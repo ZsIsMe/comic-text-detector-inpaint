@@ -2,6 +2,8 @@
 
 Solid Inpaint is a Python tool for comic text mask detection, solid-background whiteout overlay generation, and `other_mask` review.
 
+![Solid Inpaint preview](docs/preview.png)
+
 This repository is designed to run from source on macOS and Windows. It does not package a native app.
 
 The model file is not included in this repository. On first launch, `bootstrap.py` downloads `comictextdetector.pt` from the original public release and stores it at:
