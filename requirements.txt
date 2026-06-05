@@ -1,7 +1,7 @@
-numpy
+numpy<2
 opencv-python
 Pillow
-PySide6
+PySide6-Essentials
 tqdm
 torch
 torchvision

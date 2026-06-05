@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Solid Inpaint 會批量生成漫畫去字 PSD，並把不能直接去字的部分保存到 Photoshop 通道，方便綁定生成式移去動作批量處理。">
+  <title>Solid Inpaint - 批量生成漫畫去字 PSD</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="#top" aria-label="Solid Inpaint 首頁">
+      <span class="brand-mark">SI</span>
+      <span>Solid Inpaint</span>
+    </a>
+    <nav class="site-nav" aria-label="頁面導航">
+      <a href="#result">效果</a>
+      <a href="#workflow">流程</a>
+      <a href="#photoshop">Photoshop</a>
+      <a href="https://github.com/ZsIsMe/comic-text-detector-inpaint">GitHub</a>
+    </nav>
+  </header>
+
+  <main id="top">
+    <section class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">漫畫批量去字工作流</p>
+        <h1>批量生成去字 PSD，把框外字交給 Photoshop 生成式移去。</h1>
+        <p class="lead">
+          Solid Inpaint 先處理能直接去字的純色背景，再用項目內 Photoshop 腳本生成 PSD。
+          不能直接去字的區域會保存到 <code>OTHER_CHANNEL</code>，可綁定 Photoshop 動作批量執行「AI 生成式移去」。
+        </p>
+        <div class="hero-actions">
+          <a class="button primary" href="#result">看最終效果</a>
+          <a class="button secondary" href="#photoshop">看 PSD 腳本</a>
+        </div>
+      </div>
+      <figure class="hero-media">
+        <img src="assets/other-channel-selection-preview.png" alt="Photoshop 中的 OTHER_CHANNEL 預覽，紫色標記顯示非純色背景文字區域。">
+        <figcaption>紫色部分：識別到非純色背景的文字，可用 Photoshop 生成式消除。</figcaption>
+      </figure>
+    </section>
+
+    <section id="result" class="section before-after-section">
+      <div class="section-heading">
+        <p class="eyebrow">效果對比</p>
+        <h2>從原圖到去字 PSD。</h2>
+        <p>
+          純色背景由 Solid Inpaint 先處理；框外字、線稿、網點或複雜背景上的文字，
+          進 Photoshop 通道後交給生成式移去。
+        </p>
+      </div>
+      <div class="before-after">
+        <figure>
+          <img src="assets/source-page.png" alt="原始漫畫頁，包含多處日文文字。">
+          <figcaption>原圖</figcaption>
+        </figure>
+        <figure>
+          <img src="assets/final-clean-result.png" alt="執行後的 Photoshop 去字效果圖。">
+          <figcaption>執行後效果</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section id="workflow" class="section workflow-section">
+      <div class="section-heading">
+        <p class="eyebrow">完整流程</p>
+        <h2>不止是生成框外去字圖，而是轉換為可繼續精修的 Photoshop PSD。</h2>
+      </div>
+      <ol class="workflow" aria-label="Solid Inpaint 到 Photoshop 的完整流程">
+        <li>
+          <span class="step-number">01</span>
+          <h3>跑 Solid Inpaint</h3>
+          <p>選原圖資料夾，生成 <code>ctd_inpainted</code>。</p>
+        </li>
+        <li>
+          <span class="step-number">02</span>
+          <h3>生成 PSD</h3>
+          <p>在 Photoshop 執行 <code>create_psds_from_outputs.jsx</code>。</p>
+        </li>
+        <li>
+          <span class="step-number">03</span>
+          <h3>保存 OTHER_CHANNEL</h3>
+          <p>不能直接去字的部分進通道，作為 AI 移除選區。</p>
+        </li>
+        <li>
+          <span class="step-number">04</span>
+          <h3>批量執行動作</h3>
+          <p>有 <code>OTHER_CHANNEL</code> 時，自動執行你綁定的 Photoshop 動作。</p>
+        </li>
+      </ol>
+      <figure class="wide-shot">
+        <img src="preview.png" alt="Solid Inpaint 圖形界面，左側圖片列表，中間 mask，右側 inpainted 預覽。">
+        <figcaption>Solid Inpaint GUI：先把原圖資料夾整理成 ctd_inpainted 輸出。</figcaption>
+      </figure>
+    </section>
+
+    <section id="photoshop" class="section photoshop-section">
+      <div class="section-heading">
+        <p class="eyebrow">PSD 腳本</p>
+        <h2>項目內置 JSX：選原圖資料夾和 ctd_inpainted，即可批量生成 PSD。</h2>
+        <p>
+          腳本會建立 <code>bg</code>、<code>overlay-manual</code>，並保存
+          <code>TEXT_CHANNEL</code> 和 <code>OTHER_CHANNEL</code>。勾選動作後，遇到
+          <code>OTHER_CHANNEL</code> 的頁面就能自動執行 Photoshop 動作。
+        </p>
+      </div>
+      <figure class="wide-shot">
+        <img src="assets/psd-script-dialog.png" alt="Photoshop 腳本窗口，可選擇原圖文件夾、ctd_inpainted，並勾選有 OTHER_CHANNEL 時執行動作。">
+        <figcaption>腳本窗口：有 OTHER_CHANNEL 時，可選擇動作組和動作批量執行。</figcaption>
+      </figure>
+    </section>
+
+    <section class="section channel-section">
+      <div class="section-heading">
+        <p class="eyebrow">通道選區</p>
+        <h2>識別到非純色背景的文字，可用 Photoshop 生成式消除。</h2>
+        <p>
+          PSD 會保留 <code>OTHER_CHANNEL</code>。這個通道可以被 Photoshop 動作轉成選區，
+          對框外字和複雜背景文字批量執行「生成式移去」。
+        </p>
+      </div>
+      <div class="image-text-grid">
+        <figure>
+          <img src="assets/other-channel-selection-preview.png" alt="Photoshop 中的 OTHER_CHANNEL 預覽，紫色標記顯示待生成式移去的文字區域。">
+          <figcaption>OTHER_CHANNEL：未自動去字的區域被保存為通道。</figcaption>
+        </figure>
+        <div class="feature-list">
+          <article>
+            <span class="file-label">bg</span>
+            <h3>原圖層</h3>
+            <p>保留原始漫畫頁。</p>
+          </article>
+          <article>
+            <span class="file-label">overlay-manual</span>
+            <h3>已去字圖層</h3>
+            <p>純色背景文字先被自動覆蓋。</p>
+          </article>
+          <article>
+            <span class="file-label">OTHER_CHANNEL</span>
+            <h3>AI 移除選區</h3>
+            <p>框外字、複雜背景文字交給 Photoshop 動作。</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section generative-section">
+      <div class="section-heading">
+        <p class="eyebrow">生成式移去</p>
+        <h2>用 Photoshop 動作，把 OTHER_CHANNEL 批量送進「AI 生成式移去」。</h2>
+        <p>
+          你可以錄好一個 Photoshop 動作：讀取 OTHER_CHANNEL 選區，執行生成式移去，
+          再交給 JSX 腳本在一批 PSD 上自動執行。
+        </p>
+      </div>
+      <figure class="wide-shot">
+        <img src="assets/photoshop-generative-remove.png" alt="Photoshop 中選中文字區域，準備使用生成式 AI 移除。">
+        <figcaption>框外字和複雜背景文字：由 Photoshop 生成式移去接手。</figcaption>
+      </figure>
+    </section>
+
+    <section class="section usage-section">
+      <div class="section-heading">
+        <p class="eyebrow">如何開始</p>
+        <h2>先運行工具，再進 Photoshop 執行項目內腳本。</h2>
+      </div>
+      <div class="usage-grid">
+        <article>
+          <h3>1. 啟動 Solid Inpaint</h3>
+          <p>首次啟動會建立 Python 環境、安裝依賴並下載模型。</p>
+          <pre><code>python3 bootstrap.py</code></pre>
+        </article>
+        <article>
+          <h3>2. 生成 PSD</h3>
+          <p>在 Photoshop 使用 <code>File &gt; Scripts &gt; Browse...</code>。</p>
+          <pre><code>create_psds_from_outputs.jsx</code></pre>
+        </article>
+        <article>
+          <h3>3. 批量 AI 移除</h3>
+          <p>勾選「有 OTHER_CHANNEL 時執行動作」，選擇已錄好的 Photoshop 動作。</p>
+          <pre><code>OTHER_CHANNEL -> AI 生成式移去</code></pre>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <p>Solid Inpaint：批量生成漫畫去字 PSD，並用通道銜接 Photoshop 生成式移去。</p>
+    <a href="https://github.com/ZsIsMe/comic-text-detector-inpaint">查看 GitHub 倉庫</a>
+  </footer>
+</body>
+</html>

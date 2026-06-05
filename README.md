@@ -33,7 +33,7 @@ The model license and ownership belong to the original project.
 
 ## Quick Start
 
-Install Python 3.10 or newer first.
+Install Python 3.10-3.12 first. Python 3.13+ may work, but is not the recommended runtime for first-time users.
 
 macOS:
 
@@ -61,6 +61,8 @@ First launch will:
 3. download models/comictextdetector.pt if missing
 4. start the UI
 ```
+
+The GUI depends on `PySide6-Essentials` instead of the full `PySide6` package, so first launch avoids downloading the large optional Qt Addons package.
 
 This tool runs on CPU by default and does not provide a CUDA/GPU option.
 
@@ -328,6 +330,7 @@ models/comictextdetector.pt
 ## 開發注意
 
 - `vendor/` 是 detector 程式的拷貝版本，不會自動跟外部程式同步。
+- 發佈給普通用戶時建議使用 Python 3.10-3.12 測試；`requirements.txt` 會鎖住 `numpy<2`，避免舊 detector 程式遇到 NumPy 2.x 移除舊別名的兼容問題。
 - `inpainted` 是完整畫布尺寸的透明 PNG，不需要 Photoshop 圖層用的四角 anchor pixel。
 - `other_mask` 只代表不能自動純色填補的 repair area。
 - 每次調整純色判斷參數後，建議手動生成並查看 `preview_report.pdf`。
