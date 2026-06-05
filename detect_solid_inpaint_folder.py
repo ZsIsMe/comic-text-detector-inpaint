@@ -35,16 +35,32 @@ PREVIEW_PDF = 'preview_report.pdf'
 MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'comictextdetector.pt'
 
 REPAIR_EXPAND_PX = 3
-SAMPLE_RING_PX = 6
+SAMPLE_RING_PX = 3
 GROUP_MERGE_PX = 16
 BLOCK_PADDING_PX = 8
 MIN_COMPONENT_AREA = 4
 MIN_BOX_SIZE_PX = 2
 MIN_SAMPLE_PIXELS = 12
-SOLID_P90_P10_MAX = 18
-SOLID_PEAK_RATIO_MIN = 0.55
-WHITE_DOMINANT_MIN = 235
-WHITE_PEAK_RATIO_MIN = 0.58
+MIN_DIRECTIONAL_SAMPLE_PIXELS = 24
+SOLID_P90_P10_MAX = 12
+SOLID_PEAK_RATIO_MIN = 0.62
+SOLID_CLOSE_DELTA_MAX = 10
+SOLID_CLOSE_RATIO_MIN = 0.72
+SOLID_P95_DELTA_MAX = 16
+DIRECTIONAL_SOLID_P90_P10_MAX = 8
+DIRECTIONAL_SOLID_CLOSE_RATIO_MIN = 0.82
+DIRECTIONAL_SOLID_P95_DELTA_MAX = 12
+DIRECTIONAL_FALLBACK_MAX_FULL_SPREAD = 28
+DIRECTIONAL_FALLBACK_MIN_FULL_CLOSE_RATIO = 0.45
+DIRECTIONAL_FILL_AGREEMENT_MAX = 10
+MIN_DIRECTIONAL_AGREEMENT_COUNT = 2
+WHITE_DOMINANT_MIN = 242
+WHITE_PEAK_RATIO_MIN = 0.68
+WHITE_FULL_PEAK_RATIO_MIN = 0.18
+WHITE_CLOSE_DELTA_MAX = 10
+WHITE_CLOSE_RATIO_MIN = 0.78
+DIRECTIONAL_WHITE_CLOSE_RATIO_MIN = 0.84
+WHITE_P95_DELTA_MAX = 18
 PREVIEW_PAGE_WIDTH = 2400
 PREVIEW_MARGIN = 36
 PREVIEW_GAP = 24
@@ -59,6 +75,10 @@ class SolidQuality:
     fill_bgr: tuple[int, int, int]
     max_spread: int
     min_peak_ratio: float
+    close_ratio: float
+    p95_delta: int
+    white_close_ratio: float
+    white_p95_delta: int
     sample_pixels: int
     mode: str
 
@@ -226,7 +246,7 @@ def _quality_from_sample(color_img: np.ndarray, sample_mask: np.ndarray, mode: s
     active = sample_mask > 0
     sample_pixels = int(np.count_nonzero(active))
     if sample_pixels < MIN_SAMPLE_PIXELS:
-        return SolidQuality(False, -1.0, (0, 0, 0), 255, 0.0, sample_pixels, mode)
+        return SolidQuality(False, -1.0, (0, 0, 0), 255, 0.0, 0.0, 255, 0.0, 255, sample_pixels, mode)
 
     samples = color_img[active]
     b_values = samples[:, 0]
@@ -237,37 +257,101 @@ def _quality_from_sample(color_img: np.ndarray, sample_mask: np.ndarray, mode: s
     r_spread, r_peak_ratio, r_peak = _hist_channel(r_values)
     max_spread = int(max(b_spread, g_spread, r_spread))
     min_peak_ratio = float(min(b_peak_ratio, g_peak_ratio, r_peak_ratio))
-    strict_solid = max_spread <= SOLID_P90_P10_MAX and min_peak_ratio >= SOLID_PEAK_RATIO_MIN
-    white_dominant = (
-        b_peak >= WHITE_DOMINANT_MIN
-        and g_peak >= WHITE_DOMINANT_MIN
-        and r_peak >= WHITE_DOMINANT_MIN
-        and min_peak_ratio >= WHITE_PEAK_RATIO_MIN
-    )
-    is_solid = strict_solid or white_dominant
     fill_bgr = (
         _dominant_channel(b_values),
         _dominant_channel(g_values),
         _dominant_channel(r_values),
     )
-    score = min_peak_ratio * 1000.0 - max_spread + min(sample_pixels, 1000) * 0.001
+    deltas = np.max(
+        np.abs(samples.astype(np.int16) - np.array(fill_bgr, dtype=np.int16)),
+        axis=1,
+    )
+    close_ratio = float(np.count_nonzero(deltas <= SOLID_CLOSE_DELTA_MAX) / sample_pixels)
+    p95_delta = int(np.percentile(deltas, 95))
+    white_deltas = np.max(255 - samples.astype(np.int16), axis=1)
+    white_close_ratio = float(np.count_nonzero(white_deltas <= WHITE_CLOSE_DELTA_MAX) / sample_pixels)
+    white_p95_delta = int(np.percentile(white_deltas, 95))
+    spread_limit = SOLID_P90_P10_MAX
+    close_ratio_limit = SOLID_CLOSE_RATIO_MIN
+    p95_delta_limit = SOLID_P95_DELTA_MAX
+    white_close_ratio_limit = WHITE_CLOSE_RATIO_MIN
+    white_peak_ratio_limit = WHITE_FULL_PEAK_RATIO_MIN
+    if mode != 'full':
+        spread_limit = DIRECTIONAL_SOLID_P90_P10_MAX
+        close_ratio_limit = DIRECTIONAL_SOLID_CLOSE_RATIO_MIN
+        p95_delta_limit = DIRECTIONAL_SOLID_P95_DELTA_MAX
+        white_close_ratio_limit = DIRECTIONAL_WHITE_CLOSE_RATIO_MIN
+        white_peak_ratio_limit = WHITE_PEAK_RATIO_MIN
+    strict_solid = (
+        sample_pixels >= (MIN_DIRECTIONAL_SAMPLE_PIXELS if mode != 'full' else MIN_SAMPLE_PIXELS)
+        and max_spread <= spread_limit
+        and min_peak_ratio >= SOLID_PEAK_RATIO_MIN
+        and close_ratio >= close_ratio_limit
+        and p95_delta <= p95_delta_limit
+    )
+    white_dominant = (
+        sample_pixels >= (MIN_DIRECTIONAL_SAMPLE_PIXELS if mode != 'full' else MIN_SAMPLE_PIXELS)
+        and b_peak >= WHITE_DOMINANT_MIN
+        and g_peak >= WHITE_DOMINANT_MIN
+        and r_peak >= WHITE_DOMINANT_MIN
+        and min_peak_ratio >= white_peak_ratio_limit
+        and white_close_ratio >= white_close_ratio_limit
+        and white_p95_delta <= WHITE_P95_DELTA_MAX
+    )
+    is_solid = strict_solid or white_dominant
+    score = (
+        min_peak_ratio * 1000.0
+        + close_ratio * 400.0
+        + white_close_ratio * 120.0
+        - max_spread * 4.0
+        - p95_delta * 6.0
+        + min(sample_pixels, 1000) * 0.001
+    )
     if white_dominant:
         score += 50.0
     if strict_solid:
         score += 100.0
-    return SolidQuality(is_solid, score, fill_bgr, max_spread, min_peak_ratio, sample_pixels, mode)
+    return SolidQuality(
+        is_solid,
+        score,
+        fill_bgr,
+        max_spread,
+        min_peak_ratio,
+        close_ratio,
+        p95_delta,
+        white_close_ratio,
+        white_p95_delta,
+        sample_pixels,
+        mode,
+    )
 
 
 def _best_quality(color_img: np.ndarray, repair_area: np.ndarray, sample_ring: np.ndarray) -> SolidQuality:
     full = _quality_from_sample(color_img, sample_ring, 'full')
     if full.is_solid:
         return full
+    if (
+        full.max_spread > DIRECTIONAL_FALLBACK_MAX_FULL_SPREAD
+        and full.close_ratio < DIRECTIONAL_FALLBACK_MIN_FULL_CLOSE_RATIO
+    ):
+        return full
 
-    candidates = [full]
+    directionals = []
     for direction in ('top', 'bottom', 'left', 'right'):
         directional = cv2.bitwise_and(sample_ring, _direction_mask(sample_ring.shape, repair_area, direction))
-        candidates.append(_quality_from_sample(color_img, directional, direction))
-    return max(candidates, key=lambda item: item.score)
+        directionals.append(_quality_from_sample(color_img, directional, direction))
+
+    solid_directionals = [
+        item for item in directionals
+        if item.is_solid and item.sample_pixels >= MIN_DIRECTIONAL_SAMPLE_PIXELS
+    ]
+    if len(solid_directionals) < MIN_DIRECTIONAL_AGREEMENT_COUNT:
+        return full
+    fill_values = np.array([item.fill_bgr for item in solid_directionals], dtype=np.int16)
+    fill_disagreement = int(np.max(fill_values.max(axis=0) - fill_values.min(axis=0)))
+    if fill_disagreement > DIRECTIONAL_FILL_AGREEMENT_MAX:
+        return full
+    return max(solid_directionals, key=lambda item: item.score)
 
 
 def _solid_overlay_from_mask(
