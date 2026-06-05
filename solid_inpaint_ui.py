@@ -163,10 +163,17 @@ class ImageView(QGraphicsView):
             self.pixmap_item.setPixmap(QPixmap())
             self.scene().setSceneRect(0, 0, 1, 1)
             return
+        old_transform = self.transform()
+        old_center = self.mapToScene(self.viewport().rect().center())
+        old_zoom = self._zoom
         pixmap = QPixmap.fromImage(image)
         self.pixmap_item.setPixmap(pixmap)
         self.scene().setSceneRect(pixmap.rect())
-        if not keep_view:
+        if keep_view:
+            self.setTransform(old_transform)
+            self._zoom = old_zoom
+            self.centerOn(old_center)
+        else:
             self.fit()
 
     def fit(self) -> None:
@@ -703,6 +710,20 @@ class MainWindow(QMainWindow):
         right_layout.addLayout(preview_buttons)
         splitter.addWidget(right_panel)
 
+        for button in (
+            self.brush_btn,
+            self.rect_btn,
+            self.undo_btn,
+            self.redo_btn,
+            self.brush_down_btn,
+            self.brush_up_btn,
+            fit_btn,
+            actual_btn,
+            fit_btn2,
+            actual_btn2,
+        ):
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
         splitter.setSizes([250, 650, 650])
         self.setCentralWidget(root)
 
@@ -963,7 +984,7 @@ class MainWindow(QMainWindow):
         if row < self.list_widget.count() - 1:
             self.list_widget.setCurrentRow(row + 1)
 
-    def reload_current(self) -> None:
+    def reload_current(self, keep_view: bool = False) -> None:
         if not self.current_img_path:
             return
         base = _optional_imread(self.current_img_path, cv2.IMREAD_UNCHANGED)
@@ -976,18 +997,18 @@ class MainWindow(QMainWindow):
         shape = base.shape[:2]
         self.current_mask = np.where(mask > 0, 255, 0).astype(np.uint8) if mask is not None else np.zeros(shape, dtype=np.uint8)
         self.mask_view.set_mask(self.current_mask, shape)
-        self.refresh_mask_preview(keep_view=False)
+        self.refresh_mask_preview(keep_view=keep_view)
 
         if overlay is not None:
             preview = _compose_overlay_preview(base, overlay)
             if self.show_other_mask:
                 preview = _overlay_mask_on_bgr(preview, other_mask, 0.38, (165, 110, 255))
-            self.preview_view.set_qimage(_qimage_from_bgr(preview))
+            self.preview_view.set_qimage(_qimage_from_bgr(preview), keep_view=keep_view)
         else:
             preview = base[:, :, :3].copy() if len(base.shape) == 3 else cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
             if self.show_other_mask:
                 preview = _overlay_mask_on_bgr(preview, other_mask, 0.38, (165, 110, 255))
-            self.preview_view.set_qimage(_qimage_from_bgr(preview))
+            self.preview_view.set_qimage(_qimage_from_bgr(preview), keep_view=keep_view)
 
         info = self.report.get('pages', {}).get(osp.basename(self.current_img_path), {})
         if 'error' in info:
@@ -1147,7 +1168,7 @@ class MainWindow(QMainWindow):
             if self.pending_render_img_path:
                 self.status.showMessage('預覽已更新，等待最新編輯。')
             else:
-                self.reload_current()
+                self.reload_current(keep_view=True)
                 self.status.showMessage('預覽已更新。')
         if self.pending_render_img_path:
             self.render_timer.start(50)
