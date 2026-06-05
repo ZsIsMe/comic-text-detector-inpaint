@@ -319,18 +319,29 @@ Each PSD contains:
             throw new Error(layerName + " 尺寸不一致");
         }
 
-        overlayDoc.selection.selectAll();
-        overlayDoc.selection.copy();
-        overlayDoc.close(SaveOptions.DONOTSAVECHANGES);
+        app.activeDocument = overlayDoc;
+        if (overlayDoc.mode !== DocumentMode.RGB) {
+            overlayDoc.changeMode(ChangeMode.RGB);
+        }
+        if (overlayDoc.layers.length > 1) {
+            overlayDoc.mergeVisibleLayers();
+        }
+
+        var sourceLayer = overlayDoc.activeLayer;
+        var sourceBounds = getLayerBounds(sourceLayer);
+        var importedLayer = sourceLayer.duplicate(targetDoc, ElementPlacement.PLACEATBEGINNING);
 
         app.activeDocument = targetDoc;
         setRGBChannels(targetDoc);
-        targetDoc.paste();
-        targetDoc.activeLayer.name = layerName;
+        targetDoc.activeLayer = importedLayer;
+        importedLayer.name = layerName;
+        alignLayerBounds(importedLayer, sourceBounds);
+
+        overlayDoc.close(SaveOptions.DONOTSAVECHANGES);
 
         try {
             var bgLayer = targetDoc.artLayers.getByName("bg");
-            targetDoc.activeLayer.move(bgLayer, ElementPlacement.PLACEBEFORE);
+            importedLayer.move(bgLayer, ElementPlacement.PLACEBEFORE);
         } catch (e) {
         }
     }
@@ -348,18 +359,32 @@ Each PSD contains:
             throw new Error(channelName + " 尺寸不一致");
         }
 
-        maskDoc.selection.selectAll();
-        maskDoc.selection.copy();
+        app.activeDocument = maskDoc;
+        var sourceChannel = maskDoc.channels[0];
+        var alpha = sourceChannel.duplicate(targetDoc);
         maskDoc.close(SaveOptions.DONOTSAVECHANGES);
 
         app.activeDocument = targetDoc;
-        var alpha = targetDoc.channels.add();
         alpha.name = channelName;
-        targetDoc.activeChannels = [alpha];
-        targetDoc.selection.selectAll();
-        targetDoc.paste();
-        targetDoc.selection.deselect();
         setRGBChannels(targetDoc);
+    }
+
+    function getLayerBounds(layer) {
+        return {
+            left: Math.round(layer.bounds[0].as("px")),
+            top: Math.round(layer.bounds[1].as("px")),
+            right: Math.round(layer.bounds[2].as("px")),
+            bottom: Math.round(layer.bounds[3].as("px"))
+        };
+    }
+
+    function alignLayerBounds(layer, expectedBounds) {
+        var actualBounds = getLayerBounds(layer);
+        var dx = expectedBounds.left - actualBounds.left;
+        var dy = expectedBounds.top - actualBounds.top;
+        if (dx !== 0 || dy !== 0) {
+            layer.translate(dx, dy);
+        }
     }
 
     function hasChannel(doc, channelName) {
