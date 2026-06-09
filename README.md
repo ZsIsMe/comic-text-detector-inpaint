@@ -1,6 +1,6 @@
 # Solid Inpaint
 
-漫畫批量去字 PSD 生成工具。
+日文漫畫批量去字 PSD 生成工具。
 
 網站：[https://zsisme.github.io/comic-text-detector-inpaint/](https://zsisme.github.io/comic-text-detector-inpaint/)
 
