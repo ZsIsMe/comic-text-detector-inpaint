@@ -12,7 +12,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PySide6.QtCore import QObject, QPoint, QSettings, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QPen, QPixmap
+from PySide6.QtGui import QAction, QColor, QCursor, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -73,6 +73,9 @@ MAX_UNDO_STEPS = 30
 DEFAULT_BRUSH_RADIUS = 24
 MIN_BRUSH_RADIUS = 2
 MAX_BRUSH_RADIUS = 160
+DEFAULT_MAGIC_TOLERANCE = 28
+MIN_MAGIC_TOLERANCE = 0
+MAX_MAGIC_TOLERANCE = 100
 VIEW_ZOOM_STEP = 1.15
 VIEW_KEY_PAN_STEP = 80
 APP_VERSION = '0.2.0'
@@ -148,6 +151,29 @@ def _overlay_mask_on_bgr(
     return output
 
 
+def _make_magic_cursor() -> QCursor:
+    pixmap = QPixmap(32, 32)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(QPen(QColor(8, 12, 16, 210), 4))
+    painter.drawLine(8, 25, 21, 12)
+    painter.setPen(QPen(QColor('#e9fffb'), 2))
+    painter.drawLine(8, 25, 21, 12)
+    painter.setPen(QPen(QColor(8, 12, 16, 230), 3))
+    painter.drawLine(22, 4, 22, 9)
+    painter.drawLine(22, 15, 22, 20)
+    painter.drawLine(14, 12, 19, 12)
+    painter.drawLine(25, 12, 30, 12)
+    painter.setPen(QPen(QColor('#f7d95c'), 1))
+    painter.drawLine(22, 4, 22, 9)
+    painter.drawLine(22, 15, 22, 20)
+    painter.drawLine(14, 12, 19, 12)
+    painter.drawLine(25, 12, 30, 12)
+    painter.end()
+    return QCursor(pixmap, 22, 12)
+
+
 class ImageView(QGraphicsView):
     def __init__(self) -> None:
         super().__init__()
@@ -210,8 +236,22 @@ class ImageView(QGraphicsView):
     def wheelEvent(self, event) -> None:
         if self.pixmap_item.pixmap().isNull():
             return
-        factor = VIEW_ZOOM_STEP if event.angleDelta().y() > 0 else 1 / VIEW_ZOOM_STEP
+        pixel_delta = event.pixelDelta()
+        zoom_modifier = bool(
+            event.modifiers() & Qt.KeyboardModifier.MetaModifier
+            or event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        )
+        if not pixel_delta.isNull() and not zoom_modifier:
+            self.pan_by(-pixel_delta.x(), -pixel_delta.y())
+            event.accept()
+            return
+        zoom_delta = pixel_delta.y() if not pixel_delta.isNull() else event.angleDelta().y()
+        if zoom_delta == 0:
+            event.accept()
+            return
+        factor = VIEW_ZOOM_STEP if zoom_delta > 0 else 1 / VIEW_ZOOM_STEP
         self.zoom_by(factor, keep_center=True)
+        event.accept()
 
 
 class MaskEditorView(ImageView):
@@ -222,7 +262,9 @@ class MaskEditorView(ImageView):
         super().__init__()
         self.tool = 'brush'
         self.brush_radius = DEFAULT_BRUSH_RADIUS
+        self.magic_tolerance = DEFAULT_MAGIC_TOLERANCE
         self.mask: np.ndarray | None = None
+        self.source_bgr: np.ndarray | None = None
         self.image_shape: tuple[int, int] | None = None
         self._active_button: Qt.MouseButton | None = None
         self._drag_start: tuple[int, int] | None = None
@@ -232,6 +274,7 @@ class MaskEditorView(ImageView):
         self._rubber_band: QGraphicsRectItem | None = None
         self._brush_cursor: QGraphicsEllipseItem | None = None
         self._edit_started = False
+        self._magic_cursor = _make_magic_cursor()
         self._rect_pen_add = QPen(QColor('#e9fffb'), 2, Qt.PenStyle.DashLine)
         self._rect_pen_remove = QPen(QColor('#ff8f8f'), 2, Qt.PenStyle.DashLine)
         self._brush_pen = QPen(QColor('#e9fffb'), 2)
@@ -246,14 +289,27 @@ class MaskEditorView(ImageView):
         else:
             self.mask = np.where(mask > 0, 255, 0).astype(np.uint8)
 
+    def set_source_image(self, image: np.ndarray | None) -> None:
+        if image is None:
+            self.source_bgr = None
+            return
+        if len(image.shape) == 2:
+            self.source_bgr = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        else:
+            self.source_bgr = image[:, :, :3].copy()
+
     def set_tool(self, tool: str) -> None:
         self.tool = tool
         self._clear_rubber_band()
         self._update_brush_cursor_visibility()
+        self._update_tool_cursor()
 
     def set_brush_radius(self, radius: int) -> None:
         self.brush_radius = max(MIN_BRUSH_RADIUS, min(MAX_BRUSH_RADIUS, int(radius)))
         self._move_brush_cursor_to_last_position()
+
+    def set_magic_tolerance(self, tolerance: int) -> None:
+        self.magic_tolerance = max(MIN_MAGIC_TOLERANCE, min(MAX_MAGIC_TOLERANCE, int(tolerance)))
 
     def image_point_from_view(self, pos: QPoint, clamp: bool = False) -> tuple[int, int] | None:
         if self.image_shape is None:
@@ -285,6 +341,17 @@ class MaskEditorView(ImageView):
         point = self.image_point_from_view(event.position().toPoint())
         if point is None or self.mask is None:
             super().mousePressEvent(event)
+            return
+        if self.tool == 'magic':
+            replace = (
+                event.button() == Qt.MouseButton.LeftButton
+                and bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            )
+            if self._apply_magic_wand(point, event.button(), replace=replace):
+                self._begin_edit_once()
+                self.maskEdited.emit(self.mask.copy())
+            self._edit_started = False
+            event.accept()
             return
         self._active_button = event.button()
         self._drag_start = point
@@ -330,7 +397,7 @@ class MaskEditorView(ImageView):
         if self._panning and event.button() == Qt.MouseButton.LeftButton:
             self._panning = False
             self._pan_last_pos = None
-            self.unsetCursor()
+            self._update_tool_cursor()
             event.accept()
             return
         if event.button() != self._active_button:
@@ -397,6 +464,47 @@ class MaskEditorView(ImageView):
         value = 255 if button == Qt.MouseButton.LeftButton else 0
         self.mask[y1:y2 + 1, x1:x2 + 1] = value
 
+    def _apply_magic_wand(
+        self,
+        point: tuple[int, int],
+        button: Qt.MouseButton,
+        replace: bool = False,
+    ) -> bool:
+        if self.mask is None or self.source_bgr is None:
+            return False
+        height, width = self.mask.shape[:2]
+        if not (0 <= point[0] < width and 0 <= point[1] < height):
+            return False
+        flood_mask = np.zeros((height + 2, width + 2), dtype=np.uint8)
+        tolerance = int(self.magic_tolerance)
+        diff = (tolerance, tolerance, tolerance)
+        flags = (
+            8
+            | cv2.FLOODFILL_FIXED_RANGE
+            | cv2.FLOODFILL_MASK_ONLY
+            | (255 << 8)
+        )
+        cv2.floodFill(
+            self.source_bgr.copy(),
+            flood_mask,
+            point,
+            (0, 0, 0),
+            diff,
+            diff,
+            flags,
+        )
+        selection = flood_mask[1:height + 1, 1:width + 1] > 0
+        if not np.any(selection):
+            return False
+        old_mask = self.mask.copy()
+        if replace:
+            self.mask[:, :] = 0
+            self.mask[selection] = 255
+            return not np.array_equal(old_mask, self.mask)
+        value = 255 if button == Qt.MouseButton.LeftButton else 0
+        self.mask[selection] = value
+        return not np.array_equal(old_mask, self.mask)
+
     def _update_rubber_band(
         self,
         start: tuple[int, int],
@@ -444,6 +552,14 @@ class MaskEditorView(ImageView):
         rect = self._brush_cursor.rect()
         center = rect.center()
         self._update_brush_cursor((int(center.x()), int(center.y())))
+
+    def _update_tool_cursor(self) -> None:
+        if self._panning:
+            return
+        if self.tool == 'magic':
+            self.setCursor(self._magic_cursor)
+        else:
+            self.unsetCursor()
 
 
 class FolderWorker(QObject):
@@ -696,6 +812,9 @@ class MainWindow(QMainWindow):
         self.rect_btn = QPushButton('矩形')
         self.rect_btn.setCheckable(True)
         self.rect_btn.clicked.connect(lambda: self.set_edit_tool('rect'))
+        self.magic_btn = QPushButton('魔法棒')
+        self.magic_btn.setCheckable(True)
+        self.magic_btn.clicked.connect(lambda: self.set_edit_tool('magic'))
         self.brush_btn = QPushButton('筆刷')
         self.brush_btn.setCheckable(True)
         self.brush_btn.setChecked(True)
@@ -709,12 +828,22 @@ class MainWindow(QMainWindow):
         self.brush_up_btn = QPushButton('+')
         self.brush_up_btn.clicked.connect(lambda: self.change_brush_radius(4))
         self.brush_label = QLabel(f'筆刷 {DEFAULT_BRUSH_RADIUS}px')
+        self.magic_tolerance_label = QLabel(f'容差 {DEFAULT_MAGIC_TOLERANCE}')
+        self.magic_tolerance_slider = QSlider(Qt.Orientation.Horizontal)
+        self.magic_tolerance_slider.setRange(MIN_MAGIC_TOLERANCE, MAX_MAGIC_TOLERANCE)
+        self.magic_tolerance_slider.setValue(DEFAULT_MAGIC_TOLERANCE)
+        self.magic_tolerance_slider.setFixedWidth(130)
+        self.magic_tolerance_slider.valueChanged.connect(self.on_magic_tolerance_changed)
         edit_toolbar.addWidget(self.brush_btn)
         edit_toolbar.addWidget(self.rect_btn)
+        edit_toolbar.addWidget(self.magic_btn)
         edit_toolbar.addSpacing(10)
         edit_toolbar.addWidget(self.brush_down_btn)
         edit_toolbar.addWidget(self.brush_label)
         edit_toolbar.addWidget(self.brush_up_btn)
+        edit_toolbar.addSpacing(10)
+        edit_toolbar.addWidget(self.magic_tolerance_label)
+        edit_toolbar.addWidget(self.magic_tolerance_slider)
         edit_toolbar.addSpacing(10)
         edit_toolbar.addWidget(self.undo_btn)
         edit_toolbar.addWidget(self.redo_btn)
@@ -775,6 +904,7 @@ class MainWindow(QMainWindow):
         for button in (
             self.brush_btn,
             self.rect_btn,
+            self.magic_btn,
             self.undo_btn,
             self.redo_btn,
             self.brush_down_btn,
@@ -1069,6 +1199,7 @@ class MainWindow(QMainWindow):
         shape = base.shape[:2]
         self.current_mask = np.where(mask > 0, 255, 0).astype(np.uint8) if mask is not None else np.zeros(shape, dtype=np.uint8)
         self.mask_view.set_mask(self.current_mask, shape)
+        self.mask_view.set_source_image(self.current_base)
         self.refresh_mask_preview(keep_view=keep_view)
 
         if overlay is not None:
@@ -1110,6 +1241,7 @@ class MainWindow(QMainWindow):
         self.mask_view.set_qimage(_qimage_from_bgr(mask_preview), keep_view=keep_view)
         if self.current_mask is not None:
             self.mask_view.set_mask(self.current_mask, self.current_base.shape[:2])
+            self.mask_view.set_source_image(self.current_base)
 
     def on_alpha_changed(self, value: int) -> None:
         self.alpha = value / 100.0
@@ -1124,10 +1256,15 @@ class MainWindow(QMainWindow):
         self.mask_view.set_tool(tool)
         self.brush_btn.setChecked(tool == 'brush')
         self.rect_btn.setChecked(tool == 'rect')
+        self.magic_btn.setChecked(tool == 'magic')
 
     def change_brush_radius(self, delta: int) -> None:
         self.mask_view.set_brush_radius(self.mask_view.brush_radius + delta)
         self.brush_label.setText(f'筆刷 {self.mask_view.brush_radius}px')
+
+    def on_magic_tolerance_changed(self, value: int) -> None:
+        self.mask_view.set_magic_tolerance(value)
+        self.magic_tolerance_label.setText(f'容差 {value}')
 
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_B:
@@ -1135,6 +1272,9 @@ class MainWindow(QMainWindow):
             return
         if event.key() == Qt.Key.Key_R:
             self.set_edit_tool('rect')
+            return
+        if event.key() == Qt.Key.Key_W:
+            self.set_edit_tool('magic')
             return
         if event.key() == Qt.Key.Key_BracketLeft:
             self.change_brush_radius(-4)
@@ -1305,8 +1445,10 @@ class MainWindow(QMainWindow):
             '滑鼠操作：\n'
             '左鍵：添加 mask\n'
             '右鍵：去掉 mask\n'
+            '魔法棒：點擊相近的連續區域，Shift + 左鍵替換當前 mask\n'
             'Command/Ctrl + 左鍵拖拽：平移畫布\n'
-            '滾輪：縮放畫布\n\n'
+            '觸摸板雙指：移動畫布\n'
+            '鼠標滾輪：縮放畫布\n\n'
             '快捷鍵：\n'
             'Command/Ctrl + +：放大\n'
             'Command/Ctrl + -：縮小（保持頁面中心點）\n'
@@ -1315,6 +1457,7 @@ class MainWindow(QMainWindow):
             'D：下一頁\n'
             'B：筆刷工具\n'
             'R：矩形工具\n'
+            'W：魔法棒工具\n'
             '[：縮小筆刷\n'
             ']：放大筆刷\n'
             'Ctrl+Z：撤銷\n'
