@@ -164,15 +164,17 @@ class ImageView(QGraphicsView):
             self.scene().setSceneRect(0, 0, 1, 1)
             return
         old_transform = self.transform()
-        old_center = self.mapToScene(self.viewport().rect().center())
         old_zoom = self._zoom
+        old_horizontal_scroll = self.horizontalScrollBar().value()
+        old_vertical_scroll = self.verticalScrollBar().value()
         pixmap = QPixmap.fromImage(image)
         self.pixmap_item.setPixmap(pixmap)
         self.scene().setSceneRect(pixmap.rect())
         if keep_view:
             self.setTransform(old_transform)
             self._zoom = old_zoom
-            self.centerOn(old_center)
+            self.horizontalScrollBar().setValue(old_horizontal_scroll)
+            self.verticalScrollBar().setValue(old_vertical_scroll)
         else:
             self.fit()
 
@@ -916,8 +918,10 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.worker_thread = None
 
-    def refresh_list(self) -> None:
+    def refresh_list(self, keep_scroll: bool = True) -> None:
         previous_path = self.current_img_path
+        vertical_scroll = self.list_widget.verticalScrollBar().value()
+        horizontal_scroll = self.list_widget.horizontalScrollBar().value()
         self.suppress_list_selection = True
         self.list_widget.clear()
         pages = self.report.get('pages', {})
@@ -952,6 +956,14 @@ class MainWindow(QMainWindow):
         if selected_row >= 0:
             self.list_widget.setCurrentRow(selected_row)
         self.suppress_list_selection = False
+        if keep_scroll:
+            self.restore_list_scroll(vertical_scroll, horizontal_scroll)
+
+    def restore_list_scroll(self, vertical_scroll: int, horizontal_scroll: int) -> None:
+        vertical_bar = self.list_widget.verticalScrollBar()
+        horizontal_bar = self.list_widget.horizontalScrollBar()
+        vertical_bar.setValue(max(vertical_bar.minimum(), min(vertical_bar.maximum(), vertical_scroll)))
+        horizontal_bar.setValue(max(horizontal_bar.minimum(), min(horizontal_bar.maximum(), horizontal_scroll)))
 
     def on_image_selected(self, row: int) -> None:
         if self.suppress_list_selection:
