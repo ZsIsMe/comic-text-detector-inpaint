@@ -73,6 +73,8 @@ MAX_UNDO_STEPS = 30
 DEFAULT_BRUSH_RADIUS = 24
 MIN_BRUSH_RADIUS = 2
 MAX_BRUSH_RADIUS = 160
+VIEW_ZOOM_STEP = 1.15
+VIEW_KEY_PAN_STEP = 80
 APP_VERSION = '0.2.0'
 
 
@@ -190,12 +192,26 @@ class ImageView(QGraphicsView):
         self.resetTransform()
         self._zoom = 1.0
 
+    def zoom_by(self, factor: float, keep_center: bool = False) -> None:
+        if self.pixmap_item.pixmap().isNull():
+            return
+        old_center = self.mapToScene(self.viewport().rect().center()) if keep_center else None
+        self._zoom *= factor
+        self.scale(factor, factor)
+        if old_center is not None:
+            self.centerOn(old_center)
+
+    def pan_by(self, dx: int, dy: int) -> None:
+        if self.pixmap_item.pixmap().isNull():
+            return
+        self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() + dx)
+        self.verticalScrollBar().setValue(self.verticalScrollBar().value() + dy)
+
     def wheelEvent(self, event) -> None:
         if self.pixmap_item.pixmap().isNull():
             return
-        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
-        self._zoom *= factor
-        self.scale(factor, factor)
+        factor = VIEW_ZOOM_STEP if event.angleDelta().y() > 0 else 1 / VIEW_ZOOM_STEP
+        self.zoom_by(factor, keep_center=True)
 
 
 class MaskEditorView(ImageView):
@@ -561,16 +577,60 @@ class MainWindow(QMainWindow):
         self.update_recent_menu()
 
         prev_action = QAction('上一頁', self)
-        prev_action.setShortcuts([QKeySequence('Left'), QKeySequence('PageUp')])
+        prev_action.setShortcuts([QKeySequence('A')])
         prev_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
         prev_action.triggered.connect(self.previous_image)
         toolbar.addAction(prev_action)
 
         next_action = QAction('下一頁', self)
-        next_action.setShortcuts([QKeySequence('Right'), QKeySequence('PageDown')])
+        next_action.setShortcuts([QKeySequence('D')])
         next_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
         next_action.triggered.connect(self.next_image)
         toolbar.addAction(next_action)
+
+        zoom_in_action = QAction('放大', self)
+        zoom_in_action.setShortcuts([
+            QKeySequence(Qt.KeyboardModifier.ControlModifier | Qt.Key.Key_Plus),
+            QKeySequence(Qt.KeyboardModifier.MetaModifier | Qt.Key.Key_Plus),
+            QKeySequence(Qt.KeyboardModifier.ControlModifier | Qt.Key.Key_Equal),
+            QKeySequence(Qt.KeyboardModifier.MetaModifier | Qt.Key.Key_Equal),
+        ])
+        zoom_in_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        zoom_in_action.triggered.connect(lambda: self.mask_view.zoom_by(VIEW_ZOOM_STEP, keep_center=True))
+        self.addAction(zoom_in_action)
+
+        zoom_out_action = QAction('縮小', self)
+        zoom_out_action.setShortcuts([
+            QKeySequence(Qt.KeyboardModifier.ControlModifier | Qt.Key.Key_Minus),
+            QKeySequence(Qt.KeyboardModifier.MetaModifier | Qt.Key.Key_Minus),
+        ])
+        zoom_out_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        zoom_out_action.triggered.connect(lambda: self.mask_view.zoom_by(1 / VIEW_ZOOM_STEP, keep_center=True))
+        self.addAction(zoom_out_action)
+
+        pan_left_action = QAction('左移畫布', self)
+        pan_left_action.setShortcut(QKeySequence('Left'))
+        pan_left_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        pan_left_action.triggered.connect(lambda: self.mask_view.pan_by(-VIEW_KEY_PAN_STEP, 0))
+        self.addAction(pan_left_action)
+
+        pan_right_action = QAction('右移畫布', self)
+        pan_right_action.setShortcut(QKeySequence('Right'))
+        pan_right_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        pan_right_action.triggered.connect(lambda: self.mask_view.pan_by(VIEW_KEY_PAN_STEP, 0))
+        self.addAction(pan_right_action)
+
+        pan_up_action = QAction('上移畫布', self)
+        pan_up_action.setShortcut(QKeySequence('Up'))
+        pan_up_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        pan_up_action.triggered.connect(lambda: self.mask_view.pan_by(0, -VIEW_KEY_PAN_STEP))
+        self.addAction(pan_up_action)
+
+        pan_down_action = QAction('下移畫布', self)
+        pan_down_action.setShortcut(QKeySequence('Down'))
+        pan_down_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        pan_down_action.triggered.connect(lambda: self.mask_view.pan_by(0, VIEW_KEY_PAN_STEP))
+        self.addAction(pan_down_action)
 
         open_output_action = QAction('打開輸出', self)
         open_output_action.triggered.connect(self.open_output)
@@ -1070,12 +1130,6 @@ class MainWindow(QMainWindow):
         self.brush_label.setText(f'筆刷 {self.mask_view.brush_radius}px')
 
     def keyPressEvent(self, event) -> None:
-        if event.key() in (Qt.Key.Key_Left, Qt.Key.Key_PageUp):
-            self.previous_image()
-            return
-        if event.key() in (Qt.Key.Key_Right, Qt.Key.Key_PageDown):
-            self.next_image()
-            return
         if event.key() == Qt.Key.Key_B:
             self.set_edit_tool('brush')
             return
@@ -1254,8 +1308,11 @@ class MainWindow(QMainWindow):
             'Command/Ctrl + 左鍵拖拽：平移畫布\n'
             '滾輪：縮放畫布\n\n'
             '快捷鍵：\n'
-            '← / PageUp：上一頁\n'
-            '→ / PageDown：下一頁\n'
+            'Command/Ctrl + +：放大\n'
+            'Command/Ctrl + -：縮小（保持頁面中心點）\n'
+            '方向鍵：移動畫布\n'
+            'A：上一頁\n'
+            'D：下一頁\n'
             'B：筆刷工具\n'
             'R：矩形工具\n'
             '[：縮小筆刷\n'
