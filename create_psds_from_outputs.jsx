@@ -100,7 +100,7 @@ Each PSD contains:
                 doc = createDocument(imageFile);
                 importOverlayLayer(doc, overlayFile, "overlay-manual");
                 importMaskAsAlpha(doc, maskFile, "TEXT_CHANNEL");
-                importMaskAsAlpha(doc, otherMaskFile, "OTHER_CHANNEL");
+                importMaskAsAlpha(doc, otherMaskFile, "OTHER_CHANNEL", true);
 
                 if (settings.runAction && hasChannel(doc, "OTHER_CHANNEL")) {
                     try {
@@ -336,6 +336,7 @@ Each PSD contains:
         targetDoc.activeLayer = importedLayer;
         importedLayer.name = layerName;
         alignLayerBounds(importedLayer, sourceBounds);
+        addWhiteCornerPixels(targetDoc);
 
         overlayDoc.close(SaveOptions.DONOTSAVECHANGES);
 
@@ -346,7 +347,7 @@ Each PSD contains:
         }
     }
 
-    function importMaskAsAlpha(targetDoc, maskFile, channelName) {
+    function importMaskAsAlpha(targetDoc, maskFile, channelName, skipIfAllBlack) {
         app.activeDocument = targetDoc;
         removeAlphaChannelIfExists(targetDoc, channelName);
 
@@ -361,12 +362,19 @@ Each PSD contains:
 
         app.activeDocument = maskDoc;
         var sourceChannel = maskDoc.channels[0];
+        if (skipIfAllBlack && isChannelAllBlack(sourceChannel)) {
+            maskDoc.close(SaveOptions.DONOTSAVECHANGES);
+            return false;
+        }
         var alpha = sourceChannel.duplicate(targetDoc);
         maskDoc.close(SaveOptions.DONOTSAVECHANGES);
 
         app.activeDocument = targetDoc;
         alpha.name = channelName;
+        targetDoc.activeChannels = [alpha];
+        addWhiteCornerPixels(targetDoc);
         setRGBChannels(targetDoc);
+        return true;
     }
 
     function getLayerBounds(layer) {
@@ -392,6 +400,14 @@ Each PSD contains:
             if (doc.channels[i].name === channelName) return true;
         }
         return false;
+    }
+
+    function isChannelAllBlack(channel) {
+        var histogram = channel.histogram;
+        for (var i = 1; i < histogram.length; i++) {
+            if (histogram[i] > 0) return false;
+        }
+        return true;
     }
 
     function getActionSets() {
@@ -507,6 +523,33 @@ Each PSD contains:
 
     function setRGBChannels(doc) {
         doc.activeChannels = [doc.channels[0], doc.channels[1], doc.channels[2]];
+    }
+
+    function addWhiteCornerPixels(doc) {
+        var width = Math.round(doc.width.as("px"));
+        var height = Math.round(doc.height.as("px"));
+        if (width < 1 || height < 1) return;
+
+        var white = new SolidColor();
+        white.rgb.red = 255;
+        white.rgb.green = 255;
+        white.rgb.blue = 255;
+
+        fillPixel(doc, 0, 0, white);
+        fillPixel(doc, width - 1, 0, white);
+        fillPixel(doc, 0, height - 1, white);
+        fillPixel(doc, width - 1, height - 1, white);
+        doc.selection.deselect();
+    }
+
+    function fillPixel(doc, x, y, color) {
+        doc.selection.select([
+            [x, y],
+            [x + 1, y],
+            [x + 1, y + 1],
+            [x, y + 1]
+        ]);
+        doc.selection.fill(color, ColorBlendMode.NORMAL, 100, false);
     }
 
     function stripExtension(name) {
