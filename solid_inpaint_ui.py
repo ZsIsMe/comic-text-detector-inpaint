@@ -12,7 +12,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PySide6.QtCore import QObject, QPoint, QSettings, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QCursor, QImage, QKeySequence, QPainter, QPen, QPixmap
+from PySide6.QtGui import QAction, QColor, QCursor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -87,6 +87,7 @@ MASK_DISPLAY_COLORS: dict[str, tuple[int, int, int]] = {
 VIEW_ZOOM_STEP = 1.15
 VIEW_KEY_PAN_STEP = 80
 APP_VERSION = '0.2.0'
+APP_ICON_PATH = SCRIPT_DIR / 'icons' / 'tubai_icon_1024.png'
 
 
 def _qimage_from_bgr(img: np.ndarray) -> QImage:
@@ -657,6 +658,8 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle('Solid Inpaint')
+        if APP_ICON_PATH.is_file():
+            self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
         self.resize(1500, 900)
         self.folder = ''
         self.paths: dict[str, str] = {}
@@ -688,6 +691,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._apply_style()
+        QTimer.singleShot(0, self.load_latest_recent_folder)
 
     def _build_ui(self) -> None:
         toolbar = QToolBar('工具')
@@ -784,7 +788,7 @@ class MainWindow(QMainWindow):
 
         self.detect_button = QToolButton()
         self.detect_button.setText('偵測並生成')
-        self.detect_button.setProperty('danger', True)
+        self.detect_button.setProperty('primary', True)
         self.detect_button.clicked.connect(self.run_or_load)
         toolbar.addWidget(self.detect_button)
 
@@ -973,8 +977,8 @@ class MainWindow(QMainWindow):
                 background: #e9fffb; color: #10161a; border-color: #e9fffb;
                 font-weight: 600;
             }
-            QToolButton[danger="true"] { color: #ff6b6b; border-color: #6d3438; }
-            QToolButton[danger="true"]:hover { background: #352329; border-color: #a8454d; }
+            QToolButton[primary="true"] { color: #dffcf0; background: #1f5d45; border-color: #38a96d; }
+            QToolButton[primary="true"]:hover { background: #277252; border-color: #57c989; }
             QToolButton::menu-indicator { image: none; width: 0; }
             QFrame { background: #1c2128; border: 1px solid #2e3640; border-radius: 6px; }
             QLabel { color: #dfe5ea; border: 0; }
@@ -1003,6 +1007,11 @@ class MainWindow(QMainWindow):
         if not folder:
             return
         self.load_folder(folder)
+
+    def load_latest_recent_folder(self) -> None:
+        if self.folder or not self.recent_folders:
+            return
+        self.load_folder(self.recent_folders[0])
 
     def load_folder(self, folder: str) -> None:
         if not osp.isdir(folder):
@@ -1529,7 +1538,7 @@ class MainWindow(QMainWindow):
             ']：放大筆刷\n'
             'Ctrl+Z：撤銷\n'
             'Ctrl+Shift+Z：重做\n\n'
-            '注意：紅色「偵測並生成」會重新跑 detector，可能覆蓋已有 mask。',
+            '注意：綠色「偵測並生成」會重新跑 detector，可能覆蓋已有 mask。',
         )
 
     def open_output(self) -> None:
@@ -1555,6 +1564,10 @@ class MainWindow(QMainWindow):
 
 def main() -> None:
     app = QApplication(sys.argv)
+    app.setApplicationName('Solid Inpaint')
+    app.setOrganizationName('ComicTextDetector')
+    if APP_ICON_PATH.is_file():
+        app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
