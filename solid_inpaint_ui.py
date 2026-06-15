@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QCheckBox,
+    QComboBox,
     QProgressBar,
     QSlider,
     QSizePolicy,
@@ -76,6 +77,13 @@ MAX_BRUSH_RADIUS = 160
 DEFAULT_MAGIC_TOLERANCE = 28
 MIN_MAGIC_TOLERANCE = 0
 MAX_MAGIC_TOLERANCE = 100
+MASK_DISPLAY_COLORS: dict[str, tuple[int, int, int]] = {
+    '白色': (255, 255, 255),
+    '紅色': (60, 80, 255),
+    '青色': (255, 245, 70),
+    '黃色': (60, 220, 255),
+    '綠色': (100, 230, 120),
+}
 VIEW_ZOOM_STEP = 1.15
 VIEW_KEY_PAN_STEP = 80
 APP_VERSION = '0.2.0'
@@ -110,6 +118,7 @@ def _mask_overlay_image(
     mask: np.ndarray | None,
     alpha: float,
     color_bgr: tuple[int, int, int],
+    keep_mask_opacity: bool = False,
 ) -> np.ndarray:
     base_bgr = base[:, :, :3].copy() if len(base.shape) == 3 else cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
     if mask is None:
@@ -121,10 +130,13 @@ def _mask_overlay_image(
     color[:, :, 1] = color_bgr[1]
     color[:, :, 2] = color_bgr[2]
     blended = dimmed.copy()
-    blended[mask_active] = (
-        base_bgr[mask_active].astype(np.float32) * (1.0 - alpha)
-        + color[mask_active].astype(np.float32) * alpha
-    ).astype(np.uint8)
+    if keep_mask_opacity:
+        blended[mask_active] = color[mask_active]
+    else:
+        blended[mask_active] = (
+            base_bgr[mask_active].astype(np.float32) * (1.0 - alpha)
+            + color[mask_active].astype(np.float32) * alpha
+        ).astype(np.uint8)
     return blended
 
 
@@ -654,6 +666,8 @@ class MainWindow(QMainWindow):
         self.current_base: np.ndarray | None = None
         self.current_mask: np.ndarray | None = None
         self.alpha = 1.0
+        self.keep_mask_opacity = True
+        self.mask_display_color = MASK_DISPLAY_COLORS['白色']
         self.show_other_mask = True
         self.undo_stack: list[np.ndarray] = []
         self.redo_stack: list[np.ndarray] = []
@@ -809,13 +823,13 @@ class MainWindow(QMainWindow):
         center_layout.setContentsMargins(10, 10, 10, 10)
         center_layout.addWidget(QLabel('Mask / 原圖'))
         edit_toolbar = QHBoxLayout()
-        self.rect_btn = QPushButton('矩形')
+        self.rect_btn = QPushButton('F2 矩形')
         self.rect_btn.setCheckable(True)
         self.rect_btn.clicked.connect(lambda: self.set_edit_tool('rect'))
-        self.magic_btn = QPushButton('魔法棒')
+        self.magic_btn = QPushButton('F3 魔法棒')
         self.magic_btn.setCheckable(True)
         self.magic_btn.clicked.connect(lambda: self.set_edit_tool('magic'))
-        self.brush_btn = QPushButton('筆刷')
+        self.brush_btn = QPushButton('F1 筆刷')
         self.brush_btn.setCheckable(True)
         self.brush_btn.setChecked(True)
         self.brush_btn.clicked.connect(lambda: self.set_edit_tool('brush'))
@@ -838,12 +852,22 @@ class MainWindow(QMainWindow):
         edit_toolbar.addWidget(self.rect_btn)
         edit_toolbar.addWidget(self.magic_btn)
         edit_toolbar.addSpacing(10)
-        edit_toolbar.addWidget(self.brush_down_btn)
-        edit_toolbar.addWidget(self.brush_label)
-        edit_toolbar.addWidget(self.brush_up_btn)
+        self.brush_controls = QWidget()
+        brush_controls_layout = QHBoxLayout(self.brush_controls)
+        brush_controls_layout.setContentsMargins(0, 0, 0, 0)
+        brush_controls_layout.setSpacing(8)
+        brush_controls_layout.addWidget(self.brush_down_btn)
+        brush_controls_layout.addWidget(self.brush_label)
+        brush_controls_layout.addWidget(self.brush_up_btn)
+        edit_toolbar.addWidget(self.brush_controls)
         edit_toolbar.addSpacing(10)
-        edit_toolbar.addWidget(self.magic_tolerance_label)
-        edit_toolbar.addWidget(self.magic_tolerance_slider)
+        self.magic_controls = QWidget()
+        magic_controls_layout = QHBoxLayout(self.magic_controls)
+        magic_controls_layout.setContentsMargins(0, 0, 0, 0)
+        magic_controls_layout.setSpacing(8)
+        magic_controls_layout.addWidget(self.magic_tolerance_label)
+        magic_controls_layout.addWidget(self.magic_tolerance_slider)
+        edit_toolbar.addWidget(self.magic_controls)
         edit_toolbar.addSpacing(10)
         edit_toolbar.addWidget(self.undo_btn)
         edit_toolbar.addWidget(self.redo_btn)
@@ -865,6 +889,17 @@ class MainWindow(QMainWindow):
         slider_row.addWidget(self.alpha_slider, 1)
         slider_row.addWidget(QLabel('0%'))
         slider_row.addWidget(self.alpha_label)
+        self.keep_mask_opacity_checkbox = QCheckBox('Mask 透明度不變')
+        self.keep_mask_opacity_checkbox.setChecked(True)
+        self.keep_mask_opacity_checkbox.stateChanged.connect(self.on_keep_mask_opacity_changed)
+        slider_row.addWidget(self.keep_mask_opacity_checkbox)
+        slider_row.addWidget(QLabel('Mask 顏色'))
+        self.mask_color_combo = QComboBox()
+        for name in MASK_DISPLAY_COLORS:
+            self.mask_color_combo.addItem(name)
+        self.mask_color_combo.setCurrentText('白色')
+        self.mask_color_combo.currentTextChanged.connect(self.on_mask_display_color_changed)
+        slider_row.addWidget(self.mask_color_combo)
         center_layout.addLayout(slider_row)
         view_buttons = QHBoxLayout()
         fit_btn = QPushButton('適應')
@@ -922,6 +957,7 @@ class MainWindow(QMainWindow):
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         self.status.showMessage('第二版：可編輯 mask，編輯後自動生成預覽。')
+        self.set_edit_tool('brush')
 
     def _apply_style(self) -> None:
         self.setStyleSheet(
@@ -946,6 +982,12 @@ class MainWindow(QMainWindow):
             QMenu::item { padding: 7px 22px 7px 10px; border-radius: 4px; }
             QMenu::item:selected { background: #2b3440; }
             QMenu::item:disabled { color: #7c8792; }
+            QComboBox {
+                background: #242b33; color: #e6ebef; border: 1px solid #3a4551;
+                border-radius: 5px; padding: 5px 8px;
+            }
+            QComboBox:hover { background: #2b3440; }
+            QComboBox::drop-down { border: 0; width: 18px; }
             QListWidget { background: #1c2128; border: 0; color: #dfe5ea; outline: none; }
             QListWidget::item { padding: 8px 6px; border-bottom: 1px solid #27303a; }
             QListWidget::item:selected { background: #243039; color: #ffffff; }
@@ -1237,7 +1279,13 @@ class MainWindow(QMainWindow):
         if self.current_base is None:
             self.mask_view.set_qimage(None)
             return
-        mask_preview = _mask_overlay_image(self.current_base, self.current_mask, self.alpha, (255, 255, 255))
+        mask_preview = _mask_overlay_image(
+            self.current_base,
+            self.current_mask,
+            self.alpha,
+            self.mask_display_color,
+            self.keep_mask_opacity,
+        )
         self.mask_view.set_qimage(_qimage_from_bgr(mask_preview), keep_view=keep_view)
         if self.current_mask is not None:
             self.mask_view.set_mask(self.current_mask, self.current_base.shape[:2])
@@ -1246,6 +1294,14 @@ class MainWindow(QMainWindow):
     def on_alpha_changed(self, value: int) -> None:
         self.alpha = value / 100.0
         self.alpha_label.setText(f'目前 {value}%')
+        self.refresh_mask_preview(keep_view=True)
+
+    def on_keep_mask_opacity_changed(self, state: int) -> None:
+        self.keep_mask_opacity = state == Qt.CheckState.Checked.value
+        self.refresh_mask_preview(keep_view=True)
+
+    def on_mask_display_color_changed(self, color_name: str) -> None:
+        self.mask_display_color = MASK_DISPLAY_COLORS.get(color_name, MASK_DISPLAY_COLORS['白色'])
         self.refresh_mask_preview(keep_view=True)
 
     def on_show_other_mask_changed(self, state: int) -> None:
@@ -1257,6 +1313,8 @@ class MainWindow(QMainWindow):
         self.brush_btn.setChecked(tool == 'brush')
         self.rect_btn.setChecked(tool == 'rect')
         self.magic_btn.setChecked(tool == 'magic')
+        self.brush_controls.setVisible(tool == 'brush')
+        self.magic_controls.setVisible(tool == 'magic')
 
     def change_brush_radius(self, delta: int) -> None:
         self.mask_view.set_brush_radius(self.mask_view.brush_radius + delta)
@@ -1267,6 +1325,15 @@ class MainWindow(QMainWindow):
         self.magic_tolerance_label.setText(f'容差 {value}')
 
     def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_F1:
+            self.set_edit_tool('brush')
+            return
+        if event.key() == Qt.Key.Key_F2:
+            self.set_edit_tool('rect')
+            return
+        if event.key() == Qt.Key.Key_F3:
+            self.set_edit_tool('magic')
+            return
         if event.key() == Qt.Key.Key_B:
             self.set_edit_tool('brush')
             return
@@ -1455,9 +1522,9 @@ class MainWindow(QMainWindow):
             '方向鍵：移動畫布\n'
             'A：上一頁\n'
             'D：下一頁\n'
-            'B：筆刷工具\n'
-            'R：矩形工具\n'
-            'W：魔法棒工具\n'
+            'F1：筆刷工具\n'
+            'F2：矩形工具\n'
+            'F3：魔法棒工具\n'
             '[：縮小筆刷\n'
             ']：放大筆刷\n'
             'Ctrl+Z：撤銷\n'
