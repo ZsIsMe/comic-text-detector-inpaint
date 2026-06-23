@@ -153,6 +153,8 @@ GUI 提供：
 選擇圖片資料夾
 最近資料夾
 偵測並生成
+不修改 mask 重生成
+使用ysgyolo更新mask圖
 圖片列表
 mask / 原圖疊加預覽
 inpainted 合成預覽
@@ -167,6 +169,10 @@ other_mask 顯示
 ```
 
 手動修改 mask 後，會基於新 mask 重新生成當前頁的 overlay 和 other_mask。
+
+批量替換 `ctd_inpainted/mask/` 後，可在 GUI 點「不修改 mask 重生成」。這會保留現有 mask，只重新生成 `inpainted/`、`other_mask/` 和報告。
+
+若需要用 ysgyolo 輸出收窄 mask，可點「使用ysgyolo更新mask圖」並選擇 ysgyolo mask 文件夾。它會將同名 PNG 與現有 mask 取交集後覆蓋現有 mask，缺少同名 PNG 時保留原 mask，然後重新生成後續輸出。
 
 ## 開發原則
 

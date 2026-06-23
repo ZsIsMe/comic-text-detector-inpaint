@@ -589,6 +589,37 @@ def regenerate_image_from_mask(
     return page_summary
 
 
+def regenerate_image_from_ysgyolo_mask(
+    img_path: str,
+    paths: dict[str, str],
+    ysgyolo_dir: str,
+) -> dict:
+    mask_path = _mask_path(paths, img_path)
+    if not osp.isfile(mask_path):
+        raise FileNotFoundError(f'找不到 mask：{mask_path}')
+    mask = imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        raise FileNotFoundError(f'無法讀取 mask：{mask_path}')
+
+    ysgyolo_path = osp.join(ysgyolo_dir, f'{Path(img_path).stem}.png')
+    if not osp.isfile(ysgyolo_path):
+        return regenerate_image_from_mask(img_path, paths, mask)
+    ysgyolo_mask = imread(ysgyolo_path, cv2.IMREAD_GRAYSCALE)
+    if ysgyolo_mask is None:
+        raise FileNotFoundError(f'無法讀取 ysgyolo mask：{ysgyolo_path}')
+    if ysgyolo_mask.shape[:2] != mask.shape[:2]:
+        raise ValueError(
+            f'ysgyolo mask 尺寸不一致：{ysgyolo_path} '
+            f'{ysgyolo_mask.shape[1]}x{ysgyolo_mask.shape[0]}，'
+            f'原 mask {mask.shape[1]}x{mask.shape[0]}'
+        )
+
+    mask_bin = np.where(mask > 0, 255, 0).astype(np.uint8)
+    ysgyolo_bin = np.where(ysgyolo_mask > 0, 255, 0).astype(np.uint8)
+    merged_mask = cv2.bitwise_and(mask_bin, ysgyolo_bin)
+    return regenerate_image_from_mask(img_path, paths, merged_mask)
+
+
 def build_report(
     img_dir: str,
     paths: dict[str, str],

@@ -60,6 +60,7 @@ from detect_solid_inpaint_folder import (
     load_report,
     process_image_with_detector,
     regenerate_image_from_mask,
+    regenerate_image_from_ysgyolo_mask,
     write_report,
 )
 from utils.io_utils import imread, imwrite
@@ -580,11 +581,18 @@ class FolderWorker(QObject):
     finished = Signal(dict)
     failed = Signal(str)
 
-    def __init__(self, folder: str, mode: str, image_paths: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        folder: str,
+        mode: str,
+        image_paths: list[str] | None = None,
+        ysgyolo_dir: str = '',
+    ) -> None:
         super().__init__()
         self.folder = folder
         self.mode = mode
         self.image_paths = image_paths
+        self.ysgyolo_dir = ysgyolo_dir
 
     def run(self) -> None:
         try:
@@ -600,6 +608,8 @@ class FolderWorker(QObject):
                 try:
                     if self.mode == 'detect':
                         pages[name] = process_image_with_detector(img_path, paths, detector)
+                    elif self.mode == 'ysgyolo':
+                        pages[name] = regenerate_image_from_ysgyolo_mask(img_path, paths, self.ysgyolo_dir)
                     else:
                         pages[name] = regenerate_image_from_mask(img_path, paths)
                 except Exception as exc:
@@ -791,6 +801,18 @@ class MainWindow(QMainWindow):
         self.detect_button.setProperty('primary', True)
         self.detect_button.clicked.connect(self.run_or_load)
         toolbar.addWidget(self.detect_button)
+
+        self.regenerate_button = QToolButton()
+        self.regenerate_button.setText('不修改 mask 重生成')
+        self.regenerate_button.setToolTip('不重新偵測，使用現有 mask 批量重生成 inpainted 和 other_mask')
+        self.regenerate_button.clicked.connect(self.regenerate_from_existing_masks)
+        toolbar.addWidget(self.regenerate_button)
+
+        self.ysgyolo_button = QToolButton()
+        self.ysgyolo_button.setText('使用ysgyolo更新mask圖')
+        self.ysgyolo_button.setToolTip('選擇 ysgyolo mask 文件夾，與現有 mask 取交集後重生成輸出')
+        self.ysgyolo_button.clicked.connect(self.update_masks_from_ysgyolo)
+        toolbar.addWidget(self.ysgyolo_button)
 
         root = QWidget()
         root_layout = QVBoxLayout(root)
@@ -1109,6 +1131,125 @@ class MainWindow(QMainWindow):
                 return
         self.start_worker('detect', self.imglist)
 
+    def regenerate_from_existing_masks(self) -> None:
+        if not self.folder:
+            self.choose_folder()
+            if not self.folder:
+                return
+        if not self.imglist:
+            QMessageBox.information(self, '沒有圖片', '當前文件夾內沒有可處理的圖片。')
+            return
+        if self.worker_thread is not None:
+            QMessageBox.information(self, '正在執行', '已有任務在執行中。')
+            return
+        if self.page_worker_thread is not None or self.render_timer.isActive():
+            QMessageBox.information(self, '正在生成預覽', '請等待當前頁預覽生成完成後再批量重生成。')
+            return
+
+        missing_masks = [
+            osp.basename(img_path)
+            for img_path in self.imglist
+            if not osp.isfile(_mask_path(self.paths, img_path))
+        ]
+        if len(missing_masks) == len(self.imglist):
+            QMessageBox.warning(
+                self,
+                '找不到 mask',
+                '當前文件夾沒有可用的 mask。\n\n'
+                '請先放入 ctd_inpainted/mask/<檔名>.png，或先執行「偵測並生成」。',
+            )
+            return
+
+        message = (
+            '將使用現有 mask 批量重生成 other_mask 和 inpainted。\n\n'
+            '這不會重新跑 detector，也不會覆蓋 mask 的內容。\n'
+            '會覆蓋已有的 other_mask、inpainted 和報告。'
+        )
+        if missing_masks:
+            preview = '\n'.join(missing_masks[:8])
+            more = len(missing_masks) - 8
+            if more > 0:
+                preview += f'\n...以及 {more} 個文件'
+            message += f'\n\n有 {len(missing_masks)} 張圖片缺少 mask，這些頁會標記為失敗：\n{preview}'
+
+        reply = QMessageBox.question(
+            self,
+            '確認重生成',
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.start_worker('regenerate', self.imglist)
+
+    def update_masks_from_ysgyolo(self) -> None:
+        if not self.folder:
+            self.choose_folder()
+            if not self.folder:
+                return
+        if not self.imglist:
+            QMessageBox.information(self, '沒有圖片', '當前文件夾內沒有可處理的圖片。')
+            return
+        if self.worker_thread is not None:
+            QMessageBox.information(self, '正在執行', '已有任務在執行中。')
+            return
+        if self.page_worker_thread is not None or self.render_timer.isActive():
+            QMessageBox.information(self, '正在生成預覽', '請等待當前頁預覽生成完成後再更新 mask。')
+            return
+
+        missing_masks = [
+            osp.basename(img_path)
+            for img_path in self.imglist
+            if not osp.isfile(_mask_path(self.paths, img_path))
+        ]
+        if len(missing_masks) == len(self.imglist):
+            QMessageBox.warning(
+                self,
+                '找不到 mask',
+                '當前文件夾沒有可用的 mask。\n\n'
+                '請先放入 ctd_inpainted/mask/<檔名>.png，或先執行「偵測並生成」。',
+            )
+            return
+
+        ysgyolo_dir = QFileDialog.getExistingDirectory(
+            self,
+            '選擇 ysgyolo mask 文件夾',
+            self.folder,
+        )
+        if not ysgyolo_dir:
+            return
+
+        matched_count = sum(
+            1
+            for img_path in self.imglist
+            if osp.isfile(osp.join(ysgyolo_dir, f'{Path(img_path).stem}.png'))
+        )
+        message = (
+            '將使用 ysgyolo mask 更新現有 mask。\n\n'
+            '同名 ysgyolo PNG 存在時，會用「現有 mask ∩ ysgyolo mask」覆蓋現有 mask。\n'
+            '缺少同名 ysgyolo PNG 的頁面會保留原 mask。\n'
+            '更新 mask 後會重新生成 other_mask、inpainted 和報告。'
+            f'\n\n找到同名 ysgyolo mask：{matched_count} / {len(self.imglist)}'
+        )
+        if missing_masks:
+            preview = '\n'.join(missing_masks[:8])
+            more = len(missing_masks) - 8
+            if more > 0:
+                preview += f'\n...以及 {more} 個文件'
+            message += f'\n\n有 {len(missing_masks)} 張圖片缺少現有 mask，這些頁會標記為失敗：\n{preview}'
+
+        reply = QMessageBox.question(
+            self,
+            '確認使用 ysgyolo 更新',
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.start_worker('ysgyolo', self.imglist, ysgyolo_dir=ysgyolo_dir)
+
     def has_existing_masks(self) -> bool:
         if not self.paths:
             return False
@@ -1120,7 +1261,7 @@ class MainWindow(QMainWindow):
             for img_path in self.imglist
         )
 
-    def start_worker(self, mode: str, image_paths: list[str]) -> None:
+    def start_worker(self, mode: str, image_paths: list[str], ysgyolo_dir: str = '') -> None:
         if self.worker_thread is not None:
             QMessageBox.information(self, '正在執行', '已有任務在執行中。')
             return
@@ -1129,7 +1270,7 @@ class MainWindow(QMainWindow):
             return
         self.progress.setValue(0)
         self.worker_thread = QThread()
-        self.worker = FolderWorker(self.folder, mode, image_paths)
+        self.worker = FolderWorker(self.folder, mode, image_paths, ysgyolo_dir)
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
         self.worker.progress.connect(self.on_worker_progress)
@@ -1538,7 +1679,9 @@ class MainWindow(QMainWindow):
             ']：放大筆刷\n'
             'Ctrl+Z：撤銷\n'
             'Ctrl+Shift+Z：重做\n\n'
-            '注意：綠色「偵測並生成」會重新跑 detector，可能覆蓋已有 mask。',
+            '注意：綠色「偵測並生成」會重新跑 detector，可能覆蓋已有 mask。\n'
+            '「不修改 mask 重生成」只讀取現有 mask，重新生成 inpainted 和 other_mask。\n'
+            '「使用ysgyolo更新mask圖」會選擇 ysgyolo mask 文件夾，用同名 PNG 和現有 mask 取交集後重生成輸出。',
         )
 
     def open_output(self) -> None:
