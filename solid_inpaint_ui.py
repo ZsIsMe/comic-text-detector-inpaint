@@ -50,13 +50,17 @@ if str(SCRIPT_DIR) not in sys.path:
 from detect_solid_inpaint_folder import (
     _compose_overlay_preview,
     _ensure_dirs,
+    _background_sample_cache_path,
+    _mask_hash,
     _mask_path,
     _other_mask_path,
     _output_path,
+    _save_background_sample_cache,
     _write_preview_pdf,
     build_report,
     create_detector,
     image_files_in_folder,
+    iter_background_samples_from_mask,
     load_report,
     process_image_with_detector,
     regenerate_image_from_mask,
@@ -89,6 +93,8 @@ VIEW_ZOOM_STEP = 1.15
 VIEW_KEY_PAN_STEP = 80
 APP_VERSION = '0.2.0'
 APP_ICON_PATH = SCRIPT_DIR / 'icons' / 'tubai_icon_1024.png'
+SAMPLE_RING_DISPLAY_ALPHA = 0.28
+SAMPLE_RING_DISPLAY_COLOR_BGR = (70, 235, 255)
 
 
 def _qimage_from_bgr(img: np.ndarray) -> QImage:
@@ -111,6 +117,22 @@ def _optional_imread(path: str, flags: int) -> np.ndarray | None:
         return None
     try:
         return imread(path, flags)
+    except Exception:
+        return None
+
+
+def _load_background_sample_cache(paths: dict[str, str], img_path: str, mask: np.ndarray) -> np.ndarray | None:
+    cache_path = _background_sample_cache_path(paths, img_path)
+    if not osp.isfile(cache_path):
+        return None
+    try:
+        data = np.load(cache_path)
+        if int(data['mask_hash']) != _mask_hash(mask):
+            return None
+        sample = np.asarray(data['sample'], dtype=np.uint8)
+        if sample.shape != mask.shape:
+            return None
+        return np.where(sample > 0, 255, 0).astype(np.uint8)
     except Exception:
         return None
 
@@ -646,6 +668,38 @@ class PageRegenerateWorker(QObject):
             self.failed.emit(self.img_path, str(exc))
 
 
+class BackgroundSampleWorker(QObject):
+    partial = Signal(int, str, object, object)
+    finished = Signal(int, str, object, object)
+    failed = Signal(int, str, object, str)
+
+    def __init__(self, request_id: int, img_path: str, image: np.ndarray, mask: np.ndarray) -> None:
+        super().__init__()
+        self.request_id = request_id
+        self.img_path = img_path
+        self.image = image.copy()
+        self.mask = np.where(mask > 0, 255, 0).astype(np.uint8)
+        self.mask_hash = _mask_hash(self.mask)
+        self.cancelled = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def run(self) -> None:
+        try:
+            sample = np.zeros(self.mask.shape, dtype=np.uint8)
+            for block_sample in iter_background_samples_from_mask(self.image, self.mask):
+                if self.cancelled:
+                    break
+                sample = cv2.bitwise_or(sample, block_sample)
+                self.partial.emit(self.request_id, self.img_path, self.mask_hash, sample.copy())
+                if self.cancelled:
+                    break
+            self.finished.emit(self.request_id, self.img_path, self.mask_hash, sample)
+        except Exception as exc:
+            self.failed.emit(self.request_id, self.img_path, self.mask_hash, str(exc))
+
+
 class PdfWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
@@ -678,16 +732,23 @@ class MainWindow(QMainWindow):
         self.current_img_path = ''
         self.current_base: np.ndarray | None = None
         self.current_mask: np.ndarray | None = None
+        self.current_background_sample: np.ndarray | None = None
         self.alpha = 1.0
         self.keep_mask_opacity = True
         self.mask_display_color = MASK_DISPLAY_COLORS['白色']
         self.show_other_mask = True
+        self.show_background_sample = True
         self.undo_stack: list[np.ndarray] = []
         self.redo_stack: list[np.ndarray] = []
         self.worker_thread: QThread | None = None
         self.worker: FolderWorker | None = None
         self.page_worker_thread: QThread | None = None
         self.page_worker: PageRegenerateWorker | None = None
+        self.background_worker_thread: QThread | None = None
+        self.background_worker: BackgroundSampleWorker | None = None
+        self.background_sample_request_id = 0
+        self.pending_background_img_path = ''
+        self.pending_background_mask: np.ndarray | None = None
         self.pdf_worker_thread: QThread | None = None
         self.pdf_worker: PdfWorker | None = None
         self.pending_render_img_path = ''
@@ -696,6 +757,9 @@ class MainWindow(QMainWindow):
         self.render_timer = QTimer(self)
         self.render_timer.setSingleShot(True)
         self.render_timer.timeout.connect(self.start_pending_render)
+        self.background_sample_timer = QTimer(self)
+        self.background_sample_timer.setSingleShot(True)
+        self.background_sample_timer.timeout.connect(self.start_background_sample_worker)
         self.settings = QSettings('ComicTextDetector', 'SolidInpaintUI')
         self.recent_folders = self._load_recent_folders()
 
@@ -926,6 +990,13 @@ class MainWindow(QMainWindow):
         self.mask_color_combo.setCurrentText('白色')
         self.mask_color_combo.currentTextChanged.connect(self.on_mask_display_color_changed)
         slider_row.addWidget(self.mask_color_combo)
+        self.background_sample_checkbox = QCheckBox('顯示背景選區')
+        self.background_sample_checkbox.setChecked(True)
+        self.background_sample_checkbox.stateChanged.connect(self.on_show_background_sample_changed)
+        slider_row.addWidget(self.background_sample_checkbox)
+        self.background_sample_status = QLabel('')
+        self.background_sample_status.setFixedWidth(120)
+        slider_row.addWidget(self.background_sample_status)
         center_layout.addLayout(slider_row)
         view_buttons = QHBoxLayout()
         fit_btn = QPushButton('適應')
@@ -1390,6 +1461,11 @@ class MainWindow(QMainWindow):
         self.current_base = base
         shape = base.shape[:2]
         self.current_mask = np.where(mask > 0, 255, 0).astype(np.uint8) if mask is not None else np.zeros(shape, dtype=np.uint8)
+        self.current_background_sample = _load_background_sample_cache(self.paths, self.current_img_path, self.current_mask)
+        if self.current_background_sample is None:
+            self.queue_background_sample()
+        else:
+            self.background_sample_status.setText('')
         self.mask_view.set_mask(self.current_mask, shape)
         self.mask_view.set_source_image(self.current_base)
         self.refresh_mask_preview(keep_view=keep_view)
@@ -1436,6 +1512,13 @@ class MainWindow(QMainWindow):
             self.mask_display_color,
             self.keep_mask_opacity,
         )
+        if self.show_background_sample and self.current_background_sample is not None:
+            mask_preview = _overlay_mask_on_bgr(
+                mask_preview,
+                self.current_background_sample,
+                SAMPLE_RING_DISPLAY_ALPHA,
+                SAMPLE_RING_DISPLAY_COLOR_BGR,
+            )
         self.mask_view.set_qimage(_qimage_from_bgr(mask_preview), keep_view=keep_view)
         if self.current_mask is not None:
             self.mask_view.set_mask(self.current_mask, self.current_base.shape[:2])
@@ -1452,6 +1535,12 @@ class MainWindow(QMainWindow):
 
     def on_mask_display_color_changed(self, color_name: str) -> None:
         self.mask_display_color = MASK_DISPLAY_COLORS.get(color_name, MASK_DISPLAY_COLORS['白色'])
+        self.refresh_mask_preview(keep_view=True)
+
+    def on_show_background_sample_changed(self, state: int) -> None:
+        self.show_background_sample = state == Qt.CheckState.Checked.value
+        if self.show_background_sample and self.current_background_sample is None:
+            self.queue_background_sample()
         self.refresh_mask_preview(keep_view=True)
 
     def on_show_other_mask_changed(self, state: int) -> None:
@@ -1517,6 +1606,7 @@ class MainWindow(QMainWindow):
 
     def on_mask_edited(self, mask: object) -> None:
         self.current_mask = np.where(np.asarray(mask) > 0, 255, 0).astype(np.uint8)
+        self.queue_background_sample()
         self.save_current_mask()
         self.refresh_mask_preview(keep_view=True)
         self.queue_auto_render()
@@ -1527,6 +1617,7 @@ class MainWindow(QMainWindow):
             return
         self.redo_stack.append(self.current_mask.copy())
         self.current_mask = self.undo_stack.pop()
+        self.queue_background_sample()
         self.save_current_mask()
         self.refresh_mask_preview(keep_view=True)
         self.queue_auto_render()
@@ -1537,6 +1628,7 @@ class MainWindow(QMainWindow):
             return
         self.undo_stack.append(self.current_mask.copy())
         self.current_mask = self.redo_stack.pop()
+        self.queue_background_sample()
         self.save_current_mask()
         self.refresh_mask_preview(keep_view=True)
         self.queue_auto_render()
@@ -1550,6 +1642,109 @@ class MainWindow(QMainWindow):
         if not self.current_img_path or self.current_mask is None:
             return
         imwrite(_mask_path(self.paths, self.current_img_path), self.current_mask)
+
+    def queue_background_sample(self) -> None:
+        self.background_sample_request_id += 1
+        if (
+            not self.show_background_sample
+            or not self.current_img_path
+            or self.current_base is None
+            or self.current_mask is None
+        ):
+            self.pending_background_img_path = ''
+            self.pending_background_mask = None
+            self.background_sample_timer.stop()
+            if self.background_worker is not None:
+                self.background_worker.cancel()
+            if hasattr(self, 'background_sample_status'):
+                self.background_sample_status.setText('')
+            return
+        if self.background_worker is not None:
+            self.background_worker.cancel()
+        self.pending_background_img_path = self.current_img_path
+        self.pending_background_mask = self.current_mask.copy()
+        self.background_sample_status.setText('背景選區等待中...')
+        self.background_sample_timer.start(450)
+
+    def start_background_sample_worker(self) -> None:
+        if (
+            not self.pending_background_img_path
+            or self.pending_background_mask is None
+            or self.pending_background_img_path != self.current_img_path
+            or self.current_base is None
+        ):
+            return
+        if self.background_worker_thread is not None:
+            self.background_sample_timer.start(450)
+            return
+        request_id = self.background_sample_request_id
+        img_path = self.pending_background_img_path
+        mask = self.pending_background_mask.copy()
+        base = self.current_base.copy()
+        self.pending_background_img_path = ''
+        self.pending_background_mask = None
+        self.background_sample_status.setText('背景選區計算中...')
+
+        self.background_worker_thread = QThread()
+        self.background_worker = BackgroundSampleWorker(request_id, img_path, base, mask)
+        self.background_worker.moveToThread(self.background_worker_thread)
+        self.background_worker_thread.started.connect(self.background_worker.run)
+        self.background_worker.partial.connect(self.on_background_sample_partial)
+        self.background_worker.finished.connect(self.on_background_sample_finished)
+        self.background_worker.failed.connect(self.on_background_sample_failed)
+        self.background_worker.finished.connect(self.background_worker_thread.quit)
+        self.background_worker.failed.connect(self.background_worker_thread.quit)
+        self.background_worker_thread.finished.connect(self.cleanup_background_worker)
+        self.background_worker_thread.start()
+
+    def on_background_sample_partial(
+        self,
+        request_id: int,
+        img_path: str,
+        mask_hash: int,
+        sample: object,
+    ) -> None:
+        if (
+            request_id != self.background_sample_request_id
+            or img_path != self.current_img_path
+            or mask_hash != _mask_hash(self.current_mask)
+        ):
+            return
+        self.current_background_sample = np.asarray(sample, dtype=np.uint8)
+        self.refresh_mask_preview(keep_view=True)
+
+    def on_background_sample_finished(
+        self,
+        request_id: int,
+        img_path: str,
+        mask_hash: int,
+        sample: object,
+    ) -> None:
+        if (
+            request_id != self.background_sample_request_id
+            or img_path != self.current_img_path
+            or mask_hash != _mask_hash(self.current_mask)
+        ):
+            return
+        self.current_background_sample = np.asarray(sample, dtype=np.uint8)
+        _save_background_sample_cache(self.paths, img_path, mask_hash, self.current_background_sample)
+        self.background_sample_status.setText('')
+        self.refresh_mask_preview(keep_view=True)
+
+    def on_background_sample_failed(self, request_id: int, img_path: str, mask_hash: int, message: str) -> None:
+        if (
+            request_id == self.background_sample_request_id
+            and img_path == self.current_img_path
+            and mask_hash == _mask_hash(self.current_mask)
+        ):
+            self.background_sample_status.setText('背景選區失敗')
+        self.status.showMessage(f'背景選區計算失敗：{message}')
+
+    def cleanup_background_worker(self) -> None:
+        self.background_worker = None
+        self.background_worker_thread = None
+        if self.pending_background_img_path:
+            self.background_sample_timer.start(50)
 
     def queue_auto_render(self) -> None:
         if not self.current_img_path or self.current_mask is None:

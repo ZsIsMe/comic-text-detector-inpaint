@@ -8,6 +8,7 @@ import json
 import os
 import os.path as osp
 import sys
+import zlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -30,6 +31,7 @@ OUTPUT_DIR = 'ctd_inpainted'
 MASK_DIR = 'mask'
 OTHER_MASK_DIR = 'other_mask'
 INPAINTED_DIR = 'inpainted'
+BACKGROUND_SAMPLE_CACHE_DIR = 'background_sample_cache'
 REPORT_JSON = 'solid_inpaint_report.json'
 PREVIEW_PDF = 'preview_report.pdf'
 MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'comictextdetector.pt'
@@ -42,6 +44,16 @@ MIN_COMPONENT_AREA = 4
 MIN_BOX_SIZE_PX = 2
 MIN_SAMPLE_PIXELS = 12
 MIN_DIRECTIONAL_SAMPLE_PIXELS = 24
+BACKGROUND_WAND_TOLERANCE = 24
+BACKGROUND_WAND_SEED_MIN_DISTANCE_PX = 4
+BACKGROUND_WAND_SEED_SEARCH_PX = 36
+BACKGROUND_WAND_ROI_PADDING_PX = 72
+BACKGROUND_WAND_EDGE_MARGIN_PX = 6
+BACKGROUND_WAND_MAX_CANDIDATES = 16
+BACKGROUND_WAND_MAX_REJECTS = 5
+BACKGROUND_WAND_MAX_AREA_RATIO = 0.45
+BACKGROUND_WAND_DARK_SEED_MIN = 90
+BACKGROUND_WAND_GRADIENT_MAX = 24
 SOLID_P90_P10_MAX = 12
 SOLID_PEAK_RATIO_MIN = 0.62
 SOLID_CLOSE_DELTA_MAX = 10
@@ -90,6 +102,7 @@ def _ensure_dirs(img_dir: str) -> dict[str, str]:
         'mask': osp.join(out_dir, MASK_DIR),
         'other_mask': osp.join(out_dir, OTHER_MASK_DIR),
         'inpainted': osp.join(out_dir, INPAINTED_DIR),
+        'background_sample_cache': osp.join(out_dir, BACKGROUND_SAMPLE_CACHE_DIR),
     }
     for path in paths.values():
         os.makedirs(path, exist_ok=True)
@@ -106,6 +119,34 @@ def _mask_path(paths: dict[str, str], img_path: str) -> str:
 
 def _other_mask_path(paths: dict[str, str], img_path: str) -> str:
     return osp.join(paths['other_mask'], f'{Path(img_path).stem}.png')
+
+
+def _mask_hash(mask: np.ndarray | None) -> int:
+    if mask is None:
+        return 0
+    mask_bin = np.where(mask > 0, 255, 0).astype(np.uint8)
+    shape_hash = zlib.crc32(str(mask_bin.shape).encode('ascii'))
+    return zlib.crc32(mask_bin.tobytes(), shape_hash)
+
+
+def _background_sample_cache_path(paths: dict[str, str], img_path: str) -> str:
+    cache_dir = paths.get('background_sample_cache') or osp.join(paths['output'], BACKGROUND_SAMPLE_CACHE_DIR)
+    return osp.join(cache_dir, f'{Path(img_path).stem}.npz')
+
+
+def _save_background_sample_cache(
+    paths: dict[str, str],
+    img_path: str,
+    mask_hash: int,
+    sample: np.ndarray,
+) -> None:
+    cache_path = _background_sample_cache_path(paths, img_path)
+    os.makedirs(osp.dirname(cache_path), exist_ok=True)
+    np.savez_compressed(
+        cache_path,
+        mask_hash=np.array(mask_hash, dtype=np.uint32),
+        sample=np.where(sample > 0, 255, 0).astype(np.uint8),
+    )
 
 
 def _clip_box(box: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:
@@ -222,6 +263,26 @@ def _direction_mask(shape: tuple[int, int], repair_area: np.ndarray, direction: 
     return mask
 
 
+def sample_ring_from_mask(mask: np.ndarray) -> np.ndarray:
+    height, width = mask.shape[:2]
+    text_mask = np.where(mask > 0, 255, 0).astype(np.uint8)
+    boxes = _merge_boxes(_component_boxes(text_mask), GROUP_MERGE_PX, width, height)
+    repair_kernel = _kernel(REPAIR_EXPAND_PX)
+    ring_kernel = _kernel(SAMPLE_RING_PX)
+    sample_mask = np.zeros((height, width), dtype=np.uint8)
+
+    for box in boxes:
+        local_text = _mask_for_box(text_mask, box)
+        if not np.any(local_text):
+            continue
+        repair_area = cv2.dilate(local_text, repair_kernel, iterations=1)
+        expanded = cv2.dilate(repair_area, ring_kernel, iterations=1)
+        sample_ring = cv2.bitwise_and(expanded, cv2.bitwise_not(repair_area))
+        sample_ring = cv2.bitwise_and(sample_ring, cv2.bitwise_not(text_mask))
+        sample_mask = cv2.bitwise_or(sample_mask, sample_ring)
+    return sample_mask
+
+
 def _hist_channel(values: np.ndarray) -> tuple[int, float, int]:
     if values.size == 0:
         return 255, 0.0, 0
@@ -240,6 +301,218 @@ def _dominant_channel(values: np.ndarray) -> int:
         return 0
     hist = np.bincount(values.astype(np.uint8), minlength=256)
     return int(hist.argmax())
+
+
+def _sample_ring_for_local_text(
+    text_mask: np.ndarray,
+    local_text: np.ndarray,
+    repair_kernel: np.ndarray,
+    ring_kernel: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    repair_area = cv2.dilate(local_text, repair_kernel, iterations=1)
+    expanded = cv2.dilate(repair_area, ring_kernel, iterations=1)
+    sample_ring = cv2.bitwise_and(expanded, cv2.bitwise_not(repair_area))
+    sample_ring = cv2.bitwise_and(sample_ring, cv2.bitwise_not(text_mask))
+    return repair_area, sample_ring
+
+
+def _dominant_bgr(samples: np.ndarray) -> tuple[int, int, int]:
+    return (
+        _dominant_channel(samples[:, 0]),
+        _dominant_channel(samples[:, 1]),
+        _dominant_channel(samples[:, 2]),
+    )
+
+
+def _seed_search_mask(repair_area: np.ndarray, text_mask: np.ndarray) -> np.ndarray:
+    outer = cv2.dilate(repair_area, _kernel(BACKGROUND_WAND_SEED_SEARCH_PX), iterations=1)
+    inner = cv2.dilate(repair_area, _kernel(BACKGROUND_WAND_SEED_MIN_DISTANCE_PX), iterations=1)
+    search = cv2.bitwise_and(outer, cv2.bitwise_not(inner))
+    search = cv2.bitwise_and(search, cv2.bitwise_not(text_mask))
+    return search
+
+
+def _candidate_seed_points(
+    color_img: np.ndarray,
+    text_mask: np.ndarray,
+    repair_area: np.ndarray,
+    sample_ring: np.ndarray,
+) -> list[tuple[int, int]]:
+    gray = cv2.cvtColor(color_img, cv2.COLOR_BGR2GRAY)
+    grad_x = cv2.Sobel(gray, cv2.CV_16S, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray, cv2.CV_16S, 0, 1, ksize=3)
+    gradient = np.maximum(np.abs(grad_x), np.abs(grad_y)).astype(np.uint16)
+
+    search = _seed_search_mask(repair_area, text_mask) > 0
+    clean = (
+        search
+        & (text_mask == 0)
+        & (repair_area == 0)
+        & (gray >= BACKGROUND_WAND_DARK_SEED_MIN)
+        & (gradient <= BACKGROUND_WAND_GRADIENT_MAX)
+    )
+    if int(np.count_nonzero(clean)) < MIN_SAMPLE_PIXELS:
+        clean = search & (text_mask == 0) & (repair_area == 0) & (gray >= BACKGROUND_WAND_DARK_SEED_MIN)
+    if int(np.count_nonzero(clean)) < MIN_SAMPLE_PIXELS:
+        clean = (sample_ring > 0) & (text_mask == 0) & (repair_area == 0)
+    if int(np.count_nonzero(clean)) == 0:
+        return []
+
+    seed_pixels = color_img[clean]
+    dominant = np.array(_dominant_bgr(seed_pixels), dtype=np.int16)
+    ys, xs = np.where(clean)
+    colors = color_img[ys, xs].astype(np.int16)
+    color_delta = np.max(np.abs(colors - dominant), axis=1)
+    center_y, center_x = np.mean(np.where(repair_area > 0), axis=1)
+    distances = np.hypot(xs.astype(np.float32) - float(center_x), ys.astype(np.float32) - float(center_y))
+    scores = color_delta.astype(np.float32) + distances * 0.03 + gradient[ys, xs].astype(np.float32) * 0.3
+    order = np.argsort(scores)
+
+    points: list[tuple[int, int]] = []
+    used = np.zeros(clean.shape, dtype=np.uint8)
+    suppress_kernel = _kernel(5)
+    for idx in order:
+        x, y = int(xs[idx]), int(ys[idx])
+        if used[y, x] > 0:
+            continue
+        points.append((x, y))
+        marker = np.zeros(clean.shape, dtype=np.uint8)
+        marker[y, x] = 255
+        used = cv2.bitwise_or(used, cv2.dilate(marker, suppress_kernel, iterations=1))
+        if len(points) >= BACKGROUND_WAND_MAX_CANDIDATES:
+            break
+    return points
+
+
+def _wand_selection_from_seed(
+    color_img: np.ndarray,
+    seed: tuple[int, int],
+    roi_box: tuple[int, int, int, int],
+) -> np.ndarray:
+    h, w = color_img.shape[:2]
+    x1, y1, x2, y2 = roi_box
+    roi = color_img[y1:y2, x1:x2]
+    seed_x, seed_y = seed[0] - x1, seed[1] - y1
+    if seed_x < 0 or seed_y < 0 or seed_x >= roi.shape[1] or seed_y >= roi.shape[0]:
+        return np.zeros((h, w), dtype=np.uint8)
+    flood_mask = np.zeros((roi.shape[0] + 2, roi.shape[1] + 2), dtype=np.uint8)
+    diff = (BACKGROUND_WAND_TOLERANCE,) * 3
+    flags = 8 | cv2.FLOODFILL_FIXED_RANGE | cv2.FLOODFILL_MASK_ONLY | (255 << 8)
+    cv2.floodFill(roi.copy(), flood_mask, (seed_x, seed_y), (0, 0, 0), diff, diff, flags)
+    selection = np.zeros((h, w), dtype=np.uint8)
+    selection[y1:y2, x1:x2] = np.where(
+        flood_mask[1:roi.shape[0] + 1, 1:roi.shape[1] + 1] > 0,
+        255,
+        0,
+    ).astype(np.uint8)
+    return selection
+
+
+def _touches_roi_edge(selection: np.ndarray, roi_box: tuple[int, int, int, int], margin: int) -> bool:
+    x1, y1, x2, y2 = roi_box
+    roi_selection = selection[y1:y2, x1:x2] > 0
+    if not np.any(roi_selection):
+        return False
+    margin = max(1, min(margin, roi_selection.shape[0], roi_selection.shape[1]))
+    return bool(
+        np.any(roi_selection[:margin, :])
+        or np.any(roi_selection[-margin:, :])
+        or np.any(roi_selection[:, :margin])
+        or np.any(roi_selection[:, -margin:])
+    )
+
+
+def _background_wand_sample(
+    color_img: np.ndarray,
+    text_mask: np.ndarray,
+    repair_area: np.ndarray,
+    sample_ring: np.ndarray,
+) -> np.ndarray:
+    seeds = _candidate_seed_points(color_img, text_mask, repair_area, sample_ring)
+    if not seeds:
+        return sample_ring
+
+    h, w = sample_ring.shape[:2]
+    ys, xs = np.where(repair_area > 0)
+    if xs.size == 0:
+        return sample_ring
+    roi_box = _expand_box(
+        (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1),
+        BACKGROUND_WAND_ROI_PADDING_PX,
+        w,
+        h,
+    )
+    roi_area = max(1, (roi_box[2] - roi_box[0]) * (roi_box[3] - roi_box[1]))
+    max_area = int(roi_area * BACKGROUND_WAND_MAX_AREA_RATIO)
+    x1, y1, x2, y2 = roi_box
+    contact_kernel = _kernel(3)
+    contact_area = cv2.dilate(repair_area, contact_kernel, iterations=1)
+    best_selection: np.ndarray | None = None
+    best_score = -1.0
+    reject_count = 0
+
+    for seed in seeds:
+        if (
+            seed[0] <= x1 + BACKGROUND_WAND_EDGE_MARGIN_PX
+            or seed[0] >= x2 - BACKGROUND_WAND_EDGE_MARGIN_PX - 1
+            or seed[1] <= y1 + BACKGROUND_WAND_EDGE_MARGIN_PX
+            or seed[1] >= y2 - BACKGROUND_WAND_EDGE_MARGIN_PX - 1
+        ):
+            continue
+        selection = _wand_selection_from_seed(color_img, seed, roi_box)
+        selection = cv2.bitwise_and(selection, cv2.bitwise_not(text_mask))
+        selection = cv2.bitwise_and(selection, cv2.bitwise_not(repair_area))
+        if _touches_roi_edge(selection, roi_box, BACKGROUND_WAND_EDGE_MARGIN_PX):
+            reject_count += 1
+            if reject_count >= BACKGROUND_WAND_MAX_REJECTS and best_selection is None:
+                break
+            continue
+        area = int(np.count_nonzero(selection))
+        if area < MIN_SAMPLE_PIXELS or area > max_area:
+            if area > max_area:
+                reject_count += 1
+                if reject_count >= BACKGROUND_WAND_MAX_REJECTS and best_selection is None:
+                    break
+            continue
+        contact = int(np.count_nonzero((selection > 0) & (contact_area > 0)))
+        ring_contact = int(np.count_nonzero((selection > 0) & (sample_ring > 0)))
+        if contact == 0 and ring_contact < MIN_SAMPLE_PIXELS:
+            continue
+        score = area + ring_contact * 8 + contact * 4
+        if score > best_score:
+            best_score = score
+            best_selection = selection
+
+    if best_selection is not None:
+        return best_selection
+    return sample_ring
+
+
+def background_sample_from_mask(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    height, width = mask.shape[:2]
+    sample_mask = np.zeros((height, width), dtype=np.uint8)
+    for background in iter_background_samples_from_mask(img, mask):
+        sample_mask = cv2.bitwise_or(sample_mask, background)
+    return sample_mask
+
+
+def iter_background_samples_from_mask(img: np.ndarray, mask: np.ndarray):
+    color_img = img[:, :, :3].copy() if len(img.shape) == 3 else cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    height, width = mask.shape[:2]
+    text_mask = np.where(mask > 0, 255, 0).astype(np.uint8)
+    boxes = _merge_boxes(_component_boxes(text_mask), GROUP_MERGE_PX, width, height)
+    repair_kernel = _kernel(REPAIR_EXPAND_PX)
+    ring_kernel = _kernel(SAMPLE_RING_PX)
+
+    for box in boxes:
+        local_text = _mask_for_box(text_mask, box)
+        if not np.any(local_text):
+            continue
+        repair_area, sample_ring = _sample_ring_for_local_text(text_mask, local_text, repair_kernel, ring_kernel)
+        try:
+            yield _background_wand_sample(color_img, text_mask, repair_area, sample_ring)
+        except Exception:
+            yield sample_ring
 
 
 def _quality_from_sample(color_img: np.ndarray, sample_mask: np.ndarray, mode: str) -> SolidQuality:
@@ -357,7 +630,7 @@ def _best_quality(color_img: np.ndarray, repair_area: np.ndarray, sample_ring: n
 def _solid_overlay_from_mask(
     img: np.ndarray,
     mask: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, dict]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     if len(img.shape) == 2:
         color_img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     else:
@@ -369,17 +642,17 @@ def _solid_overlay_from_mask(
     ring_kernel = _kernel(SAMPLE_RING_PX)
     overlay = np.zeros((height, width, 4), dtype=np.uint8)
     other_mask = np.zeros((height, width), dtype=np.uint8)
+    background_sample_mask = np.zeros((height, width), dtype=np.uint8)
     debug_blocks = []
 
     for box in boxes:
         local_text = _mask_for_box(text_mask, box)
         if not np.any(local_text):
             continue
-        repair_area = cv2.dilate(local_text, repair_kernel, iterations=1)
-        expanded = cv2.dilate(repair_area, ring_kernel, iterations=1)
-        sample_ring = cv2.bitwise_and(expanded, cv2.bitwise_not(repair_area))
-        sample_ring = cv2.bitwise_and(sample_ring, cv2.bitwise_not(text_mask))
-        quality = _best_quality(color_img, repair_area, sample_ring)
+        repair_area, sample_ring = _sample_ring_for_local_text(text_mask, local_text, repair_kernel, ring_kernel)
+        background_sample = _background_wand_sample(color_img, text_mask, repair_area, sample_ring)
+        background_sample_mask = cv2.bitwise_or(background_sample_mask, background_sample)
+        quality = _best_quality(color_img, repair_area, background_sample)
 
         if quality.is_solid:
             active = repair_area > 0
@@ -401,7 +674,7 @@ def _solid_overlay_from_mask(
         'other_pixels': int(np.count_nonzero(other_mask)),
         'blocks_debug': debug_blocks,
     }
-    return overlay, other_mask, summary
+    return overlay, other_mask, background_sample_mask, summary
 
 
 def _bgr_to_pil_rgb(img: np.ndarray) -> Image.Image:
@@ -582,10 +855,11 @@ def regenerate_image_from_mask(
             raise FileNotFoundError(f'無法讀取 mask：{mask_path}')
     mask = np.where(mask > 0, 255, 0).astype(np.uint8)
 
-    overlay, other_mask, page_summary = _solid_overlay_from_mask(detect_img, mask)
+    overlay, other_mask, background_sample, page_summary = _solid_overlay_from_mask(detect_img, mask)
     imwrite(_mask_path(paths, img_path), mask)
     imwrite(_other_mask_path(paths, img_path), other_mask)
     imwrite(_output_path(paths, img_path), overlay)
+    _save_background_sample_cache(paths, img_path, _mask_hash(mask), background_sample)
     return page_summary
 
 
