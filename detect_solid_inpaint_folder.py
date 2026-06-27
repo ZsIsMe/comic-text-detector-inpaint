@@ -31,6 +31,8 @@ OUTPUT_DIR = 'ctd_inpainted'
 MASK_DIR = 'mask'
 OTHER_MASK_DIR = 'other_mask'
 INPAINTED_DIR = 'inpainted'
+MANUAL_SOLID_DIR = 'manual_solid'
+MANUAL_OTHER_DIR = 'manual_other'
 BACKGROUND_SAMPLE_CACHE_DIR = 'background_sample_cache'
 REPORT_JSON = 'solid_inpaint_report.json'
 PREVIEW_PDF = 'preview_report.pdf'
@@ -102,6 +104,8 @@ def _ensure_dirs(img_dir: str) -> dict[str, str]:
         'mask': osp.join(out_dir, MASK_DIR),
         'other_mask': osp.join(out_dir, OTHER_MASK_DIR),
         'inpainted': osp.join(out_dir, INPAINTED_DIR),
+        'manual_solid': osp.join(out_dir, MANUAL_SOLID_DIR),
+        'manual_other': osp.join(out_dir, MANUAL_OTHER_DIR),
         'background_sample_cache': osp.join(out_dir, BACKGROUND_SAMPLE_CACHE_DIR),
     }
     for path in paths.values():
@@ -119,6 +123,18 @@ def _mask_path(paths: dict[str, str], img_path: str) -> str:
 
 def _other_mask_path(paths: dict[str, str], img_path: str) -> str:
     return osp.join(paths['other_mask'], f'{Path(img_path).stem}.png')
+
+
+def _manual_solid_path(paths: dict[str, str], img_path: str) -> str:
+    manual_dir = paths.get('manual_solid') or osp.join(paths['output'], MANUAL_SOLID_DIR)
+    os.makedirs(manual_dir, exist_ok=True)
+    return osp.join(manual_dir, f'{Path(img_path).stem}.png')
+
+
+def _manual_other_path(paths: dict[str, str], img_path: str) -> str:
+    manual_dir = paths.get('manual_other') or osp.join(paths['output'], MANUAL_OTHER_DIR)
+    os.makedirs(manual_dir, exist_ok=True)
+    return osp.join(manual_dir, f'{Path(img_path).stem}.png')
 
 
 def _mask_hash(mask: np.ndarray | None) -> int:
@@ -677,6 +693,58 @@ def _solid_overlay_from_mask(
     return overlay, other_mask, background_sample_mask, summary
 
 
+def _manual_solid_overlay(
+    color_img: np.ndarray,
+    manual_solid: np.ndarray,
+    exclude_mask: np.ndarray,
+) -> tuple[np.ndarray, int, int]:
+    height, width = manual_solid.shape[:2]
+    solid_mask = np.where(manual_solid > 0, 255, 0).astype(np.uint8)
+    boxes = _merge_boxes(_component_boxes(solid_mask), GROUP_MERGE_PX, width, height)
+    overlay = np.zeros((height, width, 4), dtype=np.uint8)
+    ring_kernel = _kernel(SAMPLE_RING_PX)
+    filled_regions = 0
+
+    for box in boxes:
+        local_solid = _mask_for_box(solid_mask, box)
+        if not np.any(local_solid):
+            continue
+        expanded = cv2.dilate(local_solid, ring_kernel, iterations=1)
+        sample_ring = cv2.bitwise_and(expanded, cv2.bitwise_not(local_solid))
+        sample_ring = cv2.bitwise_and(sample_ring, cv2.bitwise_not(exclude_mask))
+        active_sample = sample_ring > 0
+        if int(np.count_nonzero(active_sample)) < MIN_SAMPLE_PIXELS:
+            expanded = cv2.dilate(local_solid, _kernel(SAMPLE_RING_PX * 2), iterations=1)
+            sample_ring = cv2.bitwise_and(expanded, cv2.bitwise_not(local_solid))
+            sample_ring = cv2.bitwise_and(sample_ring, cv2.bitwise_not(exclude_mask))
+            active_sample = sample_ring > 0
+        if int(np.count_nonzero(active_sample)) < MIN_SAMPLE_PIXELS:
+            continue
+
+        fill_bgr = _dominant_bgr(color_img[active_sample])
+        active = local_solid > 0
+        overlay[active, 0] = fill_bgr[0]
+        overlay[active, 1] = fill_bgr[1]
+        overlay[active, 2] = fill_bgr[2]
+        overlay[active, 3] = 255
+        filled_regions += 1
+
+    return overlay, filled_regions, int(np.count_nonzero(overlay[:, :, 3] > 0))
+
+
+def _read_optional_mask(path: str, shape: tuple[int, int]) -> np.ndarray:
+    if not osp.isfile(path):
+        return np.zeros(shape, dtype=np.uint8)
+    mask = imread(path, cv2.IMREAD_UNCHANGED)
+    if mask is None or mask.shape[:2] != shape:
+        return np.zeros(shape, dtype=np.uint8)
+    if len(mask.shape) == 3 and mask.shape[2] >= 4:
+        mask = mask[:, :, 3]
+    elif len(mask.shape) == 3:
+        mask = cv2.cvtColor(mask[:, :, :3], cv2.COLOR_BGR2GRAY)
+    return np.where(mask > 0, 255, 0).astype(np.uint8)
+
+
 def _bgr_to_pil_rgb(img: np.ndarray) -> Image.Image:
     if len(img.shape) == 2:
         return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_GRAY2RGB))
@@ -856,10 +924,27 @@ def regenerate_image_from_mask(
     mask = np.where(mask > 0, 255, 0).astype(np.uint8)
 
     overlay, other_mask, background_sample, page_summary = _solid_overlay_from_mask(detect_img, mask)
+    manual_solid = _read_optional_mask(_manual_solid_path(paths, img_path), mask.shape[:2])
+    manual_other = _read_optional_mask(_manual_other_path(paths, img_path), mask.shape[:2])
+    manual_solid_overlay, manual_solid_regions, manual_solid_pixels = _manual_solid_overlay(
+        detect_img,
+        manual_solid,
+        cv2.bitwise_or(mask, manual_solid),
+    )
+    manual_active = manual_solid_overlay[:, :, 3] > 0
+    overlay[manual_active] = manual_solid_overlay[manual_active]
+    other_mask = cv2.bitwise_or(other_mask, manual_other)
+    other_mask[manual_solid > 0] = 0
+
     imwrite(_mask_path(paths, img_path), mask)
     imwrite(_other_mask_path(paths, img_path), other_mask)
     imwrite(_output_path(paths, img_path), overlay)
     _save_background_sample_cache(paths, img_path, _mask_hash(mask), background_sample)
+    page_summary['manual_solid_requested_pixels'] = int(np.count_nonzero(manual_solid))
+    page_summary['manual_solid_pixels'] = manual_solid_pixels
+    page_summary['manual_solid_regions'] = manual_solid_regions
+    page_summary['manual_other_pixels'] = int(np.count_nonzero(manual_other))
+    page_summary['other_pixels'] = int(np.count_nonzero(other_mask))
     return page_summary
 
 

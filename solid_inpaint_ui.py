@@ -52,6 +52,8 @@ from detect_solid_inpaint_folder import (
     _ensure_dirs,
     _background_sample_cache_path,
     _mask_hash,
+    _manual_other_path,
+    _manual_solid_path,
     _mask_path,
     _other_mask_path,
     _output_path,
@@ -89,6 +91,16 @@ MASK_DISPLAY_COLORS: dict[str, tuple[int, int, int]] = {
     '黃色': (60, 220, 255),
     '綠色': (100, 230, 120),
 }
+EDIT_MODE_LABELS = {
+    'mask': '自動',
+    'manual_solid': '強制純色',
+    'manual_other': '需要修改',
+}
+EDIT_MODE_COLORS = {
+    'mask': (255, 255, 255),
+    'manual_solid': (100, 230, 120),
+    'manual_other': (165, 110, 255),
+}
 VIEW_ZOOM_STEP = 1.15
 VIEW_KEY_PAN_STEP = 80
 APP_VERSION = '0.2.0'
@@ -121,6 +133,27 @@ def _optional_imread(path: str, flags: int) -> np.ndarray | None:
         return None
 
 
+def _mask_from_optional_image(img: np.ndarray | None, shape: tuple[int, int]) -> np.ndarray:
+    if img is None or img.shape[:2] != shape:
+        return np.zeros(shape, dtype=np.uint8)
+    if len(img.shape) == 3 and img.shape[2] >= 4:
+        img = img[:, :, 3]
+    elif len(img.shape) == 3:
+        img = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2GRAY)
+    return np.where(img > 0, 255, 0).astype(np.uint8)
+
+
+def _imwrite_transparent_mask(path: str, mask: np.ndarray, color_bgr: tuple[int, int, int]) -> None:
+    mask_bin = np.where(mask > 0, 255, 0).astype(np.uint8)
+    overlay = np.zeros((mask_bin.shape[0], mask_bin.shape[1], 4), dtype=np.uint8)
+    active = mask_bin > 0
+    overlay[active, 0] = color_bgr[0]
+    overlay[active, 1] = color_bgr[1]
+    overlay[active, 2] = color_bgr[2]
+    overlay[active, 3] = 255
+    imwrite(path, overlay)
+
+
 def _load_background_sample_cache(paths: dict[str, str], img_path: str, mask: np.ndarray) -> np.ndarray | None:
     cache_path = _background_sample_cache_path(paths, img_path)
     if not osp.isfile(cache_path):
@@ -142,7 +175,6 @@ def _mask_overlay_image(
     mask: np.ndarray | None,
     alpha: float,
     color_bgr: tuple[int, int, int],
-    keep_mask_opacity: bool = False,
 ) -> np.ndarray:
     base_bgr = base[:, :, :3].copy() if len(base.shape) == 3 else cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
     if mask is None:
@@ -154,17 +186,37 @@ def _mask_overlay_image(
     color[:, :, 1] = color_bgr[1]
     color[:, :, 2] = color_bgr[2]
     blended = dimmed.copy()
-    if keep_mask_opacity:
-        blended[mask_active] = color[mask_active]
-    else:
-        blended[mask_active] = (
-            base_bgr[mask_active].astype(np.float32) * (1.0 - alpha)
-            + color[mask_active].astype(np.float32) * alpha
-        ).astype(np.uint8)
+    blended[mask_active] = (
+        base_bgr[mask_active].astype(np.float32) * (1.0 - alpha)
+        + color[mask_active].astype(np.float32) * alpha
+    ).astype(np.uint8)
     return blended
 
 
 def _overlay_mask_on_bgr(
+    base_bgr: np.ndarray,
+    mask: np.ndarray | None,
+    alpha: float,
+    color_bgr: tuple[int, int, int],
+) -> np.ndarray:
+    if mask is None:
+        return base_bgr
+    active = mask > 0
+    if not np.any(active):
+        return base_bgr
+    color = np.zeros_like(base_bgr)
+    color[:, :, 0] = color_bgr[0]
+    color[:, :, 1] = color_bgr[1]
+    color[:, :, 2] = color_bgr[2]
+    output = base_bgr.copy()
+    output[active] = (
+        output[active].astype(np.float32) * (1.0 - alpha)
+        + color[active].astype(np.float32) * alpha
+    ).astype(np.uint8)
+    return output
+
+
+def _overlay_transparent_mask_on_bgr(
     base_bgr: np.ndarray,
     mask: np.ndarray | None,
     alpha: float,
@@ -732,9 +784,11 @@ class MainWindow(QMainWindow):
         self.current_img_path = ''
         self.current_base: np.ndarray | None = None
         self.current_mask: np.ndarray | None = None
+        self.current_manual_solid: np.ndarray | None = None
+        self.current_manual_other: np.ndarray | None = None
         self.current_background_sample: np.ndarray | None = None
+        self.edit_mode = 'mask'
         self.alpha = 1.0
-        self.keep_mask_opacity = True
         self.mask_display_color = MASK_DISPLAY_COLORS['白色']
         self.show_other_mask = True
         self.show_background_sample = True
@@ -912,6 +966,22 @@ class MainWindow(QMainWindow):
         center_layout = QVBoxLayout(center_panel)
         center_layout.setContentsMargins(10, 10, 10, 10)
         center_layout.addWidget(QLabel('Mask / 原圖'))
+        mode_toolbar = QHBoxLayout()
+        self.edit_mask_btn = QPushButton('自動')
+        self.edit_mask_btn.setCheckable(True)
+        self.edit_mask_btn.setChecked(True)
+        self.edit_mask_btn.clicked.connect(lambda: self.set_edit_mode('mask'))
+        self.edit_manual_solid_btn = QPushButton('強制純色')
+        self.edit_manual_solid_btn.setCheckable(True)
+        self.edit_manual_solid_btn.clicked.connect(lambda: self.set_edit_mode('manual_solid'))
+        self.edit_manual_other_btn = QPushButton('需要修改')
+        self.edit_manual_other_btn.setCheckable(True)
+        self.edit_manual_other_btn.clicked.connect(lambda: self.set_edit_mode('manual_other'))
+        mode_toolbar.addWidget(self.edit_mask_btn)
+        mode_toolbar.addWidget(self.edit_manual_solid_btn)
+        mode_toolbar.addWidget(self.edit_manual_other_btn)
+        mode_toolbar.addStretch()
+        center_layout.addLayout(mode_toolbar)
         edit_toolbar = QHBoxLayout()
         self.rect_btn = QPushButton('F2 矩形')
         self.rect_btn.setCheckable(True)
@@ -979,10 +1049,6 @@ class MainWindow(QMainWindow):
         slider_row.addWidget(self.alpha_slider, 1)
         slider_row.addWidget(QLabel('0%'))
         slider_row.addWidget(self.alpha_label)
-        self.keep_mask_opacity_checkbox = QCheckBox('Mask 透明度不變')
-        self.keep_mask_opacity_checkbox.setChecked(True)
-        self.keep_mask_opacity_checkbox.stateChanged.connect(self.on_keep_mask_opacity_changed)
-        slider_row.addWidget(self.keep_mask_opacity_checkbox)
         slider_row.addWidget(QLabel('Mask 顏色'))
         self.mask_color_combo = QComboBox()
         for name in MASK_DISPLAY_COLORS:
@@ -1019,9 +1085,6 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.other_mask_checkbox)
         self.preview_view = ImageView()
         right_layout.addWidget(self.preview_view, 1)
-        self.stats_label = QLabel('未載入')
-        self.stats_label.setWordWrap(True)
-        right_layout.addWidget(self.stats_label)
         preview_buttons = QHBoxLayout()
         fit_btn2 = QPushButton('適應')
         fit_btn2.clicked.connect(self.preview_view.fit)
@@ -1034,6 +1097,9 @@ class MainWindow(QMainWindow):
         splitter.addWidget(right_panel)
 
         for button in (
+            self.edit_mask_btn,
+            self.edit_manual_solid_btn,
+            self.edit_manual_other_btn,
             self.brush_btn,
             self.rect_btn,
             self.magic_btn,
@@ -1053,7 +1119,7 @@ class MainWindow(QMainWindow):
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
-        self.status.showMessage('第二版：可編輯 mask，編輯後自動生成預覽。')
+        self.status.showMessage('可編輯 text mask、強制純色和需要修改 mask，編輯後自動生成預覽。')
         self.set_edit_tool('brush')
 
     def _apply_style(self) -> None:
@@ -1454,6 +1520,8 @@ class MainWindow(QMainWindow):
             return
         base = _optional_imread(self.current_img_path, cv2.IMREAD_UNCHANGED)
         mask = _optional_imread(_mask_path(self.paths, self.current_img_path), cv2.IMREAD_GRAYSCALE)
+        manual_solid = _optional_imread(_manual_solid_path(self.paths, self.current_img_path), cv2.IMREAD_UNCHANGED)
+        manual_other = _optional_imread(_manual_other_path(self.paths, self.current_img_path), cv2.IMREAD_UNCHANGED)
         other_mask = _optional_imread(_other_mask_path(self.paths, self.current_img_path), cv2.IMREAD_GRAYSCALE)
         overlay = _optional_imread(_output_path(self.paths, self.current_img_path), cv2.IMREAD_UNCHANGED)
         if base is None:
@@ -1461,12 +1529,14 @@ class MainWindow(QMainWindow):
         self.current_base = base
         shape = base.shape[:2]
         self.current_mask = np.where(mask > 0, 255, 0).astype(np.uint8) if mask is not None else np.zeros(shape, dtype=np.uint8)
+        self.current_manual_solid = _mask_from_optional_image(manual_solid, shape)
+        self.current_manual_other = _mask_from_optional_image(manual_other, shape)
         self.current_background_sample = _load_background_sample_cache(self.paths, self.current_img_path, self.current_mask)
         if self.current_background_sample is None:
             self.queue_background_sample()
         else:
             self.background_sample_status.setText('')
-        self.mask_view.set_mask(self.current_mask, shape)
+        self.mask_view.set_mask(self.current_edit_mask(), shape)
         self.mask_view.set_source_image(self.current_base)
         self.refresh_mask_preview(keep_view=keep_view)
 
@@ -1481,24 +1551,6 @@ class MainWindow(QMainWindow):
                 preview = _overlay_mask_on_bgr(preview, other_mask, 0.38, (165, 110, 255))
             self.preview_view.set_qimage(_qimage_from_bgr(preview), keep_view=keep_view)
 
-        info = self.report.get('pages', {}).get(osp.basename(self.current_img_path), {})
-        if 'error' in info:
-            self.stats_label.setText(
-                f'{osp.basename(self.current_img_path)}\n失敗：{info["error"]}'
-            )
-        elif info:
-            blocks = info.get('blocks', 0)
-            auto_blocks = info.get('auto_blocks', 0)
-            other_blocks = info.get('other_blocks', 0)
-            other_pixels = info.get('other_pixels', 0)
-            self.stats_label.setText(
-                f'{osp.basename(self.current_img_path)}\n'
-                f'blocks {blocks}    auto {auto_blocks}    '
-                f'other {other_blocks}    other_pixels {other_pixels}'
-            )
-        else:
-            self.stats_label.setText(f'{osp.basename(self.current_img_path)}\n未處理')
-
         self.update_edit_buttons()
 
     def refresh_mask_preview(self, keep_view: bool = True) -> None:
@@ -1510,7 +1562,18 @@ class MainWindow(QMainWindow):
             self.current_mask,
             self.alpha,
             self.mask_display_color,
-            self.keep_mask_opacity,
+        )
+        mask_preview = _overlay_transparent_mask_on_bgr(
+            mask_preview,
+            self.current_manual_solid,
+            self.alpha,
+            EDIT_MODE_COLORS['manual_solid'],
+        )
+        mask_preview = _overlay_transparent_mask_on_bgr(
+            mask_preview,
+            self.current_manual_other,
+            self.alpha,
+            EDIT_MODE_COLORS['manual_other'],
         )
         if self.show_background_sample and self.current_background_sample is not None:
             mask_preview = _overlay_mask_on_bgr(
@@ -1520,17 +1583,14 @@ class MainWindow(QMainWindow):
                 SAMPLE_RING_DISPLAY_COLOR_BGR,
             )
         self.mask_view.set_qimage(_qimage_from_bgr(mask_preview), keep_view=keep_view)
-        if self.current_mask is not None:
-            self.mask_view.set_mask(self.current_mask, self.current_base.shape[:2])
+        current_mask = self.current_edit_mask()
+        if current_mask is not None:
+            self.mask_view.set_mask(current_mask, self.current_base.shape[:2])
             self.mask_view.set_source_image(self.current_base)
 
     def on_alpha_changed(self, value: int) -> None:
         self.alpha = value / 100.0
         self.alpha_label.setText(f'目前 {value}%')
-        self.refresh_mask_preview(keep_view=True)
-
-    def on_keep_mask_opacity_changed(self, state: int) -> None:
-        self.keep_mask_opacity = state == Qt.CheckState.Checked.value
         self.refresh_mask_preview(keep_view=True)
 
     def on_mask_display_color_changed(self, color_name: str) -> None:
@@ -1546,6 +1606,46 @@ class MainWindow(QMainWindow):
     def on_show_other_mask_changed(self, state: int) -> None:
         self.show_other_mask = state == Qt.CheckState.Checked.value
         self.reload_current()
+
+    def current_edit_mask(self) -> np.ndarray | None:
+        if self.edit_mode == 'manual_solid':
+            return self.current_manual_solid
+        if self.edit_mode == 'manual_other':
+            return self.current_manual_other
+        return self.current_mask
+
+    def set_current_edit_mask(self, mask: np.ndarray) -> None:
+        mask = np.where(mask > 0, 255, 0).astype(np.uint8)
+        if self.edit_mode == 'manual_solid':
+            self.current_manual_solid = mask
+        elif self.edit_mode == 'manual_other':
+            self.current_manual_other = mask
+        else:
+            self.current_mask = mask
+
+    def current_edit_color(self) -> tuple[int, int, int]:
+        if self.edit_mode == 'mask':
+            return self.mask_display_color
+        return EDIT_MODE_COLORS[self.edit_mode]
+
+    def set_edit_mode(self, mode: str) -> None:
+        if mode not in EDIT_MODE_LABELS:
+            return
+        self.edit_mode = mode
+        self.undo_stack = []
+        self.redo_stack = []
+        self.edit_mask_btn.setChecked(mode == 'mask')
+        self.edit_manual_solid_btn.setChecked(mode == 'manual_solid')
+        self.edit_manual_other_btn.setChecked(mode == 'manual_other')
+        self.background_sample_checkbox.setEnabled(True)
+        if self.show_background_sample and self.current_background_sample is None:
+            self.queue_background_sample()
+        edit_mask = self.current_edit_mask()
+        if edit_mask is not None and self.current_base is not None:
+            self.mask_view.set_mask(edit_mask, self.current_base.shape[:2])
+        self.refresh_mask_preview(keep_view=True)
+        self.update_edit_buttons()
+        self.status.showMessage(f'正在編輯：{EDIT_MODE_LABELS[mode]}')
 
     def set_edit_tool(self, tool: str) -> None:
         self.mask_view.set_tool(tool)
@@ -1597,39 +1697,45 @@ class MainWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def push_undo_snapshot(self) -> None:
-        if self.current_mask is None:
+        edit_mask = self.current_edit_mask()
+        if edit_mask is None:
             return
-        self.undo_stack.append(self.current_mask.copy())
+        self.undo_stack.append(edit_mask.copy())
         self.undo_stack = self.undo_stack[-MAX_UNDO_STEPS:]
         self.redo_stack = []
         self.update_edit_buttons()
 
     def on_mask_edited(self, mask: object) -> None:
-        self.current_mask = np.where(np.asarray(mask) > 0, 255, 0).astype(np.uint8)
-        self.queue_background_sample()
-        self.save_current_mask()
+        self.set_current_edit_mask(np.asarray(mask))
+        if self.edit_mode == 'mask':
+            self.queue_background_sample()
+        self.save_current_edit_mask()
         self.refresh_mask_preview(keep_view=True)
         self.queue_auto_render()
         self.update_edit_buttons()
 
     def undo_mask(self) -> None:
-        if self.current_mask is None or not self.undo_stack:
+        edit_mask = self.current_edit_mask()
+        if edit_mask is None or not self.undo_stack:
             return
-        self.redo_stack.append(self.current_mask.copy())
-        self.current_mask = self.undo_stack.pop()
-        self.queue_background_sample()
-        self.save_current_mask()
+        self.redo_stack.append(edit_mask.copy())
+        self.set_current_edit_mask(self.undo_stack.pop())
+        if self.edit_mode == 'mask':
+            self.queue_background_sample()
+        self.save_current_edit_mask()
         self.refresh_mask_preview(keep_view=True)
         self.queue_auto_render()
         self.update_edit_buttons()
 
     def redo_mask(self) -> None:
-        if self.current_mask is None or not self.redo_stack:
+        edit_mask = self.current_edit_mask()
+        if edit_mask is None or not self.redo_stack:
             return
-        self.undo_stack.append(self.current_mask.copy())
-        self.current_mask = self.redo_stack.pop()
-        self.queue_background_sample()
-        self.save_current_mask()
+        self.undo_stack.append(edit_mask.copy())
+        self.set_current_edit_mask(self.redo_stack.pop())
+        if self.edit_mode == 'mask':
+            self.queue_background_sample()
+        self.save_current_edit_mask()
         self.refresh_mask_preview(keep_view=True)
         self.queue_auto_render()
         self.update_edit_buttons()
@@ -1642,6 +1748,27 @@ class MainWindow(QMainWindow):
         if not self.current_img_path or self.current_mask is None:
             return
         imwrite(_mask_path(self.paths, self.current_img_path), self.current_mask)
+
+    def save_current_edit_mask(self) -> None:
+        if not self.current_img_path:
+            return
+        if self.edit_mode == 'manual_solid':
+            if self.current_manual_solid is not None:
+                _imwrite_transparent_mask(
+                    _manual_solid_path(self.paths, self.current_img_path),
+                    self.current_manual_solid,
+                    EDIT_MODE_COLORS['manual_solid'],
+                )
+            return
+        if self.edit_mode == 'manual_other':
+            if self.current_manual_other is not None:
+                _imwrite_transparent_mask(
+                    _manual_other_path(self.paths, self.current_img_path),
+                    self.current_manual_other,
+                    EDIT_MODE_COLORS['manual_other'],
+                )
+            return
+        self.save_current_mask()
 
     def queue_background_sample(self) -> None:
         self.background_sample_request_id += 1
@@ -1751,7 +1878,7 @@ class MainWindow(QMainWindow):
             return
         self.pending_render_img_path = self.current_img_path
         self.pending_render_mask = self.current_mask.copy()
-        self.stats_label.setText(f'{osp.basename(self.current_img_path)}\n正在生成預覽...')
+        self.status.showMessage(f'{osp.basename(self.current_img_path)} 正在生成預覽...')
         self.render_timer.start(450)
 
     def start_pending_render(self) -> None:
@@ -1797,9 +1924,7 @@ class MainWindow(QMainWindow):
         self.report = build_report(self.folder, self.paths, self.imglist, pages)
         write_report(self.paths, self.report)
         self.refresh_list()
-        if img_path == self.current_img_path:
-            self.stats_label.setText(f'{osp.basename(img_path)}\n失敗：{message}')
-        self.status.showMessage('預覽生成失敗。')
+        self.status.showMessage(f'{osp.basename(img_path)} 預覽生成失敗：{message}')
         if self.pending_render_img_path:
             self.render_timer.start(50)
 
