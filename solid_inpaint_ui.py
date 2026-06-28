@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSplitter,
     QStatusBar,
+    QButtonGroup,
     QToolBar,
     QToolButton,
     QVBoxLayout,
@@ -79,6 +80,7 @@ STATUS_TODO = '未處理'
 MAX_RECENT_FOLDERS = 12
 MAX_FOLDER_PROGRESS = 200
 MAX_UNDO_STEPS = 30
+DEFAULT_MASK_ALPHA_PERCENT = 80
 DEFAULT_BRUSH_RADIUS = 24
 MIN_BRUSH_RADIUS = 2
 MAX_BRUSH_RADIUS = 160
@@ -96,6 +98,12 @@ EDIT_MODE_LABELS = {
     'mask': '自動',
     'manual_solid': '強制純色',
     'manual_other': '需要修改',
+}
+SELECTION_COMBINE_LABELS = {
+    'add': '添加',
+    'subtract': '減去',
+    'local_intersect': '局部交集',
+    'transfer_from_other': '從其他轉入',
 }
 EDIT_MODE_COLORS = {
     'mask': (255, 255, 255),
@@ -307,12 +315,23 @@ class ImageView(QGraphicsView):
         self.resetTransform()
         self._zoom = 1.0
 
-    def zoom_by(self, factor: float, keep_center: bool = False) -> None:
+    def zoom_by(
+        self,
+        factor: float,
+        keep_center: bool = False,
+        anchor_pos: QPoint | None = None,
+    ) -> None:
         if self.pixmap_item.pixmap().isNull():
             return
         old_center = self.mapToScene(self.viewport().rect().center()) if keep_center else None
+        old_anchor_scene = self.mapToScene(anchor_pos) if anchor_pos is not None else None
         self._zoom *= factor
         self.scale(factor, factor)
+        if old_anchor_scene is not None and anchor_pos is not None:
+            new_anchor_view = self.mapFromScene(old_anchor_scene)
+            delta = new_anchor_view - anchor_pos
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() + delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() + delta.y())
         if old_center is not None:
             self.centerOn(old_center)
 
@@ -326,30 +345,41 @@ class ImageView(QGraphicsView):
         if self.pixmap_item.pixmap().isNull():
             return
         pixel_delta = event.pixelDelta()
-        zoom_modifier = bool(
-            event.modifiers() & Qt.KeyboardModifier.MetaModifier
-            or event.modifiers() & Qt.KeyboardModifier.ControlModifier
-        )
-        if not pixel_delta.isNull() and not zoom_modifier:
+        angle_delta = event.angleDelta()
+        modifiers = event.modifiers()
+        if modifiers & Qt.KeyboardModifier.AltModifier:
+            zoom_delta = pixel_delta.y() if not pixel_delta.isNull() else angle_delta.y()
+            if zoom_delta != 0:
+                factor = VIEW_ZOOM_STEP if zoom_delta > 0 else 1 / VIEW_ZOOM_STEP
+                self.zoom_by(factor, anchor_pos=event.position().toPoint())
+            event.accept()
+            return
+        if modifiers & Qt.KeyboardModifier.ControlModifier:
+            horizontal_delta = pixel_delta.x() if not pixel_delta.isNull() and pixel_delta.x() else angle_delta.x()
+            vertical_delta = pixel_delta.y() if not pixel_delta.isNull() and pixel_delta.y() else angle_delta.y()
+            pan_delta = horizontal_delta if horizontal_delta else vertical_delta
+            if pan_delta:
+                self.pan_by(-pan_delta, 0)
+            event.accept()
+            return
+        if not pixel_delta.isNull():
             self.pan_by(-pixel_delta.x(), -pixel_delta.y())
             event.accept()
             return
-        zoom_delta = pixel_delta.y() if not pixel_delta.isNull() else event.angleDelta().y()
-        if zoom_delta == 0:
-            event.accept()
-            return
-        factor = VIEW_ZOOM_STEP if zoom_delta > 0 else 1 / VIEW_ZOOM_STEP
-        self.zoom_by(factor, keep_center=True)
+        if not angle_delta.isNull():
+            self.pan_by(-angle_delta.x(), -angle_delta.y())
         event.accept()
 
 
 class MaskEditorView(ImageView):
     editStarted = Signal()
     maskEdited = Signal(object)
+    selectionCreated = Signal(object)
 
     def __init__(self) -> None:
         super().__init__()
         self.tool = 'brush'
+        self.selection_combine_mode = 'add'
         self.brush_radius = DEFAULT_BRUSH_RADIUS
         self.magic_tolerance = DEFAULT_MAGIC_TOLERANCE
         self.mask: np.ndarray | None = None
@@ -366,6 +396,7 @@ class MaskEditorView(ImageView):
         self._magic_cursor = _make_magic_cursor()
         self._rect_pen_add = QPen(QColor('#e9fffb'), 2, Qt.PenStyle.DashLine)
         self._rect_pen_remove = QPen(QColor('#ff8f8f'), 2, Qt.PenStyle.DashLine)
+        self._rect_pen_intersect = QPen(QColor('#ffd86f'), 2, Qt.PenStyle.DashLine)
         self._brush_pen = QPen(QColor('#e9fffb'), 2)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.setMouseTracking(True)
@@ -392,6 +423,10 @@ class MaskEditorView(ImageView):
         self._clear_rubber_band()
         self._update_brush_cursor_visibility()
         self._update_tool_cursor()
+
+    def set_selection_combine_mode(self, mode: str) -> None:
+        if mode in SELECTION_COMBINE_LABELS:
+            self.selection_combine_mode = mode
 
     def set_brush_radius(self, radius: int) -> None:
         self.brush_radius = max(MIN_BRUSH_RADIUS, min(MAX_BRUSH_RADIUS, int(radius)))
@@ -432,13 +467,10 @@ class MaskEditorView(ImageView):
             super().mousePressEvent(event)
             return
         if self.tool == 'magic':
-            replace = (
-                event.button() == Qt.MouseButton.LeftButton
-                and bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
-            )
-            if self._apply_magic_wand(point, event.button(), replace=replace):
+            if self._apply_magic_wand(point, event.button()):
                 self._begin_edit_once()
-                self.maskEdited.emit(self.mask.copy())
+                if self.mask is not None:
+                    self.maskEdited.emit(self.mask.copy())
             self._edit_started = False
             event.accept()
             return
@@ -494,9 +526,10 @@ class MaskEditorView(ImageView):
             return
         point = self.image_point_from_view(event.position().toPoint(), clamp=True)
         if self.tool == 'rect' and self.mask is not None and self._drag_start is not None and point is not None:
-            self._begin_edit_once()
-            self._apply_rect(self._drag_start, point, self._active_button)
-            self.maskEdited.emit(self.mask.copy())
+            if self._apply_rect(self._drag_start, point, self._active_button):
+                self._begin_edit_once()
+                if self.mask is not None:
+                    self.maskEdited.emit(self.mask.copy())
         self._active_button = None
         self._drag_start = None
         self._last_brush_point = None
@@ -543,21 +576,26 @@ class MaskEditorView(ImageView):
         start: tuple[int, int],
         end: tuple[int, int],
         button: Qt.MouseButton,
-    ) -> None:
+    ) -> bool:
         if self.mask is None:
-            return
+            return False
         x1, x2 = sorted((start[0], end[0]))
         y1, y2 = sorted((start[1], end[1]))
         if x2 < x1 or y2 < y1:
-            return
-        value = 255 if button == Qt.MouseButton.LeftButton else 0
-        self.mask[y1:y2 + 1, x1:x2 + 1] = value
+            return False
+        old_mask = self.mask.copy()
+        selection = np.zeros(self.mask.shape[:2], dtype=bool)
+        selection[y1:y2 + 1, x1:x2 + 1] = True
+        if self._should_emit_selection(button):
+            self.selectionCreated.emit(selection.copy())
+            return False
+        self._apply_selection(selection, button)
+        return not np.array_equal(old_mask, self.mask)
 
     def _apply_magic_wand(
         self,
         point: tuple[int, int],
         button: Qt.MouseButton,
-        replace: bool = False,
     ) -> bool:
         if self.mask is None or self.source_bgr is None:
             return False
@@ -585,14 +623,53 @@ class MaskEditorView(ImageView):
         selection = flood_mask[1:height + 1, 1:width + 1] > 0
         if not np.any(selection):
             return False
+        if self._should_emit_selection(button):
+            self.selectionCreated.emit(selection.copy())
+            return False
         old_mask = self.mask.copy()
-        if replace:
-            self.mask[:, :] = 0
-            self.mask[selection] = 255
-            return not np.array_equal(old_mask, self.mask)
-        value = 255 if button == Qt.MouseButton.LeftButton else 0
-        self.mask[selection] = value
+        self._apply_selection(selection, button)
         return not np.array_equal(old_mask, self.mask)
+
+    def _apply_selection(self, selection: np.ndarray, button: Qt.MouseButton) -> None:
+        if self.mask is None:
+            return
+        operation = self._selection_operation_for_button(button)
+        if operation == 'add':
+            self.mask[selection] = 255
+            return
+        if operation == 'subtract':
+            self.mask[selection] = 0
+            return
+        if operation == 'local_intersect':
+            self._apply_local_intersection(selection)
+
+    def _selection_operation_for_button(self, button: Qt.MouseButton) -> str:
+        if button == Qt.MouseButton.RightButton:
+            return 'subtract'
+        return self.selection_combine_mode
+
+    def _should_emit_selection(self, button: Qt.MouseButton) -> bool:
+        return (
+            button == Qt.MouseButton.LeftButton
+            and self.selection_combine_mode == 'transfer_from_other'
+        )
+
+    def _apply_local_intersection(self, selection: np.ndarray) -> None:
+        if self.mask is None:
+            return
+        current = self.mask > 0
+        overlap = current & selection
+        if not np.any(overlap):
+            return
+        _, labels = cv2.connectedComponents(current.astype(np.uint8), connectivity=8)
+        hit_labels = np.unique(labels[overlap])
+        hit_labels = hit_labels[hit_labels != 0]
+        if hit_labels.size == 0:
+            return
+        touched_components = np.isin(labels, hit_labels)
+        next_mask = current.copy()
+        next_mask[touched_components] = selection[touched_components]
+        self.mask[:, :] = np.where(next_mask, 255, 0).astype(np.uint8)
 
     def _update_rubber_band(
         self,
@@ -606,9 +683,13 @@ class MaskEditorView(ImageView):
             self._rubber_band = QGraphicsRectItem()
             self._rubber_band.setBrush(QColor(255, 255, 255, 30))
             self.scene().addItem(self._rubber_band)
-        self._rubber_band.setPen(
-            self._rect_pen_add if button == Qt.MouseButton.LeftButton else self._rect_pen_remove
-        )
+        operation = self._selection_operation_for_button(button)
+        if operation == 'subtract':
+            self._rubber_band.setPen(self._rect_pen_remove)
+        elif operation in ('local_intersect', 'transfer_from_other'):
+            self._rubber_band.setPen(self._rect_pen_intersect)
+        else:
+            self._rubber_band.setPen(self._rect_pen_add)
         self._rubber_band.setRect(x1, y1, max(1, x2 - x1), max(1, y2 - y1))
 
     def _clear_rubber_band(self) -> None:
@@ -789,12 +870,15 @@ class MainWindow(QMainWindow):
         self.current_manual_other: np.ndarray | None = None
         self.current_background_sample: np.ndarray | None = None
         self.edit_mode = 'mask'
-        self.alpha = 1.0
+        self.selection_combine_mode = 'add'
+        self.settings = QSettings('ComicTextDetector', 'SolidInpaintUI')
+        self.mask_alpha_percent = self._load_mask_alpha_percent()
+        self.alpha = self.mask_alpha_percent / 100.0
         self.mask_display_color = MASK_DISPLAY_COLORS['白色']
         self.show_other_mask = True
         self.show_background_sample = True
-        self.undo_stack: list[np.ndarray] = []
-        self.redo_stack: list[np.ndarray] = []
+        self.undo_stack: list[dict[str, np.ndarray]] = []
+        self.redo_stack: list[dict[str, np.ndarray]] = []
         self.worker_thread: QThread | None = None
         self.worker: FolderWorker | None = None
         self.page_worker_thread: QThread | None = None
@@ -815,7 +899,10 @@ class MainWindow(QMainWindow):
         self.background_sample_timer = QTimer(self)
         self.background_sample_timer.setSingleShot(True)
         self.background_sample_timer.timeout.connect(self.start_background_sample_worker)
-        self.settings = QSettings('ComicTextDetector', 'SolidInpaintUI')
+        self.resize_fit_timer = QTimer(self)
+        self.resize_fit_timer.setSingleShot(True)
+        self.resize_fit_timer.timeout.connect(self.fit_both_views)
+        self.auto_fit_on_resize = False
         self.recent_folders = self._load_recent_folders()
         self.folder_progress = self._load_folder_progress()
 
@@ -969,14 +1056,14 @@ class MainWindow(QMainWindow):
         center_layout.setContentsMargins(10, 10, 10, 10)
         center_layout.addWidget(QLabel('Mask / 原圖'))
         mode_toolbar = QHBoxLayout()
-        self.edit_mask_btn = QPushButton('自動')
+        self.edit_mask_btn = QPushButton('F5 自動')
         self.edit_mask_btn.setCheckable(True)
         self.edit_mask_btn.setChecked(True)
         self.edit_mask_btn.clicked.connect(lambda: self.set_edit_mode('mask'))
-        self.edit_manual_solid_btn = QPushButton('強制純色')
+        self.edit_manual_solid_btn = QPushButton('F6 強制純色')
         self.edit_manual_solid_btn.setCheckable(True)
         self.edit_manual_solid_btn.clicked.connect(lambda: self.set_edit_mode('manual_solid'))
-        self.edit_manual_other_btn = QPushButton('需要修改')
+        self.edit_manual_other_btn = QPushButton('F7 需要修改')
         self.edit_manual_other_btn.setCheckable(True)
         self.edit_manual_other_btn.clicked.connect(lambda: self.set_edit_mode('manual_other'))
         mode_toolbar.addWidget(self.edit_mask_btn)
@@ -985,16 +1072,38 @@ class MainWindow(QMainWindow):
         mode_toolbar.addStretch()
         center_layout.addLayout(mode_toolbar)
         edit_toolbar = QHBoxLayout()
-        self.rect_btn = QPushButton('F2 矩形')
+        self.rect_btn = QPushButton('F1 矩形')
         self.rect_btn.setCheckable(True)
         self.rect_btn.clicked.connect(lambda: self.set_edit_tool('rect'))
         self.magic_btn = QPushButton('F3 魔法棒')
         self.magic_btn.setCheckable(True)
         self.magic_btn.clicked.connect(lambda: self.set_edit_tool('magic'))
-        self.brush_btn = QPushButton('F1 筆刷')
+        self.brush_btn = QPushButton('F2 筆刷')
         self.brush_btn.setCheckable(True)
-        self.brush_btn.setChecked(True)
         self.brush_btn.clicked.connect(lambda: self.set_edit_tool('brush'))
+        self.selection_add_btn = QPushButton('添加')
+        self.selection_add_btn.setCheckable(True)
+        self.selection_add_btn.setChecked(True)
+        self.selection_add_btn.setToolTip('矩形和魔法棒左鍵添加到目前 mask')
+        self.selection_subtract_btn = QPushButton('減去')
+        self.selection_subtract_btn.setCheckable(True)
+        self.selection_subtract_btn.setToolTip('矩形和魔法棒左鍵從目前 mask 減去；右鍵也會固定減去')
+        self.selection_intersect_btn = QPushButton('局部交集')
+        self.selection_intersect_btn.setCheckable(True)
+        self.selection_intersect_btn.setToolTip('只裁切本次選區碰到的既有 mask 區塊，不影響其他區塊')
+        self.selection_transfer_btn = QPushButton('從其他轉入')
+        self.selection_transfer_btn.setCheckable(True)
+        self.selection_transfer_btn.setToolTip('把本次選區內其他 mask 的重疊部分移到目前 mask，並從原 mask 移除')
+        self.selection_combine_group = QButtonGroup(self)
+        self.selection_combine_group.setExclusive(True)
+        self.selection_combine_group.addButton(self.selection_add_btn)
+        self.selection_combine_group.addButton(self.selection_subtract_btn)
+        self.selection_combine_group.addButton(self.selection_intersect_btn)
+        self.selection_combine_group.addButton(self.selection_transfer_btn)
+        self.selection_add_btn.clicked.connect(lambda: self.set_selection_combine_mode('add'))
+        self.selection_subtract_btn.clicked.connect(lambda: self.set_selection_combine_mode('subtract'))
+        self.selection_intersect_btn.clicked.connect(lambda: self.set_selection_combine_mode('local_intersect'))
+        self.selection_transfer_btn.clicked.connect(lambda: self.set_selection_combine_mode('transfer_from_other'))
         self.undo_btn = QPushButton('撤銷')
         self.undo_btn.clicked.connect(self.undo_mask)
         self.redo_btn = QPushButton('重做')
@@ -1010,9 +1119,19 @@ class MainWindow(QMainWindow):
         self.magic_tolerance_slider.setValue(DEFAULT_MAGIC_TOLERANCE)
         self.magic_tolerance_slider.setFixedWidth(130)
         self.magic_tolerance_slider.valueChanged.connect(self.on_magic_tolerance_changed)
-        edit_toolbar.addWidget(self.brush_btn)
         edit_toolbar.addWidget(self.rect_btn)
+        edit_toolbar.addWidget(self.brush_btn)
         edit_toolbar.addWidget(self.magic_btn)
+        edit_toolbar.addSpacing(10)
+        self.selection_combine_controls = QWidget()
+        selection_combine_layout = QHBoxLayout(self.selection_combine_controls)
+        selection_combine_layout.setContentsMargins(0, 0, 0, 0)
+        selection_combine_layout.setSpacing(8)
+        selection_combine_layout.addWidget(self.selection_add_btn)
+        selection_combine_layout.addWidget(self.selection_subtract_btn)
+        selection_combine_layout.addWidget(self.selection_intersect_btn)
+        selection_combine_layout.addWidget(self.selection_transfer_btn)
+        edit_toolbar.addWidget(self.selection_combine_controls)
         edit_toolbar.addSpacing(10)
         self.brush_controls = QWidget()
         brush_controls_layout = QHBoxLayout(self.brush_controls)
@@ -1038,15 +1157,16 @@ class MainWindow(QMainWindow):
         self.mask_view = MaskEditorView()
         self.mask_view.editStarted.connect(self.push_undo_snapshot)
         self.mask_view.maskEdited.connect(self.on_mask_edited)
+        self.mask_view.selectionCreated.connect(self.on_selection_created)
         center_layout.addWidget(self.mask_view, 1)
         slider_row = QHBoxLayout()
         slider_row.addWidget(QLabel('Mask 顯示'))
         self.alpha_slider = QSlider(Qt.Orientation.Horizontal)
         self.alpha_slider.setRange(0, 100)
         self.alpha_slider.setInvertedAppearance(True)
-        self.alpha_slider.setValue(100)
+        self.alpha_slider.setValue(self.mask_alpha_percent)
         self.alpha_slider.valueChanged.connect(self.on_alpha_changed)
-        self.alpha_label = QLabel('目前 100%')
+        self.alpha_label = QLabel(f'目前 {self.mask_alpha_percent}%')
         slider_row.addWidget(QLabel('100%'))
         slider_row.addWidget(self.alpha_slider, 1)
         slider_row.addWidget(QLabel('0%'))
@@ -1067,12 +1187,10 @@ class MainWindow(QMainWindow):
         slider_row.addWidget(self.background_sample_status)
         center_layout.addLayout(slider_row)
         view_buttons = QHBoxLayout()
-        fit_btn = QPushButton('適應')
-        fit_btn.clicked.connect(self.mask_view.fit)
-        actual_btn = QPushButton('100%')
-        actual_btn.clicked.connect(self.mask_view.actual_size)
+        fit_btn = QPushButton('F4')
+        fit_btn.setToolTip('兩張圖同時適應窗口')
+        fit_btn.clicked.connect(self.fit_both_views)
         view_buttons.addWidget(fit_btn)
-        view_buttons.addWidget(actual_btn)
         view_buttons.addStretch()
         center_layout.addLayout(view_buttons)
         splitter.addWidget(center_panel)
@@ -1087,15 +1205,6 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.other_mask_checkbox)
         self.preview_view = ImageView()
         right_layout.addWidget(self.preview_view, 1)
-        preview_buttons = QHBoxLayout()
-        fit_btn2 = QPushButton('適應')
-        fit_btn2.clicked.connect(self.preview_view.fit)
-        actual_btn2 = QPushButton('100%')
-        actual_btn2.clicked.connect(self.preview_view.actual_size)
-        preview_buttons.addWidget(fit_btn2)
-        preview_buttons.addWidget(actual_btn2)
-        preview_buttons.addStretch()
-        right_layout.addLayout(preview_buttons)
         splitter.addWidget(right_panel)
 
         for button in (
@@ -1105,14 +1214,15 @@ class MainWindow(QMainWindow):
             self.brush_btn,
             self.rect_btn,
             self.magic_btn,
+            self.selection_add_btn,
+            self.selection_subtract_btn,
+            self.selection_intersect_btn,
+            self.selection_transfer_btn,
             self.undo_btn,
             self.redo_btn,
             self.brush_down_btn,
             self.brush_up_btn,
             fit_btn,
-            actual_btn,
-            fit_btn2,
-            actual_btn2,
         ):
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
@@ -1122,7 +1232,9 @@ class MainWindow(QMainWindow):
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         self.status.showMessage('可編輯 text mask、強制純色和需要修改 mask，編輯後自動生成預覽。')
-        self.set_edit_tool('brush')
+        self.set_selection_combine_mode('add')
+        self.set_edit_tool('rect')
+        self.auto_fit_on_resize = True
 
     def _apply_style(self) -> None:
         self.setStyleSheet(
@@ -1206,6 +1318,17 @@ class MainWindow(QMainWindow):
             seen.add(normalized)
             result.append(normalized)
         return result[:MAX_RECENT_FOLDERS]
+
+    def _load_mask_alpha_percent(self) -> int:
+        value = self.settings.value('mask_alpha_percent', DEFAULT_MASK_ALPHA_PERCENT)
+        try:
+            percent = int(value)
+        except (TypeError, ValueError):
+            percent = DEFAULT_MASK_ALPHA_PERCENT
+        return max(0, min(100, percent))
+
+    def save_mask_alpha_percent(self) -> None:
+        self.settings.setValue('mask_alpha_percent', self.mask_alpha_percent)
 
     def save_recent_folders(self) -> None:
         self.settings.setValue('recent_folders', self.recent_folders)
@@ -1635,8 +1758,10 @@ class MainWindow(QMainWindow):
             self.mask_view.set_source_image(self.current_base)
 
     def on_alpha_changed(self, value: int) -> None:
+        self.mask_alpha_percent = max(0, min(100, int(value)))
         self.alpha = value / 100.0
         self.alpha_label.setText(f'目前 {value}%')
+        self.save_mask_alpha_percent()
         self.refresh_mask_preview(keep_view=True)
 
     def on_mask_display_color_changed(self, color_name: str) -> None:
@@ -1659,6 +1784,39 @@ class MainWindow(QMainWindow):
         if self.edit_mode == 'manual_other':
             return self.current_manual_other
         return self.current_mask
+
+    def current_masks_snapshot(self) -> dict[str, np.ndarray]:
+        return {
+            'mask': self.current_mask.copy() if self.current_mask is not None else np.zeros((1, 1), dtype=np.uint8),
+            'manual_solid': (
+                self.current_manual_solid.copy()
+                if self.current_manual_solid is not None
+                else np.zeros_like(self.current_mask)
+                if self.current_mask is not None
+                else np.zeros((1, 1), dtype=np.uint8)
+            ),
+            'manual_other': (
+                self.current_manual_other.copy()
+                if self.current_manual_other is not None
+                else np.zeros_like(self.current_mask)
+                if self.current_mask is not None
+                else np.zeros((1, 1), dtype=np.uint8)
+            ),
+        }
+
+    def restore_masks_snapshot(self, snapshot: dict[str, np.ndarray]) -> None:
+        self.current_mask = np.where(snapshot['mask'] > 0, 255, 0).astype(np.uint8)
+        self.current_manual_solid = np.where(snapshot['manual_solid'] > 0, 255, 0).astype(np.uint8)
+        self.current_manual_other = np.where(snapshot['manual_other'] > 0, 255, 0).astype(np.uint8)
+
+    def mask_for_mode(self, mode: str) -> np.ndarray | None:
+        if mode == 'manual_solid':
+            return self.current_manual_solid
+        if mode == 'manual_other':
+            return self.current_manual_other
+        if mode == 'mask':
+            return self.current_mask
+        return None
 
     def set_current_edit_mask(self, mask: np.ndarray) -> None:
         mask = np.where(mask > 0, 255, 0).astype(np.uint8)
@@ -1698,8 +1856,29 @@ class MainWindow(QMainWindow):
         self.brush_btn.setChecked(tool == 'brush')
         self.rect_btn.setChecked(tool == 'rect')
         self.magic_btn.setChecked(tool == 'magic')
+        if tool in ('rect', 'magic') and self.selection_combine_mode != 'add':
+            self.set_selection_combine_mode('add')
+        self.selection_combine_controls.setVisible(tool in ('rect', 'magic'))
         self.brush_controls.setVisible(tool == 'brush')
         self.magic_controls.setVisible(tool == 'magic')
+        self.update_selection_combine_status()
+
+    def set_selection_combine_mode(self, mode: str) -> None:
+        if mode not in SELECTION_COMBINE_LABELS:
+            return
+        self.selection_combine_mode = mode
+        self.mask_view.set_selection_combine_mode(mode)
+        self.selection_add_btn.setChecked(mode == 'add')
+        self.selection_subtract_btn.setChecked(mode == 'subtract')
+        self.selection_intersect_btn.setChecked(mode == 'local_intersect')
+        self.selection_transfer_btn.setChecked(mode == 'transfer_from_other')
+        self.update_selection_combine_status()
+
+    def update_selection_combine_status(self) -> None:
+        if getattr(self, 'mask_view', None) is None or self.mask_view.tool == 'brush':
+            return
+        label = SELECTION_COMBINE_LABELS.get(self.selection_combine_mode, '添加')
+        self.status.showMessage(f'選區模式：{label}；右鍵固定減去')
 
     def change_brush_radius(self, delta: int) -> None:
         self.mask_view.set_brush_radius(self.mask_view.brush_radius + delta)
@@ -1709,15 +1888,36 @@ class MainWindow(QMainWindow):
         self.mask_view.set_magic_tolerance(value)
         self.magic_tolerance_label.setText(f'容差 {value}')
 
+    def fit_both_views(self) -> None:
+        self.mask_view.fit()
+        self.preview_view.fit()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if getattr(self, 'auto_fit_on_resize', False):
+            self.resize_fit_timer.start(120)
+
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_F1:
-            self.set_edit_tool('brush')
+            self.set_edit_tool('rect')
             return
         if event.key() == Qt.Key.Key_F2:
-            self.set_edit_tool('rect')
+            self.set_edit_tool('brush')
             return
         if event.key() == Qt.Key.Key_F3:
             self.set_edit_tool('magic')
+            return
+        if event.key() == Qt.Key.Key_F4:
+            self.fit_both_views()
+            return
+        if event.key() == Qt.Key.Key_F5:
+            self.set_edit_mode('mask')
+            return
+        if event.key() == Qt.Key.Key_F6:
+            self.set_edit_mode('manual_solid')
+            return
+        if event.key() == Qt.Key.Key_F7:
+            self.set_edit_mode('manual_other')
             return
         if event.key() == Qt.Key.Key_B:
             self.set_edit_tool('brush')
@@ -1743,10 +1943,9 @@ class MainWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def push_undo_snapshot(self) -> None:
-        edit_mask = self.current_edit_mask()
-        if edit_mask is None:
+        if self.current_mask is None:
             return
-        self.undo_stack.append(edit_mask.copy())
+        self.undo_stack.append(self.current_masks_snapshot())
         self.undo_stack = self.undo_stack[-MAX_UNDO_STEPS:]
         self.redo_stack = []
         self.update_edit_buttons()
@@ -1760,28 +1959,68 @@ class MainWindow(QMainWindow):
         self.queue_auto_render()
         self.update_edit_buttons()
 
-    def undo_mask(self) -> None:
-        edit_mask = self.current_edit_mask()
-        if edit_mask is None or not self.undo_stack:
+    def on_selection_created(self, selection: object) -> None:
+        if self.selection_combine_mode != 'transfer_from_other':
             return
-        self.redo_stack.append(edit_mask.copy())
-        self.set_current_edit_mask(self.undo_stack.pop())
-        if self.edit_mode == 'mask':
+        selection_mask = np.asarray(selection, dtype=bool)
+        if self.transfer_selection_from_other_masks(selection_mask):
             self.queue_background_sample()
-        self.save_current_edit_mask()
+            self.save_all_edit_masks()
+            if self.current_base is not None:
+                self.mask_view.set_mask(self.current_edit_mask(), self.current_base.shape[:2])
+            self.refresh_mask_preview(keep_view=True)
+            self.queue_auto_render()
+            self.update_edit_buttons()
+            self.status.showMessage('已從其他 mask 轉入選區重疊部分。')
+        else:
+            self.status.showMessage('選區沒有碰到其他 mask。')
+
+    def transfer_selection_from_other_masks(self, selection: np.ndarray) -> bool:
+        current = self.mask_for_mode(self.edit_mode)
+        if current is None:
+            return False
+        transfer = np.zeros(current.shape, dtype=bool)
+        for mode in EDIT_MODE_LABELS:
+            if mode == self.edit_mode:
+                continue
+            other = self.mask_for_mode(mode)
+            if other is None:
+                continue
+            transfer |= (other > 0) & selection
+        if not np.any(transfer):
+            return False
+        self.push_undo_snapshot()
+        current[transfer] = 255
+        for mode in EDIT_MODE_LABELS:
+            if mode == self.edit_mode:
+                continue
+            other = self.mask_for_mode(mode)
+            if other is not None:
+                other[transfer] = 0
+        return True
+
+    def undo_mask(self) -> None:
+        if self.current_mask is None or not self.undo_stack:
+            return
+        self.redo_stack.append(self.current_masks_snapshot())
+        self.restore_masks_snapshot(self.undo_stack.pop())
+        if self.current_base is not None:
+            self.mask_view.set_mask(self.current_edit_mask(), self.current_base.shape[:2])
+        self.queue_background_sample()
+        self.save_all_edit_masks()
         self.refresh_mask_preview(keep_view=True)
         self.queue_auto_render()
         self.update_edit_buttons()
 
     def redo_mask(self) -> None:
-        edit_mask = self.current_edit_mask()
-        if edit_mask is None or not self.redo_stack:
+        if self.current_mask is None or not self.redo_stack:
             return
-        self.undo_stack.append(edit_mask.copy())
-        self.set_current_edit_mask(self.redo_stack.pop())
-        if self.edit_mode == 'mask':
-            self.queue_background_sample()
-        self.save_current_edit_mask()
+        self.undo_stack.append(self.current_masks_snapshot())
+        self.restore_masks_snapshot(self.redo_stack.pop())
+        if self.current_base is not None:
+            self.mask_view.set_mask(self.current_edit_mask(), self.current_base.shape[:2])
+        self.queue_background_sample()
+        self.save_all_edit_masks()
         self.refresh_mask_preview(keep_view=True)
         self.queue_auto_render()
         self.update_edit_buttons()
@@ -1815,6 +2054,24 @@ class MainWindow(QMainWindow):
                 )
             return
         self.save_current_mask()
+
+    def save_all_edit_masks(self) -> None:
+        if not self.current_img_path:
+            return
+        if self.current_mask is not None:
+            self.save_current_mask()
+        if self.current_manual_solid is not None:
+            _imwrite_transparent_mask(
+                _manual_solid_path(self.paths, self.current_img_path),
+                self.current_manual_solid,
+                EDIT_MODE_COLORS['manual_solid'],
+            )
+        if self.current_manual_other is not None:
+            _imwrite_transparent_mask(
+                _manual_other_path(self.paths, self.current_img_path),
+                self.current_manual_other,
+                EDIT_MODE_COLORS['manual_other'],
+            )
 
     def queue_background_sample(self) -> None:
         self.background_sample_request_id += 1
@@ -2026,21 +2283,31 @@ class MainWindow(QMainWindow):
             f'Solid Inpaint UI\n'
             f'版本：{APP_VERSION}\n\n'
             '滑鼠操作：\n'
-            '左鍵：添加 mask\n'
-            '右鍵：去掉 mask\n'
-            '魔法棒：點擊相近的連續區域，Shift + 左鍵替換當前 mask\n'
+            '筆刷左鍵：添加 mask\n'
+            '筆刷右鍵：去掉 mask\n'
+            '矩形 / 魔法棒左鍵：按「添加 / 減去 / 局部交集 / 從其他轉入」處理目前 mask\n'
+            '矩形 / 魔法棒右鍵：固定減去 mask\n'
+            '局部交集：只裁切本次選區碰到的既有 mask 區塊\n'
+            '從其他轉入：把選區內其他 mask 的重疊部分移到目前 mask\n'
+            '魔法棒：點擊相近的連續區域\n'
             'Command/Ctrl + 左鍵拖拽：平移畫布\n'
             '觸摸板雙指：移動畫布\n'
-            '鼠標滾輪：縮放畫布\n\n'
+            '鼠標滾輪：移動畫布\n'
+            'Command + 滾輪：左右移動畫布\n'
+            'Option + 滾輪：以鼠標位置為中心縮放\n\n'
             '快捷鍵：\n'
             'Command/Ctrl + +：放大\n'
             'Command/Ctrl + -：縮小（保持頁面中心點）\n'
             '方向鍵：移動畫布\n'
             'A：上一頁\n'
             'D：下一頁\n'
-            'F1：筆刷工具\n'
-            'F2：矩形工具\n'
+            'F1：矩形工具\n'
+            'F2：筆刷工具\n'
             'F3：魔法棒工具\n'
+            'F4：兩張圖同時適應窗口\n'
+            'F5：自動 mask\n'
+            'F6：強制純色 mask\n'
+            'F7：需要修改 mask\n'
             '[：縮小筆刷\n'
             ']：放大筆刷\n'
             'Ctrl+Z：撤銷\n'
