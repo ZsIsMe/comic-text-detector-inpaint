@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
     QGraphicsEllipseItem,
+    QGraphicsLineItem,
     QGraphicsPixmapItem,
     QGraphicsRectItem,
     QGraphicsScene,
@@ -388,6 +389,8 @@ class MaskEditorView(ImageView):
         self._active_button: Qt.MouseButton | None = None
         self._drag_start: tuple[int, int] | None = None
         self._last_brush_point: tuple[int, int] | None = None
+        self._brush_line_start: tuple[int, int] | None = None
+        self._brush_line_preview: QGraphicsLineItem | None = None
         self._panning = False
         self._pan_last_pos: QPoint | None = None
         self._rubber_band: QGraphicsRectItem | None = None
@@ -398,12 +401,22 @@ class MaskEditorView(ImageView):
         self._rect_pen_remove = QPen(QColor('#ff8f8f'), 2, Qt.PenStyle.DashLine)
         self._rect_pen_intersect = QPen(QColor('#ffd86f'), 2, Qt.PenStyle.DashLine)
         self._brush_pen = QPen(QColor('#e9fffb'), 2)
+        self._brush_line_pen_add = QPen(QColor('#e9fffb'), 2, Qt.PenStyle.DashLine)
+        self._brush_line_pen_remove = QPen(QColor('#ff8f8f'), 2, Qt.PenStyle.DashLine)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.setMouseTracking(True)
         self.viewport().setMouseTracking(True)
 
-    def set_mask(self, mask: np.ndarray | None, shape: tuple[int, int]) -> None:
+    def set_mask(
+        self,
+        mask: np.ndarray | None,
+        shape: tuple[int, int],
+        reset_brush_line: bool = False,
+    ) -> None:
         self.image_shape = shape
+        if reset_brush_line:
+            self._brush_line_start = None
+            self._clear_brush_line_preview()
         if mask is None:
             self.mask = np.zeros(shape, dtype=np.uint8)
         else:
@@ -419,6 +432,9 @@ class MaskEditorView(ImageView):
             self.source_bgr = image[:, :, :3].copy()
 
     def set_tool(self, tool: str) -> None:
+        if tool != 'brush':
+            self._brush_line_start = None
+            self._clear_brush_line_preview()
         self.tool = tool
         self._clear_rubber_band()
         self._update_brush_cursor_visibility()
@@ -474,16 +490,24 @@ class MaskEditorView(ImageView):
             self._edit_started = False
             event.accept()
             return
+        if self.tool == 'brush':
+            self._active_button = event.button()
+            self._last_brush_point = point
+            self._edit_started = False
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self._brush_line_start = point
+                self._update_brush_line_preview(point, point, event.button())
+            else:
+                self._begin_edit_once()
+                self._paint_brush(point, event.button())
+                self.maskEdited.emit(self.mask.copy())
+            event.accept()
+            return
         self._active_button = event.button()
         self._drag_start = point
         self._last_brush_point = point
         self._edit_started = False
-        if self.tool == 'brush':
-            self._begin_edit_once()
-            self._paint_brush(point, event.button())
-            self.maskEdited.emit(self.mask.copy())
-        else:
-            self._update_rubber_band(point, point, event.button())
+        self._update_rubber_band(point, point, event.button())
         event.accept()
 
     def mouseMoveEvent(self, event) -> None:
@@ -506,10 +530,13 @@ class MaskEditorView(ImageView):
             event.accept()
             return
         if self.tool == 'brush':
-            self._begin_edit_once()
-            self._paint_line(self._last_brush_point or point, point, self._active_button)
-            self._last_brush_point = point
-            self.maskEdited.emit(self.mask.copy())
+            if self._brush_line_start is not None:
+                self._update_brush_line_preview(self._brush_line_start, point, self._active_button)
+            else:
+                self._begin_edit_once()
+                self._paint_line(self._last_brush_point or point, point, self._active_button)
+                self._last_brush_point = point
+                self.maskEdited.emit(self.mask.copy())
         else:
             self._update_rubber_band(self._drag_start or point, point, self._active_button)
         event.accept()
@@ -525,6 +552,10 @@ class MaskEditorView(ImageView):
             super().mouseReleaseEvent(event)
             return
         point = self.image_point_from_view(event.position().toPoint(), clamp=True)
+        if self.tool == 'brush' and self.mask is not None and self._brush_line_start is not None and point is not None:
+            self._begin_edit_once()
+            self._paint_line(self._brush_line_start, point, self._active_button)
+            self.maskEdited.emit(self.mask.copy())
         if self.tool == 'rect' and self.mask is not None and self._drag_start is not None and point is not None:
             if self._apply_rect(self._drag_start, point, self._active_button):
                 self._begin_edit_once()
@@ -533,7 +564,9 @@ class MaskEditorView(ImageView):
         self._active_button = None
         self._drag_start = None
         self._last_brush_point = None
+        self._brush_line_start = None
         self._edit_started = False
+        self._clear_brush_line_preview()
         self._clear_rubber_band()
         event.accept()
 
@@ -696,6 +729,25 @@ class MaskEditorView(ImageView):
         if self._rubber_band is not None:
             self.scene().removeItem(self._rubber_band)
             self._rubber_band = None
+
+    def _update_brush_line_preview(
+        self,
+        start: tuple[int, int],
+        end: tuple[int, int],
+        button: Qt.MouseButton,
+    ) -> None:
+        if self._brush_line_preview is None:
+            self._brush_line_preview = QGraphicsLineItem()
+            self._brush_line_preview.setZValue(11)
+            self.scene().addItem(self._brush_line_preview)
+        pen = self._brush_line_pen_remove if button == Qt.MouseButton.RightButton else self._brush_line_pen_add
+        self._brush_line_preview.setPen(pen)
+        self._brush_line_preview.setLine(start[0], start[1], end[0], end[1])
+
+    def _clear_brush_line_preview(self) -> None:
+        if self._brush_line_preview is not None:
+            self.scene().removeItem(self._brush_line_preview)
+            self._brush_line_preview = None
 
     def _update_brush_cursor(self, point: tuple[int, int] | None) -> None:
         if self.tool != 'brush' or point is None:
@@ -958,6 +1010,18 @@ class MainWindow(QMainWindow):
         zoom_out_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
         zoom_out_action.triggered.connect(lambda: self.mask_view.zoom_by(1 / VIEW_ZOOM_STEP, keep_center=True))
         self.addAction(zoom_out_action)
+
+        brush_down_action = QAction('縮小筆刷', self)
+        brush_down_action.setShortcut(QKeySequence('['))
+        brush_down_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        brush_down_action.triggered.connect(lambda: self.change_brush_radius(-4))
+        self.addAction(brush_down_action)
+
+        brush_up_action = QAction('放大筆刷', self)
+        brush_up_action.setShortcut(QKeySequence(']'))
+        brush_up_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        brush_up_action.triggered.connect(lambda: self.change_brush_radius(4))
+        self.addAction(brush_up_action)
 
         pan_left_action = QAction('左移畫布', self)
         pan_left_action.setShortcut(QKeySequence('Left'))
@@ -1705,7 +1769,7 @@ class MainWindow(QMainWindow):
             self.queue_background_sample()
         else:
             self.background_sample_status.setText('')
-        self.mask_view.set_mask(self.current_edit_mask(), shape)
+        self.mask_view.set_mask(self.current_edit_mask(), shape, reset_brush_line=True)
         self.mask_view.set_source_image(self.current_base)
         self.refresh_mask_preview(keep_view=keep_view)
 
@@ -1846,7 +1910,7 @@ class MainWindow(QMainWindow):
             self.queue_background_sample()
         edit_mask = self.current_edit_mask()
         if edit_mask is not None and self.current_base is not None:
-            self.mask_view.set_mask(edit_mask, self.current_base.shape[:2])
+            self.mask_view.set_mask(edit_mask, self.current_base.shape[:2], reset_brush_line=True)
         self.refresh_mask_preview(keep_view=True)
         self.update_edit_buttons()
         self.status.showMessage(f'正在編輯：{EDIT_MODE_LABELS[mode]}')
@@ -2285,6 +2349,7 @@ class MainWindow(QMainWindow):
             '滑鼠操作：\n'
             '筆刷左鍵：添加 mask\n'
             '筆刷右鍵：去掉 mask\n'
+            '筆刷 Shift + 按下拖到鬆開：連接按下和鬆開位置\n'
             '矩形 / 魔法棒左鍵：按「添加 / 減去 / 局部交集 / 從其他轉入」處理目前 mask\n'
             '矩形 / 魔法棒右鍵：固定減去 mask\n'
             '局部交集：只裁切本次選區碰到的既有 mask 區塊\n'
