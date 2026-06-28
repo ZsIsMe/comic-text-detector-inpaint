@@ -77,6 +77,7 @@ STATUS_OTHER = '有 OTHER'
 STATUS_FAILED = '失敗'
 STATUS_TODO = '未處理'
 MAX_RECENT_FOLDERS = 12
+MAX_FOLDER_PROGRESS = 200
 MAX_UNDO_STEPS = 30
 DEFAULT_BRUSH_RADIUS = 24
 MIN_BRUSH_RADIUS = 2
@@ -816,6 +817,7 @@ class MainWindow(QMainWindow):
         self.background_sample_timer.timeout.connect(self.start_background_sample_worker)
         self.settings = QSettings('ComicTextDetector', 'SolidInpaintUI')
         self.recent_folders = self._load_recent_folders()
+        self.folder_progress = self._load_folder_progress()
 
         self._build_ui()
         self._apply_style()
@@ -1185,7 +1187,7 @@ class MainWindow(QMainWindow):
         self.add_recent_folder(folder)
         self.refresh_list()
         if self.imglist:
-            self.list_widget.setCurrentRow(0)
+            self.list_widget.setCurrentRow(self.saved_progress_row(folder))
 
     def _load_recent_folders(self) -> list[str]:
         value = self.settings.value('recent_folders', [])
@@ -1207,6 +1209,49 @@ class MainWindow(QMainWindow):
 
     def save_recent_folders(self) -> None:
         self.settings.setValue('recent_folders', self.recent_folders)
+
+    def _load_folder_progress(self) -> dict[str, str]:
+        value = self.settings.value('folder_progress', {})
+        if not isinstance(value, dict):
+            return {}
+        progress: dict[str, str] = {}
+        for folder, image_name in value.items():
+            folder_key = osp.abspath(osp.expanduser(str(folder)))
+            image_base = osp.basename(str(image_name))
+            if folder_key and image_base:
+                progress[folder_key] = image_base
+        return progress
+
+    def save_folder_progress(self) -> None:
+        if len(self.folder_progress) > MAX_FOLDER_PROGRESS:
+            recent_keys = {osp.abspath(osp.expanduser(folder)) for folder in self.recent_folders}
+            filtered = {
+                folder: image_name
+                for folder, image_name in self.folder_progress.items()
+                if folder in recent_keys
+            }
+            self.folder_progress = dict(list(filtered.items())[-MAX_FOLDER_PROGRESS:])
+        self.settings.setValue('folder_progress', self.folder_progress)
+
+    def remember_folder_progress(self, img_path: str) -> None:
+        if not self.folder or not img_path:
+            return
+        folder_key = osp.abspath(osp.expanduser(self.folder))
+        image_base = osp.basename(img_path)
+        if not image_base:
+            return
+        self.folder_progress[folder_key] = image_base
+        self.save_folder_progress()
+
+    def saved_progress_row(self, folder: str) -> int:
+        folder_key = osp.abspath(osp.expanduser(folder))
+        image_base = self.folder_progress.get(folder_key, '')
+        if not image_base:
+            return 0
+        for index, img_path in enumerate(self.imglist):
+            if osp.basename(img_path) == image_base:
+                return index
+        return 0
 
     def add_recent_folder(self, folder: str) -> None:
         normalized = osp.abspath(osp.expanduser(folder))
@@ -1493,6 +1538,7 @@ class MainWindow(QMainWindow):
         if item is None:
             return
         self.current_img_path = item.data(Qt.ItemDataRole.UserRole)
+        self.remember_folder_progress(self.current_img_path)
         self.undo_stack = []
         self.redo_stack = []
         self.reload_current()
