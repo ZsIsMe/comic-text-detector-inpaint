@@ -1120,14 +1120,14 @@ class MainWindow(QMainWindow):
         center_layout.setContentsMargins(10, 10, 10, 10)
         center_layout.addWidget(QLabel('Mask / 原圖'))
         mode_toolbar = QHBoxLayout()
-        self.edit_mask_btn = QPushButton('F5 自動')
+        self.edit_mask_btn = QPushButton('F1 自動')
         self.edit_mask_btn.setCheckable(True)
         self.edit_mask_btn.setChecked(True)
         self.edit_mask_btn.clicked.connect(lambda: self.set_edit_mode('mask'))
-        self.edit_manual_solid_btn = QPushButton('F6 強制純色')
+        self.edit_manual_solid_btn = QPushButton('F2 強制純色')
         self.edit_manual_solid_btn.setCheckable(True)
         self.edit_manual_solid_btn.clicked.connect(lambda: self.set_edit_mode('manual_solid'))
-        self.edit_manual_other_btn = QPushButton('F7 需要修改')
+        self.edit_manual_other_btn = QPushButton('F3 需要修改')
         self.edit_manual_other_btn.setCheckable(True)
         self.edit_manual_other_btn.clicked.connect(lambda: self.set_edit_mode('manual_other'))
         mode_toolbar.addWidget(self.edit_mask_btn)
@@ -1136,26 +1136,26 @@ class MainWindow(QMainWindow):
         mode_toolbar.addStretch()
         center_layout.addLayout(mode_toolbar)
         edit_toolbar = QHBoxLayout()
-        self.rect_btn = QPushButton('F1 矩形')
+        self.rect_btn = QPushButton('F5 矩形')
         self.rect_btn.setCheckable(True)
         self.rect_btn.clicked.connect(lambda: self.set_edit_tool('rect'))
-        self.magic_btn = QPushButton('F3 魔法棒')
+        self.magic_btn = QPushButton('F7 魔法棒')
         self.magic_btn.setCheckable(True)
         self.magic_btn.clicked.connect(lambda: self.set_edit_tool('magic'))
-        self.brush_btn = QPushButton('F2 筆刷')
+        self.brush_btn = QPushButton('F6 筆刷')
         self.brush_btn.setCheckable(True)
         self.brush_btn.clicked.connect(lambda: self.set_edit_tool('brush'))
-        self.selection_add_btn = QPushButton('添加')
+        self.selection_add_btn = QPushButton('F9 添加')
         self.selection_add_btn.setCheckable(True)
         self.selection_add_btn.setChecked(True)
         self.selection_add_btn.setToolTip('矩形和魔法棒左鍵添加到目前 mask')
-        self.selection_subtract_btn = QPushButton('減去')
+        self.selection_subtract_btn = QPushButton('F10 減去')
         self.selection_subtract_btn.setCheckable(True)
         self.selection_subtract_btn.setToolTip('矩形和魔法棒左鍵從目前 mask 減去；右鍵也會固定減去')
-        self.selection_intersect_btn = QPushButton('局部交集')
+        self.selection_intersect_btn = QPushButton('F11 局部交集')
         self.selection_intersect_btn.setCheckable(True)
         self.selection_intersect_btn.setToolTip('只裁切本次選區碰到的既有 mask 區塊，不影響其他區塊')
-        self.selection_transfer_btn = QPushButton('從其他轉入')
+        self.selection_transfer_btn = QPushButton('F12 從其他轉入')
         self.selection_transfer_btn.setCheckable(True)
         self.selection_transfer_btn.setToolTip('把本次選區內其他 mask 的重疊部分移到目前 mask，並從原 mask 移除')
         self.selection_combine_group = QButtonGroup(self)
@@ -1896,7 +1896,7 @@ class MainWindow(QMainWindow):
             return self.mask_display_color
         return EDIT_MODE_COLORS[self.edit_mode]
 
-    def set_edit_mode(self, mode: str) -> None:
+    def set_edit_mode(self, mode: str, reset_lower: bool = True) -> None:
         if mode not in EDIT_MODE_LABELS:
             return
         self.edit_mode = mode
@@ -1914,13 +1914,15 @@ class MainWindow(QMainWindow):
         self.refresh_mask_preview(keep_view=True)
         self.update_edit_buttons()
         self.status.showMessage(f'正在編輯：{EDIT_MODE_LABELS[mode]}')
+        if reset_lower:
+            self.set_edit_tool('rect', reset_selection=True)
 
-    def set_edit_tool(self, tool: str) -> None:
+    def set_edit_tool(self, tool: str, reset_selection: bool = True) -> None:
         self.mask_view.set_tool(tool)
         self.brush_btn.setChecked(tool == 'brush')
         self.rect_btn.setChecked(tool == 'rect')
         self.magic_btn.setChecked(tool == 'magic')
-        if tool in ('rect', 'magic') and self.selection_combine_mode != 'add':
+        if reset_selection and self.selection_combine_mode != 'add':
             self.set_selection_combine_mode('add')
         self.selection_combine_controls.setVisible(tool in ('rect', 'magic'))
         self.brush_controls.setVisible(tool == 'brush')
@@ -1963,25 +1965,37 @@ class MainWindow(QMainWindow):
 
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_F1:
-            self.set_edit_tool('rect')
+            self.set_edit_mode('mask')
             return
         if event.key() == Qt.Key.Key_F2:
-            self.set_edit_tool('brush')
+            self.set_edit_mode('manual_solid')
             return
         if event.key() == Qt.Key.Key_F3:
-            self.set_edit_tool('magic')
+            self.set_edit_mode('manual_other')
             return
         if event.key() == Qt.Key.Key_F4:
             self.fit_both_views()
             return
         if event.key() == Qt.Key.Key_F5:
-            self.set_edit_mode('mask')
+            self.set_edit_tool('rect')
             return
         if event.key() == Qt.Key.Key_F6:
-            self.set_edit_mode('manual_solid')
+            self.set_edit_tool('brush')
             return
         if event.key() == Qt.Key.Key_F7:
-            self.set_edit_mode('manual_other')
+            self.set_edit_tool('magic')
+            return
+        if event.key() == Qt.Key.Key_F9:
+            self.set_selection_combine_mode('add')
+            return
+        if event.key() == Qt.Key.Key_F10:
+            self.set_selection_combine_mode('subtract')
+            return
+        if event.key() == Qt.Key.Key_F11:
+            self.set_selection_combine_mode('local_intersect')
+            return
+        if event.key() == Qt.Key.Key_F12:
+            self.set_selection_combine_mode('transfer_from_other')
             return
         if event.key() == Qt.Key.Key_B:
             self.set_edit_tool('brush')
@@ -2366,13 +2380,17 @@ class MainWindow(QMainWindow):
             '方向鍵：移動畫布\n'
             'A：上一頁\n'
             'D：下一頁\n'
-            'F1：矩形工具\n'
-            'F2：筆刷工具\n'
-            'F3：魔法棒工具\n'
+            'F1：自動 mask\n'
+            'F2：強制純色 mask\n'
+            'F3：需要修改 mask\n'
             'F4：兩張圖同時適應窗口\n'
-            'F5：自動 mask\n'
-            'F6：強制純色 mask\n'
-            'F7：需要修改 mask\n'
+            'F5：矩形工具\n'
+            'F6：筆刷工具\n'
+            'F7：魔法棒工具\n'
+            'F9：添加\n'
+            'F10：減去\n'
+            'F11：局部交集\n'
+            'F12：從其他轉入\n'
             '[：縮小筆刷\n'
             ']：放大筆刷\n'
             'Ctrl+Z：撤銷\n'
