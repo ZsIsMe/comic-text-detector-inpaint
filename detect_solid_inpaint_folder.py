@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import os.path as osp
+import re
 import sys
 import zlib
 from dataclasses import asdict, dataclass
@@ -37,6 +38,7 @@ BACKGROUND_SAMPLE_CACHE_DIR = 'background_sample_cache'
 REPORT_JSON = 'solid_inpaint_report.json'
 PREVIEW_PDF = 'preview_report.pdf'
 MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'comictextdetector.pt'
+NATURAL_SORT_RE = re.compile(r'(\d+)')
 
 REPAIR_EXPAND_PX = 3
 SAMPLE_RING_PX = 3
@@ -875,8 +877,13 @@ def _write_preview_pdf(
 def image_files_in_folder(img_dir: str) -> list[str]:
     imglist = find_all_imgs(img_dir, abs_path=True)
     imglist = [path for path in imglist if not osp.basename(path).startswith('mask-')]
-    imglist.sort(key=lambda path: osp.basename(path).lower())
+    imglist.sort(key=lambda path: natural_sort_key(osp.basename(path)))
     return imglist
+
+
+def natural_sort_key(name: str) -> tuple:
+    parts = NATURAL_SORT_RE.split(name.lower())
+    return tuple((1, int(part), part) if part.isdigit() else (0, part) for part in parts)
 
 
 def create_detector() -> TextDetector:

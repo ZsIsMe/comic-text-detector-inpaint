@@ -63,11 +63,7 @@ Each PSD contains:
             return /\.(png|jpg|jpeg|tif|tiff|bmp|psd)$/i.test(file.name);
         });
         imageFiles.sort(function (a, b) {
-            var an = a.name.toLowerCase();
-            var bn = b.name.toLowerCase();
-            if (an < bn) return -1;
-            if (an > bn) return 1;
-            return 0;
+            return naturalCompareNames(a.name, b.name);
         });
 
         var made = 0;
@@ -554,6 +550,57 @@ Each PSD contains:
 
     function stripExtension(name) {
         return name.replace(/\.[^\.]+$/, "");
+    }
+
+    function naturalCompareNames(a, b) {
+        var ax = splitNaturalName(a);
+        var bx = splitNaturalName(b);
+        var len = Math.min(ax.length, bx.length);
+        for (var i = 0; i < len; i++) {
+            var av = ax[i];
+            var bv = bx[i];
+            if (av[0] !== bv[0]) {
+                return av[0] < bv[0] ? -1 : 1;
+            }
+            if (av[1] !== bv[1]) {
+                return av[1] < bv[1] ? -1 : 1;
+            }
+            if (av.length > 2 && bv.length > 2 && av[2] !== bv[2]) {
+                return av[2] < bv[2] ? -1 : 1;
+            }
+        }
+        if (ax.length !== bx.length) {
+            return ax.length < bx.length ? -1 : 1;
+        }
+        a = a.toLowerCase();
+        b = b.toLowerCase();
+        if (a < b) return -1;
+        if (a > b) return 1;
+        return 0;
+    }
+
+    function splitNaturalName(name) {
+        var parts = [];
+        var lowerName = name.toLowerCase();
+        var pattern = /\d+/g;
+        var lastIndex = 0;
+        var match;
+        while ((match = pattern.exec(lowerName)) !== null) {
+            parts.push(lowerName.substring(lastIndex, match.index));
+            parts.push(match[0]);
+            lastIndex = pattern.lastIndex;
+        }
+        parts.push(lowerName.substring(lastIndex));
+
+        var result = [];
+        for (var i = 0; i < parts.length; i++) {
+            if (/^\d+$/.test(parts[i])) {
+                result.push([1, parseInt(parts[i], 10), parts[i]]);
+            } else {
+                result.push([0, parts[i]]);
+            }
+        }
+        return result;
     }
 
     function trimString(value) {
