@@ -1,22 +1,23 @@
 /*
-Create PSD files from solid_inpaint outputs.
+Create PSD files from original images and same-name mask images.
 
 Run in Photoshop:
-File > Scripts > Browse... > create_psds_from_outputs.jsx
+File > Scripts > Browse... > create_psds_from_masks.jsx
 
-Expected input layout:
-<image folder>/ctd_inpainted/mask/<name>.png
-<image folder>/ctd_inpainted/other_mask/<name>.png
-<image folder>/ctd_inpainted/inpainted/<name>.png
+Inputs selected in one dialog:
+- image folder
+- mask folder
+- output PSD folder name
+- Photoshop action set/action
 
 Output:
-<image folder>/ctd_inpainted/psd/<name>.psd
+<image folder>/<output folder name>/<name>.psd
 
 Each PSD contains:
 - bg
-- overlay-manual
-- TEXT_CHANNEL
-- OTHER_CHANNEL
+- alpha channel: OTHER_CHANNEL
+
+The selected Photoshop action is executed only when the source mask has content.
 */
 
 #target photoshop
@@ -32,26 +33,15 @@ Each PSD contains:
         if (!settings) return;
 
         var imageFolder = new Folder(settings.imageFolder);
-        var outputRoot = new Folder(settings.outputRoot);
-        var maskFolder = new Folder(outputRoot.fsName + "/mask");
-        var otherMaskFolder = new Folder(outputRoot.fsName + "/other_mask");
-        var overlayFolder = new Folder(outputRoot.fsName + "/inpainted");
-        var psdFolder = new Folder(outputRoot.fsName + "/psd");
+        var maskFolder = new Folder(settings.maskFolder);
+        var psdFolder = new Folder(imageFolder.fsName + "/" + settings.outputFolderName);
 
         if (!imageFolder.exists) {
             alert("原图文件夹不存在：\n" + imageFolder.fsName);
             return;
         }
         if (!maskFolder.exists) {
-            alert("mask 文件夹不存在：\n" + maskFolder.fsName);
-            return;
-        }
-        if (!otherMaskFolder.exists) {
-            alert("other_mask 文件夹不存在：\n" + otherMaskFolder.fsName);
-            return;
-        }
-        if (!overlayFolder.exists) {
-            alert("inpainted 文件夹不存在：\n" + overlayFolder.fsName);
+            alert("mask 图文件夹不存在：\n" + maskFolder.fsName);
             return;
         }
         if (!psdFolder.exists) {
@@ -68,6 +58,7 @@ Each PSD contains:
 
         var made = 0;
         var actionRun = [];
+        var actionSkipped = [];
         var actionErrors = [];
         var skippedExisting = [];
         var skipped = [];
@@ -82,37 +73,28 @@ Each PSD contains:
             }
 
             var maskFile = findMaskFile(maskFolder, stem);
-            var otherMaskFile = findMaskFile(otherMaskFolder, stem);
-            var overlayFile = findMaskFile(overlayFolder, stem);
 
             if (!maskFile) {
                 skipped.push(imageFile.name + "：缺少 mask");
-                continue;
-            }
-            if (!otherMaskFile) {
-                skipped.push(imageFile.name + "：缺少 other_mask");
-                continue;
-            }
-            if (!overlayFile) {
-                skipped.push(imageFile.name + "：缺少 inpainted overlay");
                 continue;
             }
 
             var doc = null;
             try {
                 doc = createDocument(imageFile);
-                importOverlayLayer(doc, overlayFile, "overlay-manual");
-                importMaskAsAlpha(doc, maskFile, "TEXT_CHANNEL");
-                importMaskAsAlpha(doc, otherMaskFile, "OTHER_CHANNEL", true);
+                var maskHasContent = importMaskAsAlpha(doc, maskFile, "OTHER_CHANNEL");
 
-                if (settings.runAction && hasChannel(doc, "OTHER_CHANNEL")) {
+                if (maskHasContent) {
                     try {
                         app.activeDocument = doc;
+                        setRGBChannels(doc);
                         app.doAction(settings.actionName, settings.actionSetName);
                         actionRun.push(imageFile.name);
                     } catch (actionErr) {
                         actionErrors.push(imageFile.name + "：" + actionErr.message);
                     }
+                } else {
+                    actionSkipped.push(imageFile.name + "：mask 为空");
                 }
 
                 app.activeDocument = doc;
@@ -136,22 +118,23 @@ Each PSD contains:
         }
 
         writeReport(
-            new File(psdFolder.fsName + "/create_psds_report.txt"),
+            new File(psdFolder.fsName + "/create_psds_from_masks_report.txt"),
             imageFolder,
-            outputRoot,
+            maskFolder,
             imageFiles.length,
             made,
             settings,
             actionRun,
+            actionSkipped,
             actionErrors,
             skippedExisting,
             skipped
         );
 
         var message = "PSD 生成完成：" + made + " 个\n输出目录：\n" + psdFolder.fsName;
-        if (settings.runAction) {
-            message += "\n执行动作：" + actionRun.length + "\n动作失败：" + actionErrors.length;
-        }
+        message += "\n执行动作：" + actionRun.length;
+        message += "\nmask 为空未执行：" + actionSkipped.length;
+        message += "\n动作失败：" + actionErrors.length;
         if (skippedExisting.length > 0) {
             message += "\n已存在跳过：" + skippedExisting.length;
         }
@@ -165,14 +148,14 @@ Each PSD contains:
         }
         alert(message);
     } catch (e) {
-        alert("Create solid inpaint PSDs failed:\n" + e.toString() + "\nLine: " + (e.line || "unknown"));
+        alert("Create mask PSDs failed:\n" + e.toString() + "\nLine: " + (e.line || "unknown"));
     } finally {
         app.preferences.rulerUnits = oldRulerUnits;
     }
 
     function showSettingsDialog() {
         var actionSets = getActionSets();
-        var dialog = new Window("dialog", "生成 solid_inpaint PSD");
+        var dialog = new Window("dialog", "生成 mask PSD");
         dialog.orientation = "column";
         dialog.alignChildren = ["fill", "top"];
         dialog.spacing = 10;
@@ -186,25 +169,26 @@ Each PSD contains:
         imagePathInput.characters = 52;
         var imageBrowseButton = imageGroup.add("button", undefined, "选择");
 
+        var maskGroup = dialog.add("group");
+        maskGroup.orientation = "row";
+        maskGroup.alignChildren = ["fill", "center"];
+        maskGroup.add("statictext", undefined, "mask 图文件夹：");
+        var maskPathInput = maskGroup.add("edittext", undefined, "");
+        maskPathInput.characters = 52;
+        var maskBrowseButton = maskGroup.add("button", undefined, "选择");
+
         var outputGroup = dialog.add("group");
         outputGroup.orientation = "row";
-        outputGroup.alignChildren = ["fill", "center"];
-        outputGroup.add("statictext", undefined, "ctd_inpainted：");
-        var outputPathInput = outputGroup.add("edittext", undefined, "");
-        outputPathInput.characters = 52;
-        var outputBrowseButton = outputGroup.add("button", undefined, "选择");
+        outputGroup.alignChildren = ["left", "center"];
+        outputGroup.add("statictext", undefined, "输出 PSD 文件夹名：");
+        var outputNameInput = outputGroup.add("edittext", undefined, "psd");
+        outputNameInput.characters = 24;
 
         var restartGroup = dialog.add("group");
         restartGroup.orientation = "row";
         restartGroup.alignChildren = ["left", "center"];
         var restartCheckbox = restartGroup.add("checkbox", undefined, "重新开始（覆盖已有 PSD）");
         restartCheckbox.value = false;
-
-        var actionEnableGroup = dialog.add("group");
-        actionEnableGroup.orientation = "row";
-        actionEnableGroup.alignChildren = ["left", "center"];
-        var actionCheckbox = actionEnableGroup.add("checkbox", undefined, "有 OTHER_CHANNEL 时执行动作");
-        actionCheckbox.value = false;
 
         var actionSetGroup = dialog.add("group");
         actionSetGroup.orientation = "row";
@@ -239,19 +223,14 @@ Each PSD contains:
             var selected = Folder.selectDialog("选择原图文件夹");
             if (selected) {
                 imagePathInput.text = selected.fsName;
-                outputPathInput.text = selected.fsName + "/ctd_inpainted";
             }
         };
 
-        outputBrowseButton.onClick = function () {
-            var selected = Folder.selectDialog("选择 ctd_inpainted 文件夹");
+        maskBrowseButton.onClick = function () {
+            var selected = Folder.selectDialog("选择 mask 图文件夹");
             if (selected) {
-                outputPathInput.text = selected.fsName;
+                maskPathInput.text = selected.fsName;
             }
-        };
-
-        actionCheckbox.onClick = function () {
-            refreshActionControls();
         };
 
         setDropdown.onChange = function () {
@@ -263,11 +242,15 @@ Each PSD contains:
                 alert("请选择原图文件夹。");
                 return;
             }
-            if (!trimString(outputPathInput.text)) {
-                alert("请选择 ctd_inpainted 文件夹。");
+            if (!trimString(maskPathInput.text)) {
+                alert("请选择 mask 图文件夹。");
                 return;
             }
-            if (actionCheckbox.value && (!setDropdown.selection || !actionDropdown.selection)) {
+            if (!isValidFolderName(trimString(outputNameInput.text))) {
+                alert("请输入有效的输出 PSD 文件夹名，不能包含 / \\ : * ? \" < > |。");
+                return;
+            }
+            if (!setDropdown.selection || !actionDropdown.selection) {
                 alert("请先在 Photoshop Actions 面板载入动作，并选择动作组和动作。");
                 return;
             }
@@ -281,9 +264,9 @@ Each PSD contains:
 
         return {
             imageFolder: trimString(imagePathInput.text),
-            outputRoot: trimString(outputPathInput.text),
+            maskFolder: trimString(maskPathInput.text),
+            outputFolderName: trimString(outputNameInput.text),
             restart: restartCheckbox.value,
-            runAction: actionCheckbox.value,
             actionSetName: selectedSet ? selectedSet.name : "",
             actionName: selectedAction ? selectedAction.name : ""
         };
@@ -301,7 +284,7 @@ Each PSD contains:
         }
 
         function refreshActionControls() {
-            var enabled = actionCheckbox.value && actionSets.length > 0;
+            var enabled = actionSets.length > 0;
             setDropdown.enabled = enabled;
             actionDropdown.enabled = enabled;
         }
@@ -322,45 +305,7 @@ Each PSD contains:
         return doc;
     }
 
-    function importOverlayLayer(targetDoc, overlayFile, layerName) {
-        var overlayDoc = app.open(overlayFile);
-        var targetWidth = Math.round(targetDoc.width.as("px"));
-        var targetHeight = Math.round(targetDoc.height.as("px"));
-        if (Math.round(overlayDoc.width.as("px")) !== targetWidth ||
-            Math.round(overlayDoc.height.as("px")) !== targetHeight) {
-            overlayDoc.close(SaveOptions.DONOTSAVECHANGES);
-            throw new Error(layerName + " 尺寸不一致");
-        }
-
-        app.activeDocument = overlayDoc;
-        if (overlayDoc.mode !== DocumentMode.RGB) {
-            overlayDoc.changeMode(ChangeMode.RGB);
-        }
-        if (overlayDoc.layers.length > 1) {
-            overlayDoc.mergeVisibleLayers();
-        }
-
-        var sourceLayer = overlayDoc.activeLayer;
-        var sourceBounds = getLayerBounds(sourceLayer);
-        var importedLayer = sourceLayer.duplicate(targetDoc, ElementPlacement.PLACEATBEGINNING);
-
-        app.activeDocument = targetDoc;
-        setRGBChannels(targetDoc);
-        targetDoc.activeLayer = importedLayer;
-        importedLayer.name = layerName;
-        alignLayerBounds(importedLayer, sourceBounds);
-        addWhiteCornerPixels(targetDoc);
-
-        overlayDoc.close(SaveOptions.DONOTSAVECHANGES);
-
-        try {
-            var bgLayer = targetDoc.artLayers.getByName("bg");
-            importedLayer.move(bgLayer, ElementPlacement.PLACEBEFORE);
-        } catch (e) {
-        }
-    }
-
-    function importMaskAsAlpha(targetDoc, maskFile, channelName, skipIfAllBlack) {
+    function importMaskAsAlpha(targetDoc, maskFile, channelName) {
         app.activeDocument = targetDoc;
         removeAlphaChannelIfExists(targetDoc, channelName);
 
@@ -375,44 +320,14 @@ Each PSD contains:
 
         app.activeDocument = maskDoc;
         var sourceChannel = maskDoc.channels[0];
-        if (skipIfAllBlack && isChannelAllBlack(sourceChannel)) {
-            maskDoc.close(SaveOptions.DONOTSAVECHANGES);
-            return false;
-        }
+        var hasContent = !isChannelAllBlack(sourceChannel);
         var alpha = sourceChannel.duplicate(targetDoc);
         maskDoc.close(SaveOptions.DONOTSAVECHANGES);
 
         app.activeDocument = targetDoc;
         alpha.name = channelName;
-        targetDoc.activeChannels = [alpha];
-        addWhiteCornerPixels(targetDoc);
         setRGBChannels(targetDoc);
-        return true;
-    }
-
-    function getLayerBounds(layer) {
-        return {
-            left: Math.round(layer.bounds[0].as("px")),
-            top: Math.round(layer.bounds[1].as("px")),
-            right: Math.round(layer.bounds[2].as("px")),
-            bottom: Math.round(layer.bounds[3].as("px"))
-        };
-    }
-
-    function alignLayerBounds(layer, expectedBounds) {
-        var actualBounds = getLayerBounds(layer);
-        var dx = expectedBounds.left - actualBounds.left;
-        var dy = expectedBounds.top - actualBounds.top;
-        if (dx !== 0 || dy !== 0) {
-            layer.translate(dx, dy);
-        }
-    }
-
-    function hasChannel(doc, channelName) {
-        for (var i = 0; i < doc.channels.length; i++) {
-            if (doc.channels[i].name === channelName) return true;
-        }
-        return false;
+        return hasContent;
     }
 
     function isChannelAllBlack(channel) {
@@ -470,25 +385,24 @@ Each PSD contains:
         return actions;
     }
 
-    function writeReport(reportFile, imageFolder, outputRoot, total, made, settings, actionRun, actionErrors, skippedExisting, skipped) {
+    function writeReport(reportFile, imageFolder, maskFolder, total, made, settings, actionRun, actionSkipped, actionErrors, skippedExisting, skipped) {
         reportFile.encoding = "UTF-8";
         if (!reportFile.open("w")) {
             alert("无法写入报告：\n" + reportFile.fsName);
             return;
         }
-        reportFile.writeln("Create solid_inpaint PSD report");
+        reportFile.writeln("Create mask PSD report");
         reportFile.writeln("Generated at: " + formatDate(new Date()));
         reportFile.writeln("Image folder: " + imageFolder.fsName);
-        reportFile.writeln("ctd_inpainted folder: " + outputRoot.fsName);
+        reportFile.writeln("Mask folder: " + maskFolder.fsName);
+        reportFile.writeln("Output folder name: " + settings.outputFolderName);
         reportFile.writeln("Total image files: " + total);
         reportFile.writeln("Saved PSD files: " + made);
+        reportFile.writeln("Action set: " + settings.actionSetName);
+        reportFile.writeln("Action: " + settings.actionName);
         reportFile.writeln("Restart: " + (settings.restart ? "yes" : "no"));
-        reportFile.writeln("Run action: " + (settings.runAction ? "yes" : "no"));
-        if (settings.runAction) {
-            reportFile.writeln("Action set: " + settings.actionSetName);
-            reportFile.writeln("Action: " + settings.actionName);
-        }
         reportFile.writeln("Action executed: " + actionRun.length);
+        reportFile.writeln("Action skipped empty mask: " + actionSkipped.length);
         reportFile.writeln("Action failed: " + actionErrors.length);
         reportFile.writeln("Skipped existing PSD: " + skippedExisting.length);
         reportFile.writeln("Skipped or failed: " + skipped.length);
@@ -496,6 +410,10 @@ Each PSD contains:
 
         reportFile.writeln("[ACTION_EXECUTED]");
         writeLines(reportFile, actionRun);
+        reportFile.writeln("");
+
+        reportFile.writeln("[ACTION_SKIPPED_EMPTY_MASK]");
+        writeLines(reportFile, actionSkipped);
         reportFile.writeln("");
 
         reportFile.writeln("[ACTION_FAILED]");
@@ -542,33 +460,6 @@ Each PSD contains:
 
     function setRGBChannels(doc) {
         doc.activeChannels = [doc.channels[0], doc.channels[1], doc.channels[2]];
-    }
-
-    function addWhiteCornerPixels(doc) {
-        var width = Math.round(doc.width.as("px"));
-        var height = Math.round(doc.height.as("px"));
-        if (width < 1 || height < 1) return;
-
-        var white = new SolidColor();
-        white.rgb.red = 255;
-        white.rgb.green = 255;
-        white.rgb.blue = 255;
-
-        fillPixel(doc, 0, 0, white);
-        fillPixel(doc, width - 1, 0, white);
-        fillPixel(doc, 0, height - 1, white);
-        fillPixel(doc, width - 1, height - 1, white);
-        doc.selection.deselect();
-    }
-
-    function fillPixel(doc, x, y, color) {
-        doc.selection.select([
-            [x, y],
-            [x + 1, y],
-            [x + 1, y + 1],
-            [x, y + 1]
-        ]);
-        doc.selection.fill(color, ColorBlendMode.NORMAL, 100, false);
     }
 
     function stripExtension(name) {
@@ -628,6 +519,11 @@ Each PSD contains:
 
     function trimString(value) {
         return value.replace(/^\s+|\s+$/g, "");
+    }
+
+    function isValidFolderName(value) {
+        if (!value) return false;
+        return !/[\/\\:\*\?"<>\|]/.test(value);
     }
 
     function pad2(value) {

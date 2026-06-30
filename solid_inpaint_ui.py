@@ -15,6 +15,8 @@ from PySide6.QtCore import QObject, QPoint, QSettings, Qt, QThread, QTimer, Sign
 from PySide6.QtGui import QAction, QColor, QCursor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QGraphicsEllipseItem,
@@ -34,8 +36,10 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QProgressBar,
+    QRadioButton,
     QSlider,
     QSizePolicy,
+    QSpinBox,
     QSplitter,
     QStatusBar,
     QButtonGroup,
@@ -82,6 +86,10 @@ MAX_RECENT_FOLDERS = 12
 MAX_FOLDER_PROGRESS = 200
 MAX_UNDO_STEPS = 30
 DEFAULT_MASK_ALPHA_PERCENT = 80
+DEFAULT_OTHER_MASK_PREVIEW_EXPAND_PX = 5
+MAX_OTHER_MASK_PREVIEW_EXPAND_PX = 80
+OTHER_MASK_DISPLAY_ALPHA = 0.38
+OTHER_MASK_PREVIEW_RING_ALPHA = 0.16
 DEFAULT_BRUSH_RADIUS = 24
 MIN_BRUSH_RADIUS = 2
 MAX_BRUSH_RADIUS = 160
@@ -164,6 +172,45 @@ def _imwrite_transparent_mask(path: str, mask: np.ndarray, color_bgr: tuple[int,
     imwrite(path, overlay)
 
 
+def _write_edit_mask(paths: dict[str, str], img_path: str, mode: str, mask: np.ndarray) -> None:
+    if mode == 'manual_solid':
+        _imwrite_transparent_mask(_manual_solid_path(paths, img_path), mask, EDIT_MODE_COLORS['manual_solid'])
+    elif mode == 'manual_other':
+        _imwrite_transparent_mask(_manual_other_path(paths, img_path), mask, EDIT_MODE_COLORS['manual_other'])
+    else:
+        imwrite(_mask_path(paths, img_path), np.where(mask > 0, 255, 0).astype(np.uint8))
+
+
+def _read_edit_masks_for_image(paths: dict[str, str], img_path: str) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    base = _optional_imread(img_path, cv2.IMREAD_UNCHANGED)
+    if base is None:
+        raise FileNotFoundError(f'無法讀取原圖：{img_path}')
+    shape = base.shape[:2]
+    masks = {
+        'mask': _mask_from_optional_image(_optional_imread(_mask_path(paths, img_path), cv2.IMREAD_GRAYSCALE), shape),
+        'manual_solid': _mask_from_optional_image(
+            _optional_imread(_manual_solid_path(paths, img_path), cv2.IMREAD_UNCHANGED),
+            shape,
+        ),
+        'manual_other': _mask_from_optional_image(
+            _optional_imread(_manual_other_path(paths, img_path), cv2.IMREAD_UNCHANGED),
+            shape,
+        ),
+    }
+    return shape, masks
+
+
+def _convert_image_edit_masks(paths: dict[str, str], img_path: str, target_mode: str) -> np.ndarray:
+    shape, masks = _read_edit_masks_for_image(paths, img_path)
+    combined = np.zeros(shape, dtype=np.uint8)
+    for mask in masks.values():
+        combined = cv2.bitwise_or(combined, np.where(mask > 0, 255, 0).astype(np.uint8))
+    empty = np.zeros(shape, dtype=np.uint8)
+    for mode in EDIT_MODE_LABELS:
+        _write_edit_mask(paths, img_path, mode, combined if mode == target_mode else empty)
+    return combined if target_mode == 'mask' else empty
+
+
 def _load_background_sample_cache(paths: dict[str, str], img_path: str, mask: np.ndarray) -> np.ndarray | None:
     cache_path = _background_sample_cache_path(paths, img_path)
     if not osp.isfile(cache_path):
@@ -224,6 +271,17 @@ def _overlay_mask_on_bgr(
         + color[active].astype(np.float32) * alpha
     ).astype(np.uint8)
     return output
+
+
+def _expanded_mask_ring(mask: np.ndarray | None, radius: int) -> np.ndarray | None:
+    if mask is None or radius <= 0:
+        return None
+    mask_bin = np.where(mask > 0, 255, 0).astype(np.uint8)
+    if not np.any(mask_bin):
+        return None
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
+    expanded = cv2.dilate(mask_bin, kernel, iterations=1)
+    return cv2.bitwise_and(expanded, cv2.bitwise_not(mask_bin))
 
 
 def _overlay_transparent_mask_on_bgr(
@@ -829,6 +887,38 @@ class FolderWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class ConvertMasksWorker(QObject):
+    progress = Signal(int, int, str)
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, folder: str, paths: dict[str, str], imglist: list[str], target_mode: str) -> None:
+        super().__init__()
+        self.folder = folder
+        self.paths = dict(paths)
+        self.imglist = list(imglist)
+        self.target_mode = target_mode
+
+    def run(self) -> None:
+        try:
+            existing = load_report(self.paths)
+            pages = dict(existing.get('pages', {}))
+            total = len(self.imglist)
+            for index, img_path in enumerate(self.imglist, start=1):
+                name = osp.basename(img_path)
+                self.progress.emit(index, total, name)
+                try:
+                    auto_mask = _convert_image_edit_masks(self.paths, img_path, self.target_mode)
+                    pages[name] = regenerate_image_from_mask(img_path, self.paths, auto_mask)
+                except Exception as exc:
+                    pages[name] = {'error': str(exc)}
+            report = build_report(self.folder, self.paths, self.imglist, pages)
+            write_report(self.paths, report)
+            self.finished.emit(report)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class PageRegenerateWorker(QObject):
     finished = Signal(str, dict)
     failed = Signal(str, str)
@@ -852,6 +942,59 @@ class PageRegenerateWorker(QObject):
             self.finished.emit(self.img_path, report)
         except Exception as exc:
             self.failed.emit(self.img_path, str(exc))
+
+
+class ConvertMasksDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle('轉換選區')
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        target_label = QLabel('將全部選區轉為')
+        layout.addWidget(target_label)
+        target_layout = QHBoxLayout()
+        self.target_group = QButtonGroup(self)
+        self.target_buttons: dict[str, QRadioButton] = {}
+        for mode, label in EDIT_MODE_LABELS.items():
+            button = QRadioButton(label)
+            if mode == 'mask':
+                button.setChecked(True)
+            self.target_group.addButton(button)
+            self.target_buttons[mode] = button
+            target_layout.addWidget(button)
+        target_layout.addStretch()
+        layout.addLayout(target_layout)
+
+        scope_label = QLabel('作用範圍')
+        layout.addWidget(scope_label)
+        scope_layout = QHBoxLayout()
+        self.current_page_radio = QRadioButton('當前頁面')
+        self.current_page_radio.setChecked(True)
+        self.all_pages_radio = QRadioButton('全部頁面')
+        self.scope_group = QButtonGroup(self)
+        self.scope_group.addButton(self.current_page_radio)
+        self.scope_group.addButton(self.all_pages_radio)
+        scope_layout.addWidget(self.current_page_radio)
+        scope_layout.addWidget(self.all_pages_radio)
+        scope_layout.addStretch()
+        layout.addLayout(scope_layout)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText('確認')
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('取消')
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_target_mode(self) -> str:
+        for mode, button in self.target_buttons.items():
+            if button.isChecked():
+                return mode
+        return 'mask'
+
+    def selected_scope(self) -> str:
+        return 'all' if self.all_pages_radio.isChecked() else 'current'
 
 
 class BackgroundSampleWorker(QObject):
@@ -925,6 +1068,7 @@ class MainWindow(QMainWindow):
         self.selection_combine_mode = 'add'
         self.settings = QSettings('ComicTextDetector', 'SolidInpaintUI')
         self.mask_alpha_percent = self._load_mask_alpha_percent()
+        self.other_mask_preview_expand_px = self._load_other_mask_preview_expand_px()
         self.alpha = self.mask_alpha_percent / 100.0
         self.mask_display_color = MASK_DISPLAY_COLORS['白色']
         self.show_other_mask = True
@@ -932,7 +1076,7 @@ class MainWindow(QMainWindow):
         self.undo_stack: list[dict[str, np.ndarray]] = []
         self.redo_stack: list[dict[str, np.ndarray]] = []
         self.worker_thread: QThread | None = None
-        self.worker: FolderWorker | None = None
+        self.worker: FolderWorker | ConvertMasksWorker | None = None
         self.page_worker_thread: QThread | None = None
         self.page_worker: PageRegenerateWorker | None = None
         self.background_worker_thread: QThread | None = None
@@ -1130,9 +1274,13 @@ class MainWindow(QMainWindow):
         self.edit_manual_other_btn = QPushButton('F3 需要修改')
         self.edit_manual_other_btn.setCheckable(True)
         self.edit_manual_other_btn.clicked.connect(lambda: self.set_edit_mode('manual_other'))
+        self.convert_masks_btn = QPushButton('轉換')
+        self.convert_masks_btn.setToolTip('將全部選區轉為指定類型；此操作不能回撤')
+        self.convert_masks_btn.clicked.connect(self.show_convert_masks_dialog)
         mode_toolbar.addWidget(self.edit_mask_btn)
         mode_toolbar.addWidget(self.edit_manual_solid_btn)
         mode_toolbar.addWidget(self.edit_manual_other_btn)
+        mode_toolbar.addWidget(self.convert_masks_btn)
         mode_toolbar.addStretch()
         center_layout.addLayout(mode_toolbar)
         edit_toolbar = QHBoxLayout()
@@ -1266,7 +1414,19 @@ class MainWindow(QMainWindow):
         self.other_mask_checkbox = QCheckBox('顯示 other_mask')
         self.other_mask_checkbox.setChecked(True)
         self.other_mask_checkbox.stateChanged.connect(self.on_show_other_mask_changed)
-        right_layout.addWidget(self.other_mask_checkbox)
+        other_mask_controls = QHBoxLayout()
+        other_mask_controls.addWidget(self.other_mask_checkbox)
+        other_mask_controls.addSpacing(8)
+        other_mask_controls.addWidget(QLabel('PS 擴展預覽'))
+        self.other_mask_expand_spinbox = QSpinBox()
+        self.other_mask_expand_spinbox.setRange(0, MAX_OTHER_MASK_PREVIEW_EXPAND_PX)
+        self.other_mask_expand_spinbox.setValue(self.other_mask_preview_expand_px)
+        self.other_mask_expand_spinbox.setSuffix(' px')
+        self.other_mask_expand_spinbox.setToolTip('只影響右側淡紫色預覽，不改變輸出的 OTHER_CHANNEL')
+        self.other_mask_expand_spinbox.valueChanged.connect(self.on_other_mask_preview_expand_changed)
+        other_mask_controls.addWidget(self.other_mask_expand_spinbox)
+        other_mask_controls.addStretch()
+        right_layout.addLayout(other_mask_controls)
         self.preview_view = ImageView()
         right_layout.addWidget(self.preview_view, 1)
         splitter.addWidget(right_panel)
@@ -1275,6 +1435,7 @@ class MainWindow(QMainWindow):
             self.edit_mask_btn,
             self.edit_manual_solid_btn,
             self.edit_manual_other_btn,
+            self.convert_masks_btn,
             self.brush_btn,
             self.rect_btn,
             self.magic_btn,
@@ -1329,6 +1490,11 @@ class MainWindow(QMainWindow):
             }
             QComboBox:hover { background: #2b3440; }
             QComboBox::drop-down { border: 0; width: 18px; }
+            QSpinBox {
+                background: #242b33; color: #e6ebef; border: 1px solid #3a4551;
+                border-radius: 5px; padding: 5px 8px;
+            }
+            QSpinBox:hover { background: #2b3440; }
             QListWidget { background: #1c2128; border: 0; color: #dfe5ea; outline: none; }
             QListWidget::item { padding: 8px 6px; border-bottom: 1px solid #27303a; }
             QListWidget::item:selected { background: #243039; color: #ffffff; }
@@ -1394,6 +1560,17 @@ class MainWindow(QMainWindow):
     def save_mask_alpha_percent(self) -> None:
         self.settings.setValue('mask_alpha_percent', self.mask_alpha_percent)
 
+    def _load_other_mask_preview_expand_px(self) -> int:
+        value = self.settings.value('other_mask_preview_expand_px', DEFAULT_OTHER_MASK_PREVIEW_EXPAND_PX)
+        try:
+            expand_px = int(value)
+        except (TypeError, ValueError):
+            expand_px = DEFAULT_OTHER_MASK_PREVIEW_EXPAND_PX
+        return max(0, min(MAX_OTHER_MASK_PREVIEW_EXPAND_PX, expand_px))
+
+    def save_other_mask_preview_expand_px(self) -> None:
+        self.settings.setValue('other_mask_preview_expand_px', self.other_mask_preview_expand_px)
+
     def save_recent_folders(self) -> None:
         self.settings.setValue('recent_folders', self.recent_folders)
 
@@ -1458,6 +1635,54 @@ class MainWindow(QMainWindow):
         self.recent_folders = []
         self.save_recent_folders()
         self.update_recent_menu()
+
+    def show_convert_masks_dialog(self) -> None:
+        if not self.folder or not self.paths or not self.imglist:
+            QMessageBox.information(self, '沒有圖片', '請先選擇圖片文件夾。')
+            return
+        if self.worker_thread is not None:
+            QMessageBox.information(self, '正在執行', '已有任務在執行中。')
+            return
+        if self.page_worker_thread is not None or self.render_timer.isActive():
+            QMessageBox.information(self, '正在生成預覽', '請等待當前頁預覽生成完成。')
+            return
+        dialog = ConvertMasksDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.convert_masks(dialog.selected_target_mode(), dialog.selected_scope())
+
+    def convert_masks(self, target_mode: str, scope: str) -> None:
+        self.set_edit_mode(target_mode)
+        if scope == 'all':
+            self.save_all_edit_masks()
+            self.undo_stack = []
+            self.redo_stack = []
+            self.update_edit_buttons()
+            self.start_convert_worker(self.imglist, target_mode)
+            self.status.showMessage('正在轉換全部頁面選區...')
+            return
+        self.convert_current_page_masks(target_mode)
+
+    def convert_current_page_masks(self, target_mode: str) -> None:
+        if not self.current_img_path:
+            return
+        self.save_all_edit_masks()
+        auto_mask = _convert_image_edit_masks(self.paths, self.current_img_path, target_mode)
+        shape, masks = _read_edit_masks_for_image(self.paths, self.current_img_path)
+        self.current_mask = masks['mask']
+        self.current_manual_solid = masks['manual_solid']
+        self.current_manual_other = masks['manual_other']
+        self.undo_stack = []
+        self.redo_stack = []
+        self.update_edit_buttons()
+        if self.current_base is not None:
+            self.mask_view.set_mask(self.current_edit_mask(), shape, reset_brush_line=True)
+        self.queue_background_sample()
+        self.refresh_mask_preview(keep_view=True)
+        self.pending_render_img_path = self.current_img_path
+        self.pending_render_mask = auto_mask.copy()
+        self.start_pending_render()
+        self.status.showMessage('正在轉換當前頁面選區...')
 
     def update_recent_menu(self) -> None:
         self.recent_menu.clear()
@@ -1650,6 +1875,26 @@ class MainWindow(QMainWindow):
         self.worker_thread.finished.connect(self.cleanup_worker)
         self.worker_thread.start()
 
+    def start_convert_worker(self, image_paths: list[str], target_mode: str) -> None:
+        if self.worker_thread is not None:
+            QMessageBox.information(self, '正在執行', '已有任務在執行中。')
+            return
+        if self.page_worker_thread is not None or self.render_timer.isActive():
+            QMessageBox.information(self, '正在生成預覽', '請等待當前頁預覽生成完成。')
+            return
+        self.progress.setValue(0)
+        self.worker_thread = QThread()
+        self.worker = ConvertMasksWorker(self.folder, self.paths, image_paths, target_mode)
+        self.worker.moveToThread(self.worker_thread)
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker.progress.connect(self.on_worker_progress)
+        self.worker.finished.connect(self.on_convert_worker_finished)
+        self.worker.failed.connect(self.on_worker_failed)
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker.failed.connect(self.worker_thread.quit)
+        self.worker_thread.finished.connect(self.cleanup_worker)
+        self.worker_thread.start()
+
     def on_worker_progress(self, current: int, total: int, name: str) -> None:
         percent = int(current * 100 / max(1, total))
         self.progress.setValue(percent)
@@ -1661,6 +1906,15 @@ class MainWindow(QMainWindow):
         self.refresh_list()
         self.reload_current()
         self.status.showMessage('任務完成。')
+
+    def on_convert_worker_finished(self, report: dict) -> None:
+        self.report = report
+        self.progress.setValue(100)
+        self.undo_stack = []
+        self.redo_stack = []
+        self.refresh_list()
+        self.reload_current()
+        self.status.showMessage('選區轉換完成。')
 
     def on_worker_failed(self, message: str) -> None:
         QMessageBox.critical(self, '執行失敗', message)
@@ -1775,16 +2029,29 @@ class MainWindow(QMainWindow):
 
         if overlay is not None:
             preview = _compose_overlay_preview(base, overlay)
-            if self.show_other_mask:
-                preview = _overlay_mask_on_bgr(preview, other_mask, 0.38, (165, 110, 255))
-            self.preview_view.set_qimage(_qimage_from_bgr(preview), keep_view=keep_view)
         else:
             preview = base[:, :, :3].copy() if len(base.shape) == 3 else cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
-            if self.show_other_mask:
-                preview = _overlay_mask_on_bgr(preview, other_mask, 0.38, (165, 110, 255))
-            self.preview_view.set_qimage(_qimage_from_bgr(preview), keep_view=keep_view)
+        preview = self.apply_other_mask_preview(preview, other_mask)
+        self.preview_view.set_qimage(_qimage_from_bgr(preview), keep_view=keep_view)
 
         self.update_edit_buttons()
+
+    def apply_other_mask_preview(self, preview: np.ndarray, other_mask: np.ndarray | None) -> np.ndarray:
+        if not self.show_other_mask:
+            return preview
+        ring = _expanded_mask_ring(other_mask, self.other_mask_preview_expand_px)
+        preview = _overlay_mask_on_bgr(
+            preview,
+            ring,
+            OTHER_MASK_PREVIEW_RING_ALPHA,
+            EDIT_MODE_COLORS['manual_other'],
+        )
+        return _overlay_mask_on_bgr(
+            preview,
+            other_mask,
+            OTHER_MASK_DISPLAY_ALPHA,
+            EDIT_MODE_COLORS['manual_other'],
+        )
 
     def refresh_mask_preview(self, keep_view: bool = True) -> None:
         if self.current_base is None:
@@ -1841,6 +2108,11 @@ class MainWindow(QMainWindow):
     def on_show_other_mask_changed(self, state: int) -> None:
         self.show_other_mask = state == Qt.CheckState.Checked.value
         self.reload_current()
+
+    def on_other_mask_preview_expand_changed(self, value: int) -> None:
+        self.other_mask_preview_expand_px = max(0, min(MAX_OTHER_MASK_PREVIEW_EXPAND_PX, int(value)))
+        self.save_other_mask_preview_expand_px()
+        self.reload_current(keep_view=True)
 
     def current_edit_mask(self) -> np.ndarray | None:
         if self.edit_mode == 'manual_solid':
