@@ -12,13 +12,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PySide6.QtCore import QObject, QPoint, QSettings, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QCursor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap
+from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
     QFrame,
+    QGraphicsDropShadowEffect,
     QGraphicsEllipseItem,
     QGraphicsLineItem,
     QGraphicsPixmapItem,
@@ -440,6 +441,7 @@ class MaskEditorView(ImageView):
     editStarted = Signal()
     maskEdited = Signal(object)
     selectionCreated = Signal(object)
+    eraseAllMasksRequested = Signal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -456,6 +458,7 @@ class MaskEditorView(ImageView):
         self._last_brush_point: tuple[int, int] | None = None
         self._brush_line_start: tuple[int, int] | None = None
         self._brush_line_preview: QGraphicsLineItem | None = None
+        self._erase_all_drag = False
         self._panning = False
         self._pan_last_pos: QPoint | None = None
         self._rubber_band: QGraphicsRectItem | None = None
@@ -466,6 +469,9 @@ class MaskEditorView(ImageView):
         self._rect_pen_remove = QPen(QColor('#ff8f8f'), 2, Qt.PenStyle.DashLine)
         self._rect_pen_intersect = QPen(QColor('#ffd86f'), 2, Qt.PenStyle.DashLine)
         self._rect_pen_detect = QPen(QColor('#70bdff'), 2, Qt.PenStyle.DashLine)
+        self._rect_pen_erase_all = QPen(QColor('#ff4141'), 3, Qt.PenStyle.DashLine)
+        self._rect_brush_default = QBrush(QColor(255, 255, 255, 30))
+        self._rect_brush_erase_all = QBrush(QColor(255, 70, 70, 90), Qt.BrushStyle.BDiagPattern)
         self._brush_pen = QPen(QColor('#e9fffb'), 2)
         self._brush_line_pen_add = QPen(QColor('#e9fffb'), 2, Qt.PenStyle.DashLine)
         self._brush_line_pen_remove = QPen(QColor('#ff8f8f'), 2, Qt.PenStyle.DashLine)
@@ -554,6 +560,17 @@ class MaskEditorView(ImageView):
         if point is None or self.mask is None:
             super().mousePressEvent(event)
             return
+        if event.button() == Qt.MouseButton.RightButton:
+            self._active_button = event.button()
+            self._drag_start = point
+            self._last_brush_point = point
+            self._brush_line_start = None
+            self._erase_all_drag = True
+            self._edit_started = False
+            self._clear_brush_line_preview()
+            self._update_rubber_band(point, point, event.button())
+            event.accept()
+            return
         if self.tool == 'magic':
             if self._apply_magic_wand(point, event.button()):
                 self._begin_edit_once()
@@ -601,6 +618,10 @@ class MaskEditorView(ImageView):
         if point is None or self.mask is None:
             event.accept()
             return
+        if self._erase_all_drag:
+            self._update_rubber_band(self._drag_start or point, point, self._active_button)
+            event.accept()
+            return
         if self.tool == 'brush':
             if self._brush_line_start is not None:
                 self._update_brush_line_preview(self._brush_line_start, point, self._active_button)
@@ -624,11 +645,15 @@ class MaskEditorView(ImageView):
             super().mouseReleaseEvent(event)
             return
         point = self.image_point_from_view(event.position().toPoint(), clamp=True)
-        if self.tool == 'brush' and self.mask is not None and self._brush_line_start is not None and point is not None:
+        if self._erase_all_drag and self.mask is not None and self._drag_start is not None and point is not None:
+            selection = self._selection_from_rect(self._drag_start, point)
+            if selection is not None:
+                self.eraseAllMasksRequested.emit(selection)
+        elif self.tool == 'brush' and self.mask is not None and self._brush_line_start is not None and point is not None:
             self._begin_edit_once()
             self._paint_line(self._brush_line_start, point, self._active_button)
             self.maskEdited.emit(self.mask.copy())
-        if self.tool == 'rect' and self.mask is not None and self._drag_start is not None and point is not None:
+        if not self._erase_all_drag and self.tool == 'rect' and self.mask is not None and self._drag_start is not None and point is not None:
             if self._apply_rect(self._drag_start, point, self._active_button):
                 self._begin_edit_once()
                 if self.mask is not None:
@@ -637,6 +662,7 @@ class MaskEditorView(ImageView):
         self._drag_start = None
         self._last_brush_point = None
         self._brush_line_start = None
+        self._erase_all_drag = False
         self._edit_started = False
         self._clear_brush_line_preview()
         self._clear_rubber_band()
@@ -684,18 +710,30 @@ class MaskEditorView(ImageView):
     ) -> bool:
         if self.mask is None:
             return False
-        x1, x2 = sorted((start[0], end[0]))
-        y1, y2 = sorted((start[1], end[1]))
-        if x2 < x1 or y2 < y1:
+        selection = self._selection_from_rect(start, end)
+        if selection is None:
             return False
         old_mask = self.mask.copy()
-        selection = np.zeros(self.mask.shape[:2], dtype=bool)
-        selection[y1:y2 + 1, x1:x2 + 1] = True
         if self._should_emit_selection(button):
             self.selectionCreated.emit(selection.copy())
             return False
         self._apply_selection(selection, button)
         return not np.array_equal(old_mask, self.mask)
+
+    def _selection_from_rect(
+        self,
+        start: tuple[int, int],
+        end: tuple[int, int],
+    ) -> np.ndarray | None:
+        if self.mask is None:
+            return None
+        x1, x2 = sorted((start[0], end[0]))
+        y1, y2 = sorted((start[1], end[1]))
+        if x2 < x1 or y2 < y1:
+            return None
+        selection = np.zeros(self.mask.shape[:2], dtype=bool)
+        selection[y1:y2 + 1, x1:x2 + 1] = True
+        return selection
 
     def _apply_magic_wand(
         self,
@@ -803,8 +841,21 @@ class MaskEditorView(ImageView):
         y1, y2 = sorted((start[1], end[1]))
         if self._rubber_band is None:
             self._rubber_band = QGraphicsRectItem()
-            self._rubber_band.setBrush(QColor(255, 255, 255, 30))
             self.scene().addItem(self._rubber_band)
+        if button == Qt.MouseButton.RightButton or self._erase_all_drag:
+            self._rubber_band.setPen(self._rect_pen_erase_all)
+            self._rubber_band.setBrush(self._rect_brush_erase_all)
+            if self._rubber_band.graphicsEffect() is None:
+                shadow = QGraphicsDropShadowEffect()
+                shadow.setBlurRadius(18)
+                shadow.setOffset(0, 0)
+                shadow.setColor(QColor(255, 30, 30, 190))
+                self._rubber_band.setGraphicsEffect(shadow)
+            self._rubber_band.setRect(x1, y1, max(1, x2 - x1), max(1, y2 - y1))
+            return
+        self._rubber_band.setBrush(self._rect_brush_default)
+        if self._rubber_band.graphicsEffect() is not None:
+            self._rubber_band.setGraphicsEffect(None)
         operation = self._selection_operation_for_button(button)
         if operation == 'subtract':
             self._rubber_band.setPen(self._rect_pen_remove)
@@ -1380,7 +1431,7 @@ class MainWindow(QMainWindow):
         self.selection_add_btn.setToolTip('矩形和魔法棒左鍵添加到目前 mask')
         self.selection_subtract_btn = QPushButton('F10 減去')
         self.selection_subtract_btn.setCheckable(True)
-        self.selection_subtract_btn.setToolTip('矩形和魔法棒左鍵從目前 mask 減去；右鍵也會固定減去')
+        self.selection_subtract_btn.setToolTip('矩形和魔法棒左鍵從目前 mask 減去；右鍵矩形會清除所有 mask')
         self.selection_intersect_btn = QPushButton('F11 局部交集')
         self.selection_intersect_btn.setCheckable(True)
         self.selection_intersect_btn.setToolTip('只裁切本次選區碰到的既有 mask 區塊，不影響其他區塊')
@@ -1474,6 +1525,7 @@ class MainWindow(QMainWindow):
         self.mask_view.editStarted.connect(self.push_undo_snapshot)
         self.mask_view.maskEdited.connect(self.on_mask_edited)
         self.mask_view.selectionCreated.connect(self.on_selection_created)
+        self.mask_view.eraseAllMasksRequested.connect(self.on_erase_all_masks_requested)
         center_layout.addWidget(self.mask_view, 1)
         slider_row = QHBoxLayout()
         slider_row.addWidget(QLabel('Mask 顯示'))
@@ -2330,10 +2382,13 @@ class MainWindow(QMainWindow):
         self.local_intersect_controls.setVisible(visible)
 
     def update_selection_combine_status(self) -> None:
-        if getattr(self, 'mask_view', None) is None or self.mask_view.tool == 'brush':
+        if getattr(self, 'mask_view', None) is None:
+            return
+        if self.mask_view.tool == 'brush':
+            self.status.showMessage('筆刷左鍵添加；右鍵拖矩形清除所有 mask')
             return
         label = SELECTION_COMBINE_LABELS.get(self.selection_combine_mode, '添加')
-        self.status.showMessage(f'選區模式：{label}；右鍵固定減去')
+        self.status.showMessage(f'選區模式：{label}；右鍵拖矩形清除所有 mask')
 
     def change_brush_radius(self, delta: int) -> None:
         self.mask_view.set_brush_radius(self.mask_view.brush_radius + delta)
@@ -2447,6 +2502,33 @@ class MainWindow(QMainWindow):
             self.status.showMessage('已從其他 mask 轉入選區重疊部分。')
         else:
             self.status.showMessage('選區沒有碰到其他 mask。')
+
+    def on_erase_all_masks_requested(self, selection: object) -> None:
+        selection_mask = np.asarray(selection, dtype=bool)
+        if self.current_mask is None or selection_mask.shape[:2] != self.current_mask.shape[:2]:
+            self.status.showMessage('右鍵清除選區尺寸不一致。')
+            return
+        masks = [
+            self.current_mask,
+            self.current_manual_solid,
+            self.current_manual_other,
+        ]
+        changed = any(mask is not None and np.any(mask[selection_mask] > 0) for mask in masks)
+        if not changed:
+            self.status.showMessage('右鍵矩形內沒有可清除的 mask。')
+            return
+        self.push_undo_snapshot()
+        for mask in masks:
+            if mask is not None:
+                mask[selection_mask] = 0
+        self.queue_background_sample()
+        self.save_all_edit_masks()
+        if self.current_base is not None:
+            self.mask_view.set_mask(self.current_edit_mask(), self.current_base.shape[:2])
+        self.refresh_mask_preview(keep_view=True)
+        self.queue_auto_render()
+        self.update_edit_buttons()
+        self.status.showMessage('已清除右鍵矩形內所有 mask。')
 
     def start_ctd_selection_detection(self, selection: np.ndarray) -> None:
         if self.current_base is None or not self.current_img_path or self.current_edit_mask() is None:
@@ -2825,10 +2907,9 @@ class MainWindow(QMainWindow):
             f'版本：{APP_VERSION}\n\n'
             '滑鼠操作：\n'
             '筆刷左鍵：添加 mask\n'
-            '筆刷右鍵：去掉 mask\n'
+            '右鍵拖拽：不分工具，矩形清除自動 / 強制純色 / 需要修改 mask\n'
             '筆刷 Shift + 按下拖到鬆開：連接按下和鬆開位置\n'
             '矩形 / 魔法棒左鍵：按「添加 / 減去 / 局部交集 / 從其他轉入 / 添加CTD檢測選區」處理目前 mask\n'
-            '矩形 / 魔法棒右鍵：固定減去 mask\n'
             '局部交集：只裁切本次選區碰到的既有 mask 區塊\n'
             '交集偏移：局部交集結果正數擴展，負數收縮，0 保持原大小\n'
             '從其他轉入：把選區內其他 mask 的重疊部分移到目前 mask\n'
