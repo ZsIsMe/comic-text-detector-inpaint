@@ -439,6 +439,20 @@ class ImageView(QGraphicsView):
         finally:
             self._suppress_view_changed = False
 
+    def visible_image_rect(self) -> QRectF:
+        pixmap = self.pixmap_item.pixmap()
+        if pixmap.isNull():
+            return QRectF()
+        visible = self.mapToScene(self.viewport().rect()).boundingRect()
+        image_rect = QRectF(pixmap.rect())
+        return visible.intersected(image_rect)
+
+    def center_on_image_point(self, x: float, y: float) -> None:
+        if self.pixmap_item.pixmap().isNull():
+            return
+        self.centerOn(x, y)
+        self._emit_view_changed()
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self.viewportResized.emit()
@@ -1288,6 +1302,198 @@ class PdfWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class FloatingNavigator(QWidget):
+    viewportCenterRequested = Signal(float, float)
+    positionChanged = Signal(int, int)
+    closeRequested = Signal()
+
+    TITLE_HEIGHT = 26
+    PANEL_MARGIN = 10
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(210, 250)
+        self.setMouseTracking(True)
+        self._pixmap = QPixmap()
+        self._image_size = QRectF()
+        self._viewport_rect = QRectF()
+        self._drag_mode = ''
+        self._panel_drag_offset = QPoint()
+        self._viewport_drag_offset = QPoint()
+        self._last_mouse_pos = QPoint()
+        self.setToolTip('拖動標題列移動小地圖；拖動框口或點擊縮圖移動畫布')
+
+    def set_qimage(self, image: QImage | None) -> None:
+        if image is None or image.isNull():
+            self._pixmap = QPixmap()
+            self._image_size = QRectF()
+        else:
+            self._pixmap = QPixmap.fromImage(image)
+            self._image_size = QRectF(0, 0, image.width(), image.height())
+        self.update()
+
+    def set_viewport_rect(self, rect: QRectF) -> None:
+        self._viewport_rect = QRectF(rect)
+        self.update()
+
+    def _title_rect(self) -> QRectF:
+        return QRectF(0, 0, self.width(), self.TITLE_HEIGHT)
+
+    def _close_rect(self) -> QRectF:
+        return QRectF(self.width() - 26, 4, 18, 18)
+
+    def _thumbnail_bounds(self) -> QRectF:
+        return QRectF(
+            self.PANEL_MARGIN,
+            self.TITLE_HEIGHT + self.PANEL_MARGIN,
+            self.width() - self.PANEL_MARGIN * 2,
+            self.height() - self.TITLE_HEIGHT - self.PANEL_MARGIN * 2,
+        )
+
+    def _thumbnail_rect(self) -> QRectF:
+        bounds = self._thumbnail_bounds()
+        if self._image_size.isEmpty():
+            return QRectF()
+        scale = min(
+            bounds.width() / self._image_size.width(),
+            bounds.height() / self._image_size.height(),
+        )
+        width = self._image_size.width() * scale
+        height = self._image_size.height() * scale
+        return QRectF(
+            bounds.left() + (bounds.width() - width) / 2,
+            bounds.top() + (bounds.height() - height) / 2,
+            width,
+            height,
+        )
+
+    def _image_point_from_widget(self, point: QPoint) -> tuple[float, float] | None:
+        thumb = self._thumbnail_rect()
+        if thumb.isEmpty():
+            return None
+        x = (point.x() - thumb.left()) / thumb.width() * self._image_size.width()
+        y = (point.y() - thumb.top()) / thumb.height() * self._image_size.height()
+        return (
+            max(0.0, min(self._image_size.width(), x)),
+            max(0.0, min(self._image_size.height(), y)),
+        )
+
+    def _widget_rect_from_image_rect(self, rect: QRectF) -> QRectF:
+        thumb = self._thumbnail_rect()
+        if thumb.isEmpty() or self._image_size.isEmpty() or rect.isEmpty():
+            return QRectF()
+        x_scale = thumb.width() / self._image_size.width()
+        y_scale = thumb.height() / self._image_size.height()
+        return QRectF(
+            thumb.left() + rect.left() * x_scale,
+            thumb.top() + rect.top() * y_scale,
+            max(4.0, rect.width() * x_scale),
+            max(4.0, rect.height() * y_scale),
+        )
+
+    def _move_panel(self, pos: QPoint) -> None:
+        parent = self.parentWidget()
+        if parent is None:
+            self.move(pos)
+            self.positionChanged.emit(self.x(), self.y())
+            return
+        max_x = max(0, parent.width() - self.width())
+        max_y = max(0, parent.height() - self.height())
+        clamped = QPoint(max(0, min(max_x, pos.x())), max(0, min(max_y, pos.y())))
+        self.move(clamped)
+        self.positionChanged.emit(self.x(), self.y())
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        panel = QRectF(0.5, 0.5, self.width() - 1, self.height() - 1)
+        painter.setPen(QPen(QColor('#41505e'), 1))
+        painter.setBrush(QColor(22, 27, 32, 236))
+        painter.drawRoundedRect(panel, 6, 6)
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(35, 43, 51, 238))
+        painter.drawRoundedRect(QRectF(1, 1, self.width() - 2, self.TITLE_HEIGHT), 5, 5)
+        painter.setPen(QColor('#e6ebef'))
+        painter.drawText(QRectF(10, 0, self.width() - 42, self.TITLE_HEIGHT), Qt.AlignmentFlag.AlignVCenter, 'Navigator')
+
+        close_rect = self._close_rect()
+        painter.setPen(QPen(QColor('#aab5bf'), 2))
+        painter.drawLine(close_rect.left() + 5, close_rect.top() + 5, close_rect.right() - 5, close_rect.bottom() - 5)
+        painter.drawLine(close_rect.right() - 5, close_rect.top() + 5, close_rect.left() + 5, close_rect.bottom() - 5)
+
+        thumb_bounds = self._thumbnail_bounds()
+        painter.setPen(QPen(QColor('#303944'), 1))
+        painter.setBrush(QColor('#0b0d10'))
+        painter.drawRoundedRect(thumb_bounds, 4, 4)
+
+        thumb = self._thumbnail_rect()
+        if self._pixmap.isNull() or thumb.isEmpty():
+            painter.setPen(QColor('#74808b'))
+            painter.drawText(thumb_bounds, Qt.AlignmentFlag.AlignCenter, '無圖片')
+            return
+
+        painter.drawPixmap(thumb.toRect(), self._pixmap)
+
+        viewport = self._widget_rect_from_image_rect(self._viewport_rect).intersected(thumb)
+        if not viewport.isEmpty():
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(233, 255, 251, 35))
+            painter.drawRect(viewport)
+            painter.setPen(QPen(QColor('#e9fffb'), 2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(viewport)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            event.accept()
+            return
+        pos = event.position().toPoint()
+        self._last_mouse_pos = pos
+        if self._close_rect().contains(pos):
+            self.closeRequested.emit()
+            event.accept()
+            return
+        if self._title_rect().contains(pos):
+            self._drag_mode = 'panel'
+            self._panel_drag_offset = pos
+            event.accept()
+            return
+        thumb = self._thumbnail_rect()
+        if thumb.contains(pos):
+            viewport = self._widget_rect_from_image_rect(self._viewport_rect)
+            self._drag_mode = 'viewport'
+            if viewport.contains(pos):
+                self._viewport_drag_offset = pos - viewport.center().toPoint()
+            else:
+                self._viewport_drag_offset = QPoint()
+                self._request_center_from_widget_pos(pos)
+            event.accept()
+            return
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        pos = event.position().toPoint()
+        self._last_mouse_pos = pos
+        if self._drag_mode == 'panel':
+            self._move_panel(self.pos() + pos - self._panel_drag_offset)
+        elif self._drag_mode == 'viewport':
+            self._request_center_from_widget_pos(pos - self._viewport_drag_offset)
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._drag_mode = ''
+        self.positionChanged.emit(self.x(), self.y())
+        event.accept()
+
+    def _request_center_from_widget_pos(self, pos: QPoint) -> None:
+        image_point = self._image_point_from_widget(pos)
+        if image_point is None:
+            return
+        self.viewportCenterRequested.emit(image_point[0], image_point[1])
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -1310,6 +1516,8 @@ class MainWindow(QMainWindow):
         self.settings = QSettings('ComicTextDetector', 'SolidInpaintUI')
         self.mask_alpha_percent = self._load_mask_alpha_percent()
         self.other_mask_preview_expand_px = self._load_other_mask_preview_expand_px()
+        self.navigator_visible = self._load_navigator_visible()
+        self.navigator_position = self._load_navigator_position()
         self.alpha = self.mask_alpha_percent / 100.0
         self.mask_display_color = MASK_DISPLAY_COLORS['白色']
         self.show_other_mask = True
@@ -1453,6 +1661,12 @@ class MainWindow(QMainWindow):
         help_action.triggered.connect(self.show_help)
         toolbar.addAction(help_action)
 
+        self.navigator_action = QAction('小地圖', self)
+        self.navigator_action.setCheckable(True)
+        self.navigator_action.setChecked(self.navigator_visible)
+        self.navigator_action.triggered.connect(self.set_navigator_visible)
+        toolbar.addAction(self.navigator_action)
+
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         toolbar.addWidget(spacer)
@@ -1506,6 +1720,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(left_panel)
 
         workspace_panel = QFrame()
+        self.workspace_panel = workspace_panel
         workspace_layout = QVBoxLayout(workspace_panel)
         workspace_layout.setContentsMargins(10, 10, 10, 10)
         workspace_layout.setSpacing(8)
@@ -1702,7 +1917,9 @@ class MainWindow(QMainWindow):
         self.mask_view.selectionCreated.connect(self.on_selection_created)
         self.mask_view.eraseAllMasksRequested.connect(self.on_erase_all_masks_requested)
         self.mask_view.viewChanged.connect(self.sync_preview_view)
+        self.mask_view.viewChanged.connect(self.update_navigator_viewport)
         self.mask_view.viewportResized.connect(self.sync_preview_view)
+        self.mask_view.viewportResized.connect(self.update_navigator_viewport)
         views_grid.addWidget(self.mask_view, 1, 0)
 
         self.preview_view = PassivePreviewView()
@@ -1710,6 +1927,14 @@ class MainWindow(QMainWindow):
 
         workspace_layout.addLayout(views_grid, 1)
         splitter.addWidget(workspace_panel)
+
+        self.navigator = FloatingNavigator(workspace_panel)
+        self.navigator.viewportCenterRequested.connect(self.center_mask_view_from_navigator)
+        self.navigator.positionChanged.connect(self.save_navigator_position)
+        self.navigator.closeRequested.connect(lambda: self.navigator_action.setChecked(False))
+        self.navigator.closeRequested.connect(lambda: self.set_navigator_visible(False))
+        self.navigator.setVisible(self.navigator_visible)
+        QTimer.singleShot(0, self.restore_navigator_position)
 
         for button in (
             self.edit_mask_btn,
@@ -1851,6 +2076,60 @@ class MainWindow(QMainWindow):
 
     def save_other_mask_preview_expand_px(self) -> None:
         self.settings.setValue('other_mask_preview_expand_px', self.other_mask_preview_expand_px)
+
+    def _load_navigator_visible(self) -> bool:
+        value = self.settings.value('navigator_visible', True)
+        if isinstance(value, bool):
+            return value
+        return str(value).lower() not in ('0', 'false', 'no')
+
+    def _load_navigator_position(self) -> QPoint | None:
+        value = self.settings.value('navigator_position', '')
+        if not value:
+            return None
+        if isinstance(value, QPoint):
+            return value
+        try:
+            x_text, y_text = str(value).split(',', 1)
+            return QPoint(int(x_text), int(y_text))
+        except (TypeError, ValueError):
+            return None
+
+    def set_navigator_visible(self, visible: bool) -> None:
+        self.navigator_visible = bool(visible)
+        self.settings.setValue('navigator_visible', self.navigator_visible)
+        if getattr(self, 'navigator_action', None) is not None:
+            self.navigator_action.setChecked(self.navigator_visible)
+        if getattr(self, 'navigator', None) is not None:
+            self.navigator.setVisible(self.navigator_visible)
+            if self.navigator_visible:
+                self.restore_navigator_position()
+                self.navigator.raise_()
+                self.update_navigator_viewport()
+
+    def restore_navigator_position(self) -> None:
+        if getattr(self, 'navigator', None) is None or getattr(self, 'workspace_panel', None) is None:
+            return
+        parent = self.workspace_panel
+        if self.navigator_position is None:
+            margin = 18
+            pos = QPoint(
+                max(0, parent.width() - self.navigator.width() - margin),
+                max(0, parent.height() - self.navigator.height() - margin),
+            )
+        else:
+            max_x = max(0, parent.width() - self.navigator.width())
+            max_y = max(0, parent.height() - self.navigator.height())
+            pos = QPoint(
+                max(0, min(max_x, self.navigator_position.x())),
+                max(0, min(max_y, self.navigator_position.y())),
+            )
+        self.navigator.move(pos)
+        self.navigator.raise_()
+
+    def save_navigator_position(self, x: int, y: int) -> None:
+        self.navigator_position = QPoint(int(x), int(y))
+        self.settings.setValue('navigator_position', f'{int(x)},{int(y)}')
 
     def save_recent_folders(self) -> None:
         self.settings.setValue('recent_folders', self.recent_folders)
@@ -2339,6 +2618,8 @@ class MainWindow(QMainWindow):
     def refresh_mask_preview(self, keep_view: bool = True) -> None:
         if self.current_base is None:
             self.mask_view.set_qimage(None)
+            if getattr(self, 'navigator', None) is not None:
+                self.navigator.set_qimage(None)
             return
         mask_preview = _mask_overlay_image(
             self.current_base,
@@ -2365,11 +2646,15 @@ class MainWindow(QMainWindow):
                 SAMPLE_RING_DISPLAY_ALPHA,
                 SAMPLE_RING_DISPLAY_COLOR_BGR,
             )
-        self.mask_view.set_qimage(_qimage_from_bgr(mask_preview), keep_view=keep_view)
+        mask_qimage = _qimage_from_bgr(mask_preview)
+        self.mask_view.set_qimage(mask_qimage, keep_view=keep_view)
+        if getattr(self, 'navigator', None) is not None:
+            self.navigator.set_qimage(mask_qimage)
         current_mask = self.current_edit_mask()
         if current_mask is not None:
             self.mask_view.set_mask(current_mask, self.current_base.shape[:2])
             self.mask_view.set_source_image(self.current_base)
+        self.update_navigator_viewport()
 
     def on_alpha_changed(self, value: int) -> None:
         self.mask_alpha_percent = max(0, min(100, int(value)))
@@ -2542,8 +2827,23 @@ class MainWindow(QMainWindow):
         finally:
             self._syncing_preview_view = False
 
+    def update_navigator_viewport(self) -> None:
+        if getattr(self, 'navigator', None) is None or getattr(self, 'mask_view', None) is None:
+            return
+        self.navigator.set_viewport_rect(self.mask_view.visible_image_rect())
+
+    def center_mask_view_from_navigator(self, x: float, y: float) -> None:
+        if getattr(self, 'mask_view', None) is None:
+            return
+        self.mask_view.center_on_image_point(x, y)
+        self.sync_preview_view()
+        self.update_navigator_viewport()
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        if getattr(self, 'navigator', None) is not None:
+            self.restore_navigator_position()
+            self.update_navigator_viewport()
         if getattr(self, 'auto_fit_on_resize', False):
             self.resize_fit_timer.start(120)
 
@@ -3056,7 +3356,8 @@ class MainWindow(QMainWindow):
             '觸摸板雙指：移動畫布\n'
             '鼠標滾輪：移動畫布\n'
             'Command + 滾輪：左右移動畫布\n'
-            'Option + 滾輪：以鼠標位置為中心縮放\n\n'
+            'Option + 滾輪：以鼠標位置為中心縮放\n'
+            '小地圖：拖標題列移動面板；拖框口或點擊縮圖移動畫布\n\n'
             '快捷鍵：\n'
             'Command/Ctrl + +：放大\n'
             'Command/Ctrl + -：縮小（保持頁面中心點）\n'
