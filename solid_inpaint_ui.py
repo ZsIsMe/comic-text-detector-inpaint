@@ -11,7 +11,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QObject, QPoint, QSettings, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QObject, QPoint, QRectF, QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFrame,
-    QGraphicsDropShadowEffect,
+    QGridLayout,
     QGraphicsEllipseItem,
     QGraphicsLineItem,
     QGraphicsPixmapItem,
@@ -338,6 +338,9 @@ def _make_magic_cursor() -> QCursor:
 
 
 class ImageView(QGraphicsView):
+    viewChanged = Signal()
+    viewportResized = Signal()
+
     def __init__(self) -> None:
         super().__init__()
         self.setScene(QGraphicsScene(self))
@@ -347,12 +350,22 @@ class ImageView(QGraphicsView):
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._zoom = 1.0
+        self._suppress_view_changed = False
+        self.horizontalScrollBar().valueChanged.connect(self._emit_view_changed)
+        self.verticalScrollBar().valueChanged.connect(self._emit_view_changed)
+
+    def _emit_view_changed(self) -> None:
+        if not self._suppress_view_changed:
+            self.viewChanged.emit()
 
     def set_qimage(self, image: QImage | None, keep_view: bool = False) -> None:
         if image is None:
             self.pixmap_item.setPixmap(QPixmap())
             self.scene().setSceneRect(0, 0, 1, 1)
+            self._emit_view_changed()
             return
         old_transform = self.transform()
         old_zoom = self._zoom
@@ -368,6 +381,7 @@ class ImageView(QGraphicsView):
             self.verticalScrollBar().setValue(old_vertical_scroll)
         else:
             self.fit()
+        self._emit_view_changed()
 
     def fit(self) -> None:
         pixmap = self.pixmap_item.pixmap()
@@ -375,11 +389,13 @@ class ImageView(QGraphicsView):
             return
         self.resetTransform()
         self.fitInView(self.pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
-        self._zoom = 1.0
+        self._zoom = self.transform().m11()
+        self._emit_view_changed()
 
     def actual_size(self) -> None:
         self.resetTransform()
         self._zoom = 1.0
+        self._emit_view_changed()
 
     def zoom_by(
         self,
@@ -400,12 +416,33 @@ class ImageView(QGraphicsView):
             self.verticalScrollBar().setValue(self.verticalScrollBar().value() + delta.y())
         if old_center is not None:
             self.centerOn(old_center)
+        self._emit_view_changed()
 
     def pan_by(self, dx: int, dy: int) -> None:
         if self.pixmap_item.pixmap().isNull():
             return
         self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() + dx)
         self.verticalScrollBar().setValue(self.verticalScrollBar().value() + dy)
+        self._emit_view_changed()
+
+    def copy_view_from(self, source: 'ImageView') -> None:
+        if self.pixmap_item.pixmap().isNull() or source.pixmap_item.pixmap().isNull():
+            return
+        center = source.mapToScene(source.viewport().rect().center())
+        self._suppress_view_changed = True
+        try:
+            self.setTransform(source.transform())
+            self._zoom = source._zoom
+            self.centerOn(center)
+            self.horizontalScrollBar().setValue(source.horizontalScrollBar().value())
+            self.verticalScrollBar().setValue(source.verticalScrollBar().value())
+        finally:
+            self._suppress_view_changed = False
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.viewportResized.emit()
+        self._emit_view_changed()
 
     def wheelEvent(self, event) -> None:
         if self.pixmap_item.pixmap().isNull():
@@ -437,6 +474,92 @@ class ImageView(QGraphicsView):
         event.accept()
 
 
+class PassivePreviewView(ImageView):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self.setInteractive(False)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+
+    def mousePressEvent(self, event) -> None:
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        event.accept()
+
+    def wheelEvent(self, event) -> None:
+        event.accept()
+
+    def keyPressEvent(self, event) -> None:
+        event.accept()
+
+    def keyReleaseEvent(self, event) -> None:
+        event.accept()
+
+
+class RubberBandRectItem(QGraphicsRectItem):
+    def __init__(self) -> None:
+        super().__init__()
+        self.erase_all_style = False
+
+    def set_erase_all_style(self, enabled: bool) -> None:
+        if self.erase_all_style == enabled:
+            return
+        self.erase_all_style = enabled
+        self.update()
+
+    def boundingRect(self) -> QRectF:
+        rect = super().boundingRect()
+        if not self.erase_all_style:
+            return rect
+        return rect.adjusted(-8, -8, 8, 8)
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:
+        if not self.erase_all_style:
+            super().paint(painter, option, widget)
+            return
+
+        rect = self.rect()
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        glow_pen = QPen(QColor(115, 135, 150, 95), 8, Qt.PenStyle.SolidLine)
+        painter.setPen(glow_pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(rect.adjusted(-2, -2, 2, 2))
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(154, 167, 179, 62))
+        painter.drawRect(rect)
+
+        painter.save()
+        painter.setClipRect(rect)
+        hatch_pen = QPen(QColor(182, 194, 204, 145), 1)
+        painter.setPen(hatch_pen)
+        step = 10
+        left = int(rect.left())
+        right = int(rect.right())
+        top = int(rect.top())
+        bottom = int(rect.bottom())
+        height = max(1, bottom - top)
+        for x in range(left - height - step, right + step, step):
+            painter.drawLine(x, bottom, x + height, top)
+        painter.restore()
+
+        border_pen = QPen(QColor('#9aa7b3'), 3, Qt.PenStyle.DashLine)
+        painter.setPen(border_pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(rect)
+        painter.restore()
+
+
 class MaskEditorView(ImageView):
     editStarted = Signal()
     maskEdited = Signal(object)
@@ -461,7 +584,7 @@ class MaskEditorView(ImageView):
         self._erase_all_drag = False
         self._panning = False
         self._pan_last_pos: QPoint | None = None
-        self._rubber_band: QGraphicsRectItem | None = None
+        self._rubber_band: RubberBandRectItem | None = None
         self._brush_cursor: QGraphicsEllipseItem | None = None
         self._edit_started = False
         self._magic_cursor = _make_magic_cursor()
@@ -469,9 +592,7 @@ class MaskEditorView(ImageView):
         self._rect_pen_remove = QPen(QColor('#ff8f8f'), 2, Qt.PenStyle.DashLine)
         self._rect_pen_intersect = QPen(QColor('#ffd86f'), 2, Qt.PenStyle.DashLine)
         self._rect_pen_detect = QPen(QColor('#70bdff'), 2, Qt.PenStyle.DashLine)
-        self._rect_pen_erase_all = QPen(QColor('#9aa7b3'), 3, Qt.PenStyle.DashLine)
         self._rect_brush_default = QBrush(QColor(255, 255, 255, 30))
-        self._rect_brush_erase_all = QBrush(QColor(154, 167, 179, 85), Qt.BrushStyle.BDiagPattern)
         self._brush_pen = QPen(QColor('#e9fffb'), 2)
         self._brush_line_pen_add = QPen(QColor('#e9fffb'), 2, Qt.PenStyle.DashLine)
         self._brush_line_pen_remove = QPen(QColor('#ff8f8f'), 2, Qt.PenStyle.DashLine)
@@ -840,22 +961,14 @@ class MaskEditorView(ImageView):
         x1, x2 = sorted((start[0], end[0]))
         y1, y2 = sorted((start[1], end[1]))
         if self._rubber_band is None:
-            self._rubber_band = QGraphicsRectItem()
+            self._rubber_band = RubberBandRectItem()
             self.scene().addItem(self._rubber_band)
         if button == Qt.MouseButton.RightButton or self._erase_all_drag:
-            self._rubber_band.setPen(self._rect_pen_erase_all)
-            self._rubber_band.setBrush(self._rect_brush_erase_all)
-            if self._rubber_band.graphicsEffect() is None:
-                shadow = QGraphicsDropShadowEffect()
-                shadow.setBlurRadius(18)
-                shadow.setOffset(0, 0)
-                shadow.setColor(QColor(115, 135, 150, 165))
-                self._rubber_band.setGraphicsEffect(shadow)
+            self._rubber_band.set_erase_all_style(True)
             self._rubber_band.setRect(x1, y1, max(1, x2 - x1), max(1, y2 - y1))
             return
+        self._rubber_band.set_erase_all_style(False)
         self._rubber_band.setBrush(self._rect_brush_default)
-        if self._rubber_band.graphicsEffect() is not None:
-            self._rubber_band.setGraphicsEffect(None)
         operation = self._selection_operation_for_button(button)
         if operation == 'subtract':
             self._rubber_band.setPen(self._rect_pen_remove)
@@ -1221,6 +1334,7 @@ class MainWindow(QMainWindow):
         self.pending_render_img_path = ''
         self.pending_render_mask: np.ndarray | None = None
         self.suppress_list_selection = False
+        self._syncing_preview_view = False
         self.render_timer = QTimer(self)
         self.render_timer.setSingleShot(True)
         self.render_timer.timeout.connect(self.start_pending_render)
@@ -1391,10 +1505,11 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.list_widget, 1)
         splitter.addWidget(left_panel)
 
-        center_panel = QFrame()
-        center_layout = QVBoxLayout(center_panel)
-        center_layout.setContentsMargins(10, 10, 10, 10)
-        center_layout.addWidget(QLabel('Mask / 原圖'))
+        workspace_panel = QFrame()
+        workspace_layout = QVBoxLayout(workspace_panel)
+        workspace_layout.setContentsMargins(10, 10, 10, 10)
+        workspace_layout.setSpacing(8)
+
         mode_toolbar = QHBoxLayout()
         self.edit_mask_btn = QPushButton('F1 自動')
         self.edit_mask_btn.setCheckable(True)
@@ -1414,7 +1529,8 @@ class MainWindow(QMainWindow):
         mode_toolbar.addWidget(self.edit_manual_other_btn)
         mode_toolbar.addWidget(self.convert_masks_btn)
         mode_toolbar.addStretch()
-        center_layout.addLayout(mode_toolbar)
+        workspace_layout.addLayout(mode_toolbar)
+
         edit_toolbar = QHBoxLayout()
         self.rect_btn = QPushButton('F5 矩形')
         self.rect_btn.setCheckable(True)
@@ -1520,72 +1636,80 @@ class MainWindow(QMainWindow):
         edit_toolbar.addWidget(self.undo_btn)
         edit_toolbar.addWidget(self.redo_btn)
         edit_toolbar.addStretch()
-        center_layout.addLayout(edit_toolbar)
-        self.mask_view = MaskEditorView()
-        self.mask_view.editStarted.connect(self.push_undo_snapshot)
-        self.mask_view.maskEdited.connect(self.on_mask_edited)
-        self.mask_view.selectionCreated.connect(self.on_selection_created)
-        self.mask_view.eraseAllMasksRequested.connect(self.on_erase_all_masks_requested)
-        center_layout.addWidget(self.mask_view, 1)
-        slider_row = QHBoxLayout()
-        slider_row.addWidget(QLabel('Mask 顯示'))
+        workspace_layout.addLayout(edit_toolbar)
+
+        view_options = QHBoxLayout()
+        view_options.addWidget(QLabel('Mask 顯示'))
         self.alpha_slider = QSlider(Qt.Orientation.Horizontal)
         self.alpha_slider.setRange(0, 100)
         self.alpha_slider.setInvertedAppearance(True)
         self.alpha_slider.setValue(self.mask_alpha_percent)
         self.alpha_slider.valueChanged.connect(self.on_alpha_changed)
         self.alpha_label = QLabel(f'目前 {self.mask_alpha_percent}%')
-        slider_row.addWidget(QLabel('100%'))
-        slider_row.addWidget(self.alpha_slider, 1)
-        slider_row.addWidget(QLabel('0%'))
-        slider_row.addWidget(self.alpha_label)
-        slider_row.addWidget(QLabel('Mask 顏色'))
+        view_options.addWidget(QLabel('100%'))
+        view_options.addWidget(self.alpha_slider, 1)
+        view_options.addWidget(QLabel('0%'))
+        view_options.addWidget(self.alpha_label)
+        view_options.addWidget(QLabel('Mask 顏色'))
         self.mask_color_combo = QComboBox()
         for name in MASK_DISPLAY_COLORS:
             self.mask_color_combo.addItem(name)
         self.mask_color_combo.setCurrentText('白色')
         self.mask_color_combo.currentTextChanged.connect(self.on_mask_display_color_changed)
-        slider_row.addWidget(self.mask_color_combo)
+        view_options.addWidget(self.mask_color_combo)
         self.background_sample_checkbox = QCheckBox('顯示背景選區')
         self.background_sample_checkbox.setChecked(True)
         self.background_sample_checkbox.stateChanged.connect(self.on_show_background_sample_changed)
-        slider_row.addWidget(self.background_sample_checkbox)
+        view_options.addWidget(self.background_sample_checkbox)
         self.background_sample_status = QLabel('')
         self.background_sample_status.setFixedWidth(120)
-        slider_row.addWidget(self.background_sample_status)
-        center_layout.addLayout(slider_row)
-        view_buttons = QHBoxLayout()
-        fit_btn = QPushButton('F4')
-        fit_btn.setToolTip('兩張圖同時適應窗口')
-        fit_btn.clicked.connect(self.fit_both_views)
-        view_buttons.addWidget(fit_btn)
-        view_buttons.addStretch()
-        center_layout.addLayout(view_buttons)
-        splitter.addWidget(center_panel)
+        view_options.addWidget(self.background_sample_status)
+        view_options.addSpacing(12)
 
-        right_panel = QFrame()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(10, 10, 10, 10)
-        right_layout.addWidget(QLabel('Inpainted 預覽'))
         self.other_mask_checkbox = QCheckBox('顯示 other_mask')
         self.other_mask_checkbox.setChecked(True)
         self.other_mask_checkbox.stateChanged.connect(self.on_show_other_mask_changed)
-        other_mask_controls = QHBoxLayout()
-        other_mask_controls.addWidget(self.other_mask_checkbox)
-        other_mask_controls.addSpacing(8)
-        other_mask_controls.addWidget(QLabel('PS 擴展預覽'))
+        view_options.addWidget(self.other_mask_checkbox)
+        view_options.addSpacing(8)
+        view_options.addWidget(QLabel('PS 擴展預覽'))
         self.other_mask_expand_spinbox = QSpinBox()
         self.other_mask_expand_spinbox.setRange(0, MAX_OTHER_MASK_PREVIEW_EXPAND_PX)
         self.other_mask_expand_spinbox.setValue(self.other_mask_preview_expand_px)
         self.other_mask_expand_spinbox.setSuffix(' px')
         self.other_mask_expand_spinbox.setToolTip('只影響右側淡紫色預覽，不改變輸出的 OTHER_CHANNEL')
         self.other_mask_expand_spinbox.valueChanged.connect(self.on_other_mask_preview_expand_changed)
-        other_mask_controls.addWidget(self.other_mask_expand_spinbox)
-        other_mask_controls.addStretch()
-        right_layout.addLayout(other_mask_controls)
-        self.preview_view = ImageView()
-        right_layout.addWidget(self.preview_view, 1)
-        splitter.addWidget(right_panel)
+        view_options.addWidget(self.other_mask_expand_spinbox)
+        view_options.addSpacing(12)
+        fit_btn = QPushButton('F4')
+        fit_btn.setToolTip('兩張圖同時適應窗口')
+        fit_btn.clicked.connect(self.fit_both_views)
+        view_options.addWidget(fit_btn)
+        view_options.addStretch()
+        workspace_layout.addLayout(view_options)
+
+        views_grid = QGridLayout()
+        views_grid.setContentsMargins(0, 0, 0, 0)
+        views_grid.setSpacing(8)
+        views_grid.setColumnStretch(0, 1)
+        views_grid.setColumnStretch(1, 1)
+        views_grid.setRowStretch(1, 1)
+        views_grid.addWidget(QLabel('Mask / 原圖'), 0, 0)
+        views_grid.addWidget(QLabel('Inpainted 預覽'), 0, 1)
+
+        self.mask_view = MaskEditorView()
+        self.mask_view.editStarted.connect(self.push_undo_snapshot)
+        self.mask_view.maskEdited.connect(self.on_mask_edited)
+        self.mask_view.selectionCreated.connect(self.on_selection_created)
+        self.mask_view.eraseAllMasksRequested.connect(self.on_erase_all_masks_requested)
+        self.mask_view.viewChanged.connect(self.sync_preview_view)
+        self.mask_view.viewportResized.connect(self.sync_preview_view)
+        views_grid.addWidget(self.mask_view, 1, 0)
+
+        self.preview_view = PassivePreviewView()
+        views_grid.addWidget(self.preview_view, 1, 1)
+
+        workspace_layout.addLayout(views_grid, 1)
+        splitter.addWidget(workspace_panel)
 
         for button in (
             self.edit_mask_btn,
@@ -1608,7 +1732,7 @@ class MainWindow(QMainWindow):
         ):
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
-        splitter.setSizes([250, 650, 650])
+        splitter.setSizes([250, 1300])
         self.setCentralWidget(root)
 
         self.status = QStatusBar()
@@ -2190,6 +2314,8 @@ class MainWindow(QMainWindow):
             preview = base[:, :, :3].copy() if len(base.shape) == 3 else cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
         preview = self.apply_other_mask_preview(preview, other_mask)
         self.preview_view.set_qimage(_qimage_from_bgr(preview), keep_view=keep_view)
+        self.sync_preview_view()
+        QTimer.singleShot(0, self.sync_preview_view)
 
         self.update_edit_buttons()
 
@@ -2403,7 +2529,18 @@ class MainWindow(QMainWindow):
 
     def fit_both_views(self) -> None:
         self.mask_view.fit()
-        self.preview_view.fit()
+        self.sync_preview_view()
+
+    def sync_preview_view(self) -> None:
+        if self._syncing_preview_view:
+            return
+        if getattr(self, 'mask_view', None) is None or getattr(self, 'preview_view', None) is None:
+            return
+        self._syncing_preview_view = True
+        try:
+            self.preview_view.copy_view_from(self.mask_view)
+        finally:
+            self._syncing_preview_view = False
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
