@@ -12,7 +12,7 @@ import venv
 from pathlib import Path
 
 
-APP_NAME = 'Solid Inpaint'
+APP_NAME = '塗白'
 MODEL_URL = 'https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.2.1/comictextdetector.pt'
 MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'comictextdetector.pt'
 ROOT = Path(__file__).resolve().parent

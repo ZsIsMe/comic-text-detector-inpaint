@@ -71,6 +71,7 @@ from detect_solid_inpaint_folder import (
     iter_background_samples_from_mask,
     load_report,
     process_image_with_detector,
+    REFINEMASK_ANNOTATION,
     regenerate_image_from_mask,
     regenerate_image_from_ysgyolo_mask,
     write_report,
@@ -96,6 +97,10 @@ MAX_BRUSH_RADIUS = 160
 DEFAULT_MAGIC_TOLERANCE = 28
 MIN_MAGIC_TOLERANCE = 0
 MAX_MAGIC_TOLERANCE = 100
+DEFAULT_LOCAL_INTERSECT_OFFSET_PX = 0
+MIN_LOCAL_INTERSECT_OFFSET_PX = -80
+MAX_LOCAL_INTERSECT_OFFSET_PX = 80
+CTD_SELECTION_PADDING_PX = 16
 MASK_DISPLAY_COLORS: dict[str, tuple[int, int, int]] = {
     '白色': (255, 255, 255),
     '紅色': (60, 80, 255),
@@ -113,6 +118,7 @@ SELECTION_COMBINE_LABELS = {
     'subtract': '減去',
     'local_intersect': '局部交集',
     'transfer_from_other': '從其他轉入',
+    'ctd_detect_selection': '添加CTD檢測選區',
 }
 EDIT_MODE_COLORS = {
     'mask': (255, 255, 255),
@@ -441,6 +447,7 @@ class MaskEditorView(ImageView):
         self.selection_combine_mode = 'add'
         self.brush_radius = DEFAULT_BRUSH_RADIUS
         self.magic_tolerance = DEFAULT_MAGIC_TOLERANCE
+        self.local_intersect_offset_px = DEFAULT_LOCAL_INTERSECT_OFFSET_PX
         self.mask: np.ndarray | None = None
         self.source_bgr: np.ndarray | None = None
         self.image_shape: tuple[int, int] | None = None
@@ -458,6 +465,7 @@ class MaskEditorView(ImageView):
         self._rect_pen_add = QPen(QColor('#e9fffb'), 2, Qt.PenStyle.DashLine)
         self._rect_pen_remove = QPen(QColor('#ff8f8f'), 2, Qt.PenStyle.DashLine)
         self._rect_pen_intersect = QPen(QColor('#ffd86f'), 2, Qt.PenStyle.DashLine)
+        self._rect_pen_detect = QPen(QColor('#70bdff'), 2, Qt.PenStyle.DashLine)
         self._brush_pen = QPen(QColor('#e9fffb'), 2)
         self._brush_line_pen_add = QPen(QColor('#e9fffb'), 2, Qt.PenStyle.DashLine)
         self._brush_line_pen_remove = QPen(QColor('#ff8f8f'), 2, Qt.PenStyle.DashLine)
@@ -508,6 +516,12 @@ class MaskEditorView(ImageView):
 
     def set_magic_tolerance(self, tolerance: int) -> None:
         self.magic_tolerance = max(MIN_MAGIC_TOLERANCE, min(MAX_MAGIC_TOLERANCE, int(tolerance)))
+
+    def set_local_intersect_offset(self, offset_px: int) -> None:
+        self.local_intersect_offset_px = max(
+            MIN_LOCAL_INTERSECT_OFFSET_PX,
+            min(MAX_LOCAL_INTERSECT_OFFSET_PX, int(offset_px)),
+        )
 
     def image_point_from_view(self, pos: QPoint, clamp: bool = False) -> tuple[int, int] | None:
         if self.image_shape is None:
@@ -742,7 +756,7 @@ class MaskEditorView(ImageView):
     def _should_emit_selection(self, button: Qt.MouseButton) -> bool:
         return (
             button == Qt.MouseButton.LeftButton
-            and self.selection_combine_mode == 'transfer_from_other'
+            and self.selection_combine_mode in ('transfer_from_other', 'ctd_detect_selection')
         )
 
     def _apply_local_intersection(self, selection: np.ndarray) -> None:
@@ -758,9 +772,26 @@ class MaskEditorView(ImageView):
         if hit_labels.size == 0:
             return
         touched_components = np.isin(labels, hit_labels)
+        local_result = touched_components & selection
+        local_result = self._offset_local_intersection(local_result)
         next_mask = current.copy()
-        next_mask[touched_components] = selection[touched_components]
+        next_mask[touched_components] = False
+        next_mask |= local_result
         self.mask[:, :] = np.where(next_mask, 255, 0).astype(np.uint8)
+
+    def _offset_local_intersection(self, local_result: np.ndarray) -> np.ndarray:
+        offset_px = int(self.local_intersect_offset_px)
+        if offset_px == 0 or not np.any(local_result):
+            return local_result
+        kernel_size = abs(offset_px) * 2 + 1
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (kernel_size, kernel_size),
+        )
+        src = local_result.astype(np.uint8)
+        if offset_px > 0:
+            return cv2.dilate(src, kernel, iterations=1) > 0
+        return cv2.erode(src, kernel, iterations=1) > 0
 
     def _update_rubber_band(
         self,
@@ -777,6 +808,8 @@ class MaskEditorView(ImageView):
         operation = self._selection_operation_for_button(button)
         if operation == 'subtract':
             self._rubber_band.setPen(self._rect_pen_remove)
+        elif operation == 'ctd_detect_selection':
+            self._rubber_band.setPen(self._rect_pen_detect)
         elif operation in ('local_intersect', 'transfer_from_other'):
             self._rubber_band.setPen(self._rect_pen_intersect)
         else:
@@ -1029,6 +1062,50 @@ class BackgroundSampleWorker(QObject):
             self.failed.emit(self.request_id, self.img_path, self.mask_hash, str(exc))
 
 
+class CtdSelectionWorker(QObject):
+    finished = Signal(int, str, object, int)
+    failed = Signal(int, str, str)
+
+    def __init__(self, request_id: int, img_path: str, image: np.ndarray, selection: np.ndarray) -> None:
+        super().__init__()
+        self.request_id = request_id
+        self.img_path = img_path
+        self.image = image.copy()
+        self.selection = np.asarray(selection, dtype=bool).copy()
+
+    def run(self) -> None:
+        try:
+            if self.image.shape[:2] != self.selection.shape[:2]:
+                raise ValueError('選區尺寸和當前圖片不一致。')
+            if not np.any(self.selection):
+                raise ValueError('選區是空的。')
+
+            ys, xs = np.where(self.selection)
+            height, width = self.selection.shape[:2]
+            x1 = max(0, int(xs.min()) - CTD_SELECTION_PADDING_PX)
+            x2 = min(width - 1, int(xs.max()) + CTD_SELECTION_PADDING_PX)
+            y1 = max(0, int(ys.min()) - CTD_SELECTION_PADDING_PX)
+            y2 = min(height - 1, int(ys.max()) + CTD_SELECTION_PADDING_PX)
+
+            crop = self.image[y1:y2 + 1, x1:x2 + 1]
+            detect_img = crop[:, :, :3] if len(crop.shape) == 3 else cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR)
+            detector = create_detector()
+            _, mask_refined, _ = detector(
+                detect_img,
+                refine_mode=REFINEMASK_ANNOTATION,
+                keep_undetected_mask=True,
+            )
+            detected_crop = np.where(mask_refined > 0, 255, 0).astype(np.uint8)
+
+            detected = np.zeros(self.selection.shape[:2], dtype=np.uint8)
+            crop_selection = self.selection[y1:y2 + 1, x1:x2 + 1]
+            detected_roi = detected[y1:y2 + 1, x1:x2 + 1]
+            detected_roi[crop_selection & (detected_crop > 0)] = 255
+            self.finished.emit(self.request_id, self.img_path, detected, int(np.count_nonzero(detected)))
+        except Exception as exc:
+            self.failed.emit(self.request_id, self.img_path, str(exc))
+
+
 class PdfWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
@@ -1050,7 +1127,7 @@ class PdfWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle('Solid Inpaint')
+        self.setWindowTitle('塗白')
         if APP_ICON_PATH.is_file():
             self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
         self.resize(1500, 900)
@@ -1084,6 +1161,10 @@ class MainWindow(QMainWindow):
         self.background_sample_request_id = 0
         self.pending_background_img_path = ''
         self.pending_background_mask: np.ndarray | None = None
+        self.ctd_selection_worker_thread: QThread | None = None
+        self.ctd_selection_worker: CtdSelectionWorker | None = None
+        self.ctd_selection_request_id = 0
+        self.ctd_selection_edit_mode = ''
         self.pdf_worker_thread: QThread | None = None
         self.pdf_worker: PdfWorker | None = None
         self.pending_render_img_path = ''
@@ -1274,7 +1355,7 @@ class MainWindow(QMainWindow):
         self.edit_manual_other_btn = QPushButton('F3 需要修改')
         self.edit_manual_other_btn.setCheckable(True)
         self.edit_manual_other_btn.clicked.connect(lambda: self.set_edit_mode('manual_other'))
-        self.convert_masks_btn = QPushButton('轉換')
+        self.convert_masks_btn = QPushButton('批處理')
         self.convert_masks_btn.setToolTip('將全部選區轉為指定類型；此操作不能回撤')
         self.convert_masks_btn.clicked.connect(self.show_convert_masks_dialog)
         mode_toolbar.addWidget(self.edit_mask_btn)
@@ -1306,16 +1387,21 @@ class MainWindow(QMainWindow):
         self.selection_transfer_btn = QPushButton('F12 從其他轉入')
         self.selection_transfer_btn.setCheckable(True)
         self.selection_transfer_btn.setToolTip('把本次選區內其他 mask 的重疊部分移到目前 mask，並從原 mask 移除')
+        self.selection_ctd_btn = QPushButton('添加CTD檢測選區')
+        self.selection_ctd_btn.setCheckable(True)
+        self.selection_ctd_btn.setToolTip('只對本次矩形選區跑 CTD，並把檢測結果添加到目前 mask')
         self.selection_combine_group = QButtonGroup(self)
         self.selection_combine_group.setExclusive(True)
         self.selection_combine_group.addButton(self.selection_add_btn)
         self.selection_combine_group.addButton(self.selection_subtract_btn)
         self.selection_combine_group.addButton(self.selection_intersect_btn)
         self.selection_combine_group.addButton(self.selection_transfer_btn)
+        self.selection_combine_group.addButton(self.selection_ctd_btn)
         self.selection_add_btn.clicked.connect(lambda: self.set_selection_combine_mode('add'))
         self.selection_subtract_btn.clicked.connect(lambda: self.set_selection_combine_mode('subtract'))
         self.selection_intersect_btn.clicked.connect(lambda: self.set_selection_combine_mode('local_intersect'))
         self.selection_transfer_btn.clicked.connect(lambda: self.set_selection_combine_mode('transfer_from_other'))
+        self.selection_ctd_btn.clicked.connect(lambda: self.set_selection_combine_mode('ctd_detect_selection'))
         self.undo_btn = QPushButton('撤銷')
         self.undo_btn.clicked.connect(self.undo_mask)
         self.redo_btn = QPushButton('重做')
@@ -1331,6 +1417,21 @@ class MainWindow(QMainWindow):
         self.magic_tolerance_slider.setValue(DEFAULT_MAGIC_TOLERANCE)
         self.magic_tolerance_slider.setFixedWidth(130)
         self.magic_tolerance_slider.valueChanged.connect(self.on_magic_tolerance_changed)
+        self.local_intersect_controls = QWidget()
+        local_intersect_layout = QHBoxLayout(self.local_intersect_controls)
+        local_intersect_layout.setContentsMargins(0, 0, 0, 0)
+        local_intersect_layout.setSpacing(8)
+        local_intersect_layout.addWidget(QLabel('交集偏移'))
+        self.local_intersect_offset_spinbox = QSpinBox()
+        self.local_intersect_offset_spinbox.setRange(
+            MIN_LOCAL_INTERSECT_OFFSET_PX,
+            MAX_LOCAL_INTERSECT_OFFSET_PX,
+        )
+        self.local_intersect_offset_spinbox.setValue(DEFAULT_LOCAL_INTERSECT_OFFSET_PX)
+        self.local_intersect_offset_spinbox.setSuffix(' px')
+        self.local_intersect_offset_spinbox.setToolTip('局部交集結果的擴展/收縮；正數擴展，負數收縮')
+        self.local_intersect_offset_spinbox.valueChanged.connect(self.on_local_intersect_offset_changed)
+        local_intersect_layout.addWidget(self.local_intersect_offset_spinbox)
         edit_toolbar.addWidget(self.rect_btn)
         edit_toolbar.addWidget(self.brush_btn)
         edit_toolbar.addWidget(self.magic_btn)
@@ -1343,7 +1444,10 @@ class MainWindow(QMainWindow):
         selection_combine_layout.addWidget(self.selection_subtract_btn)
         selection_combine_layout.addWidget(self.selection_intersect_btn)
         selection_combine_layout.addWidget(self.selection_transfer_btn)
+        selection_combine_layout.addWidget(self.selection_ctd_btn)
         edit_toolbar.addWidget(self.selection_combine_controls)
+        edit_toolbar.addSpacing(10)
+        edit_toolbar.addWidget(self.local_intersect_controls)
         edit_toolbar.addSpacing(10)
         self.brush_controls = QWidget()
         brush_controls_layout = QHBoxLayout(self.brush_controls)
@@ -1443,6 +1547,7 @@ class MainWindow(QMainWindow):
             self.selection_subtract_btn,
             self.selection_intersect_btn,
             self.selection_transfer_btn,
+            self.selection_ctd_btn,
             self.undo_btn,
             self.redo_btn,
             self.brush_down_btn,
@@ -2199,6 +2304,7 @@ class MainWindow(QMainWindow):
         self.selection_combine_controls.setVisible(tool in ('rect', 'magic'))
         self.brush_controls.setVisible(tool == 'brush')
         self.magic_controls.setVisible(tool == 'magic')
+        self.update_local_intersect_controls_visibility()
         self.update_selection_combine_status()
 
     def set_selection_combine_mode(self, mode: str) -> None:
@@ -2210,7 +2316,18 @@ class MainWindow(QMainWindow):
         self.selection_subtract_btn.setChecked(mode == 'subtract')
         self.selection_intersect_btn.setChecked(mode == 'local_intersect')
         self.selection_transfer_btn.setChecked(mode == 'transfer_from_other')
+        self.selection_ctd_btn.setChecked(mode == 'ctd_detect_selection')
+        self.update_local_intersect_controls_visibility()
         self.update_selection_combine_status()
+
+    def update_local_intersect_controls_visibility(self) -> None:
+        if getattr(self, 'local_intersect_controls', None) is None:
+            return
+        visible = (
+            self.mask_view.tool in ('rect', 'magic')
+            and self.selection_combine_mode == 'local_intersect'
+        )
+        self.local_intersect_controls.setVisible(visible)
 
     def update_selection_combine_status(self) -> None:
         if getattr(self, 'mask_view', None) is None or self.mask_view.tool == 'brush':
@@ -2225,6 +2342,9 @@ class MainWindow(QMainWindow):
     def on_magic_tolerance_changed(self, value: int) -> None:
         self.mask_view.set_magic_tolerance(value)
         self.magic_tolerance_label.setText(f'容差 {value}')
+
+    def on_local_intersect_offset_changed(self, value: int) -> None:
+        self.mask_view.set_local_intersect_offset(value)
 
     def fit_both_views(self) -> None:
         self.mask_view.fit()
@@ -2310,9 +2430,12 @@ class MainWindow(QMainWindow):
         self.update_edit_buttons()
 
     def on_selection_created(self, selection: object) -> None:
+        selection_mask = np.asarray(selection, dtype=bool)
+        if self.selection_combine_mode == 'ctd_detect_selection':
+            self.start_ctd_selection_detection(selection_mask)
+            return
         if self.selection_combine_mode != 'transfer_from_other':
             return
-        selection_mask = np.asarray(selection, dtype=bool)
         if self.transfer_selection_from_other_masks(selection_mask):
             self.queue_background_sample()
             self.save_all_edit_masks()
@@ -2324,6 +2447,74 @@ class MainWindow(QMainWindow):
             self.status.showMessage('已從其他 mask 轉入選區重疊部分。')
         else:
             self.status.showMessage('選區沒有碰到其他 mask。')
+
+    def start_ctd_selection_detection(self, selection: np.ndarray) -> None:
+        if self.current_base is None or not self.current_img_path or self.current_edit_mask() is None:
+            self.status.showMessage('沒有可檢測的當前圖片。')
+            return
+        if self.ctd_selection_worker_thread is not None:
+            QMessageBox.information(self, '正在檢測', 'CTD 正在檢測上一個選區。')
+            return
+        if self.worker_thread is not None:
+            QMessageBox.information(self, '正在執行', '已有批量任務在執行中。')
+            return
+        self.ctd_selection_request_id += 1
+        request_id = self.ctd_selection_request_id
+        img_path = self.current_img_path
+        self.ctd_selection_edit_mode = self.edit_mode
+        self.status.showMessage('CTD 正在檢測選區...')
+        self.ctd_selection_worker_thread = QThread()
+        self.ctd_selection_worker = CtdSelectionWorker(request_id, img_path, self.current_base, selection)
+        self.ctd_selection_worker.moveToThread(self.ctd_selection_worker_thread)
+        self.ctd_selection_worker_thread.started.connect(self.ctd_selection_worker.run)
+        self.ctd_selection_worker.finished.connect(self.on_ctd_selection_finished)
+        self.ctd_selection_worker.failed.connect(self.on_ctd_selection_failed)
+        self.ctd_selection_worker.finished.connect(self.ctd_selection_worker_thread.quit)
+        self.ctd_selection_worker.failed.connect(self.ctd_selection_worker_thread.quit)
+        self.ctd_selection_worker_thread.finished.connect(self.cleanup_ctd_selection_worker)
+        self.ctd_selection_worker_thread.start()
+
+    def on_ctd_selection_finished(self, request_id: int, img_path: str, detected: object, detected_pixels: int) -> None:
+        if request_id != self.ctd_selection_request_id or img_path != self.current_img_path:
+            return
+        if self.edit_mode != self.ctd_selection_edit_mode:
+            self.status.showMessage('已切換編輯類型，CTD 選區結果已忽略。')
+            return
+        current = self.current_edit_mask()
+        if current is None:
+            return
+        detected_mask = np.asarray(detected, dtype=np.uint8)
+        if detected_mask.shape[:2] != current.shape[:2]:
+            self.status.showMessage('CTD 選區結果尺寸不一致。')
+            return
+        detected_bool = detected_mask > 0
+        if detected_pixels <= 0 or not np.any(detected_bool):
+            self.status.showMessage('CTD 選區內沒有檢測到文字。')
+            return
+        add_pixels = detected_bool & (current == 0)
+        if not np.any(add_pixels):
+            self.status.showMessage('CTD 檢測結果已在目前 mask 中。')
+            return
+        self.push_undo_snapshot()
+        current[detected_bool] = 255
+        self.set_current_edit_mask(current)
+        if self.edit_mode == 'mask':
+            self.queue_background_sample()
+        self.save_current_edit_mask()
+        if self.current_base is not None:
+            self.mask_view.set_mask(self.current_edit_mask(), self.current_base.shape[:2])
+        self.refresh_mask_preview(keep_view=True)
+        self.queue_auto_render()
+        self.update_edit_buttons()
+        self.status.showMessage(f'CTD 已添加選區檢測結果：{int(np.count_nonzero(add_pixels))} px。')
+
+    def on_ctd_selection_failed(self, request_id: int, img_path: str, message: str) -> None:
+        if request_id == self.ctd_selection_request_id and img_path == self.current_img_path:
+            self.status.showMessage(f'CTD 選區檢測失敗：{message}')
+
+    def cleanup_ctd_selection_worker(self) -> None:
+        self.ctd_selection_worker = None
+        self.ctd_selection_worker_thread = None
 
     def transfer_selection_from_other_masks(self, selection: np.ndarray) -> bool:
         current = self.mask_for_mode(self.edit_mode)
@@ -2629,17 +2820,19 @@ class MainWindow(QMainWindow):
     def show_help(self) -> None:
         QMessageBox.information(
             self,
-            'Solid Inpaint 說明',
-            f'Solid Inpaint UI\n'
+            '塗白 說明',
+            f'塗白 UI\n'
             f'版本：{APP_VERSION}\n\n'
             '滑鼠操作：\n'
             '筆刷左鍵：添加 mask\n'
             '筆刷右鍵：去掉 mask\n'
             '筆刷 Shift + 按下拖到鬆開：連接按下和鬆開位置\n'
-            '矩形 / 魔法棒左鍵：按「添加 / 減去 / 局部交集 / 從其他轉入」處理目前 mask\n'
+            '矩形 / 魔法棒左鍵：按「添加 / 減去 / 局部交集 / 從其他轉入 / 添加CTD檢測選區」處理目前 mask\n'
             '矩形 / 魔法棒右鍵：固定減去 mask\n'
             '局部交集：只裁切本次選區碰到的既有 mask 區塊\n'
+            '交集偏移：局部交集結果正數擴展，負數收縮，0 保持原大小\n'
             '從其他轉入：把選區內其他 mask 的重疊部分移到目前 mask\n'
+            '添加CTD檢測選區：只對本次選區跑 CTD，將檢測結果添加到目前 mask\n'
             '魔法棒：點擊相近的連續區域\n'
             'Command/Ctrl + 左鍵拖拽：平移畫布\n'
             '觸摸板雙指：移動畫布\n'
@@ -2695,7 +2888,7 @@ class MainWindow(QMainWindow):
 
 def main() -> None:
     app = QApplication(sys.argv)
-    app.setApplicationName('Solid Inpaint')
+    app.setApplicationName('塗白')
     app.setOrganizationName('ComicTextDetector')
     if APP_ICON_PATH.is_file():
         app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
