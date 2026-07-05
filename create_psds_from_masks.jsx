@@ -11,7 +11,7 @@ Inputs selected in one dialog:
 - Photoshop action set/action
 
 Output:
-<image folder>/<output folder name>/<name>.psd
+<image folder>/ctd_inpainted/<output folder name>/<name>.psd
 
 Each PSD contains:
 - bg
@@ -34,7 +34,8 @@ The selected Photoshop action is executed only when the source mask has content.
 
         var imageFolder = new Folder(settings.imageFolder);
         var maskFolder = new Folder(settings.maskFolder);
-        var psdFolder = new Folder(imageFolder.fsName + "/" + settings.outputFolderName);
+        var outputRoot = new Folder(imageFolder.fsName + "/ctd_inpainted");
+        var psdFolder = new Folder(outputRoot.fsName + "/" + settings.outputFolderName);
 
         if (!imageFolder.exists) {
             alert("原图文件夹不存在：\n" + imageFolder.fsName);
@@ -43,6 +44,9 @@ The selected Photoshop action is executed only when the source mask has content.
         if (!maskFolder.exists) {
             alert("mask 图文件夹不存在：\n" + maskFolder.fsName);
             return;
+        }
+        if (!outputRoot.exists) {
+            outputRoot.create();
         }
         if (!psdFolder.exists) {
             psdFolder.create();
@@ -102,6 +106,7 @@ The selected Photoshop action is executed only when the source mask has content.
                 var saveOptions = new PhotoshopSaveOptions();
                 saveOptions.alphaChannels = true;
                 saveOptions.layers = true;
+                saveOptions.maximizeCompatibility = true;
                 doc.saveAs(psdFile, saveOptions, true, Extension.LOWERCASE);
                 made++;
             } catch (err) {

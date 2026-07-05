@@ -120,6 +120,7 @@ Each PSD contains:
                 var saveOptions = new PhotoshopSaveOptions();
                 saveOptions.alphaChannels = true;
                 saveOptions.layers = true;
+                saveOptions.maximizeCompatibility = true;
                 doc.saveAs(psdFile, saveOptions, true, Extension.LOWERCASE);
                 made++;
             } catch (err) {
