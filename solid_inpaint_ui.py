@@ -118,6 +118,7 @@ SELECTION_COMBINE_LABELS = {
     'add': '添加',
     'subtract': '減去',
     'local_intersect': '局部交集',
+    'selection_inner': '選區內部',
     'transfer_from_other': '從其他轉入',
     'ctd_detect_selection': '添加CTD檢測選區',
 }
@@ -822,8 +823,12 @@ class MaskEditorView(ImageView):
     def _paint_brush(self, point: tuple[int, int], button: Qt.MouseButton) -> None:
         if self.mask is None:
             return
-        color = 255 if button == Qt.MouseButton.LeftButton else 0
+        color = self._brush_color_for_button(button)
         cv2.circle(self.mask, point, self.brush_radius, color, thickness=-1, lineType=cv2.LINE_8)
+
+    def _brush_color_for_button(self, button: Qt.MouseButton) -> int:
+        operation = self._selection_operation_for_button(button)
+        return 0 if operation == 'subtract' else 255
 
     def _paint_line(
         self,
@@ -833,7 +838,7 @@ class MaskEditorView(ImageView):
     ) -> None:
         if self.mask is None:
             return
-        color = 255 if button == Qt.MouseButton.LeftButton else 0
+        color = self._brush_color_for_button(button)
         cv2.line(self.mask, start, end, color, thickness=self.brush_radius * 2, lineType=cv2.LINE_8)
         cv2.circle(self.mask, end, self.brush_radius, color, thickness=-1, lineType=cv2.LINE_8)
 
@@ -920,6 +925,9 @@ class MaskEditorView(ImageView):
             return
         if operation == 'local_intersect':
             self._apply_local_intersection(selection)
+            return
+        if operation == 'selection_inner' and self.tool == 'magic':
+            self._apply_selection_inner(selection)
 
     def _selection_operation_for_button(self, button: Qt.MouseButton) -> str:
         if button == Qt.MouseButton.RightButton:
@@ -951,6 +959,31 @@ class MaskEditorView(ImageView):
         next_mask[touched_components] = False
         next_mask |= local_result
         self.mask[:, :] = np.where(next_mask, 255, 0).astype(np.uint8)
+
+    def _apply_selection_inner(self, selection: np.ndarray) -> None:
+        if self.mask is None:
+            return
+        holes = self._selection_holes(selection)
+        if np.any(holes):
+            self.mask[holes] = 255
+
+    def _selection_holes(self, selection: np.ndarray) -> np.ndarray:
+        selection = np.asarray(selection, dtype=bool)
+        if not np.any(selection):
+            return np.zeros(selection.shape, dtype=bool)
+        inverse = ~selection
+        if not np.any(inverse):
+            return np.zeros(selection.shape, dtype=bool)
+        _, labels = cv2.connectedComponents(inverse.astype(np.uint8), connectivity=8)
+        border_labels = np.unique(
+            np.concatenate((
+                labels[0, :],
+                labels[-1, :],
+                labels[:, 0],
+                labels[:, -1],
+            ))
+        )
+        return inverse & ~np.isin(labels, border_labels)
 
     def _offset_local_intersection(self, local_result: np.ndarray) -> np.ndarray:
         offset_px = int(self.local_intersect_offset_px)
@@ -988,7 +1021,7 @@ class MaskEditorView(ImageView):
             self._rubber_band.setPen(self._rect_pen_remove)
         elif operation == 'ctd_detect_selection':
             self._rubber_band.setPen(self._rect_pen_detect)
-        elif operation in ('local_intersect', 'transfer_from_other'):
+        elif operation in ('local_intersect', 'selection_inner', 'transfer_from_other'):
             self._rubber_band.setPen(self._rect_pen_intersect)
         else:
             self._rubber_band.setPen(self._rect_pen_add)
@@ -1009,7 +1042,7 @@ class MaskEditorView(ImageView):
             self._brush_line_preview = QGraphicsLineItem()
             self._brush_line_preview.setZValue(11)
             self.scene().addItem(self._brush_line_preview)
-        pen = self._brush_line_pen_remove if button == Qt.MouseButton.RightButton else self._brush_line_pen_add
+        pen = self._brush_line_pen_remove if self._brush_color_for_button(button) == 0 else self._brush_line_pen_add
         self._brush_line_preview.setPen(pen)
         self._brush_line_preview.setLine(start[0], start[1], end[0], end[1])
 
@@ -1759,13 +1792,16 @@ class MainWindow(QMainWindow):
         self.selection_add_btn = QPushButton('F9 添加')
         self.selection_add_btn.setCheckable(True)
         self.selection_add_btn.setChecked(True)
-        self.selection_add_btn.setToolTip('矩形和魔法棒左鍵添加到目前 mask')
+        self.selection_add_btn.setToolTip('筆刷、矩形和魔法棒左鍵添加到目前 mask')
         self.selection_subtract_btn = QPushButton('F10 減去')
         self.selection_subtract_btn.setCheckable(True)
-        self.selection_subtract_btn.setToolTip('矩形和魔法棒左鍵從目前 mask 減去；右鍵矩形會清除所有 mask')
+        self.selection_subtract_btn.setToolTip('筆刷、矩形和魔法棒左鍵從目前 mask 減去；右鍵矩形會清除所有 mask')
         self.selection_intersect_btn = QPushButton('F11 局部交集')
         self.selection_intersect_btn.setCheckable(True)
         self.selection_intersect_btn.setToolTip('只裁切本次選區碰到的既有 mask 區塊，不影響其他區塊')
+        self.selection_inner_btn = QPushButton('選區內部')
+        self.selection_inner_btn.setCheckable(True)
+        self.selection_inner_btn.setToolTip('魔法棒專用：提取本次選區包圍住的內部孔洞，例如點氣泡空白後取得文字')
         self.selection_transfer_btn = QPushButton('F12 從其他轉入')
         self.selection_transfer_btn.setCheckable(True)
         self.selection_transfer_btn.setToolTip('把本次選區內其他 mask 的重疊部分移到目前 mask，並從原 mask 移除')
@@ -1777,11 +1813,13 @@ class MainWindow(QMainWindow):
         self.selection_combine_group.addButton(self.selection_add_btn)
         self.selection_combine_group.addButton(self.selection_subtract_btn)
         self.selection_combine_group.addButton(self.selection_intersect_btn)
+        self.selection_combine_group.addButton(self.selection_inner_btn)
         self.selection_combine_group.addButton(self.selection_transfer_btn)
         self.selection_combine_group.addButton(self.selection_ctd_btn)
         self.selection_add_btn.clicked.connect(lambda: self.set_selection_combine_mode('add'))
         self.selection_subtract_btn.clicked.connect(lambda: self.set_selection_combine_mode('subtract'))
         self.selection_intersect_btn.clicked.connect(lambda: self.set_selection_combine_mode('local_intersect'))
+        self.selection_inner_btn.clicked.connect(lambda: self.set_selection_combine_mode('selection_inner'))
         self.selection_transfer_btn.clicked.connect(lambda: self.set_selection_combine_mode('transfer_from_other'))
         self.selection_ctd_btn.clicked.connect(lambda: self.set_selection_combine_mode('ctd_detect_selection'))
         self.undo_btn = QPushButton('撤銷')
@@ -1825,6 +1863,7 @@ class MainWindow(QMainWindow):
         selection_combine_layout.addWidget(self.selection_add_btn)
         selection_combine_layout.addWidget(self.selection_subtract_btn)
         selection_combine_layout.addWidget(self.selection_intersect_btn)
+        selection_combine_layout.addWidget(self.selection_inner_btn)
         selection_combine_layout.addWidget(self.selection_transfer_btn)
         selection_combine_layout.addWidget(self.selection_ctd_btn)
         edit_toolbar.addWidget(self.selection_combine_controls)
@@ -1947,6 +1986,7 @@ class MainWindow(QMainWindow):
             self.selection_add_btn,
             self.selection_subtract_btn,
             self.selection_intersect_btn,
+            self.selection_inner_btn,
             self.selection_transfer_btn,
             self.selection_ctd_btn,
             self.undo_btn,
@@ -2762,26 +2802,55 @@ class MainWindow(QMainWindow):
         self.brush_btn.setChecked(tool == 'brush')
         self.rect_btn.setChecked(tool == 'rect')
         self.magic_btn.setChecked(tool == 'magic')
-        if reset_selection and self.selection_combine_mode != 'add':
+        if (
+            (reset_selection and self.selection_combine_mode != 'add')
+            or not self.selection_mode_allowed_for_tool(self.selection_combine_mode, tool)
+        ):
             self.set_selection_combine_mode('add')
-        self.selection_combine_controls.setVisible(tool in ('rect', 'magic'))
+        self.selection_combine_controls.setVisible(tool in ('rect', 'magic', 'brush'))
         self.brush_controls.setVisible(tool == 'brush')
         self.magic_controls.setVisible(tool == 'magic')
+        self.update_selection_combine_controls_visibility()
         self.update_local_intersect_controls_visibility()
         self.update_selection_combine_status()
 
     def set_selection_combine_mode(self, mode: str) -> None:
         if mode not in SELECTION_COMBINE_LABELS:
             return
+        if not self.selection_mode_allowed_for_tool(mode, self.mask_view.tool):
+            return
         self.selection_combine_mode = mode
         self.mask_view.set_selection_combine_mode(mode)
         self.selection_add_btn.setChecked(mode == 'add')
         self.selection_subtract_btn.setChecked(mode == 'subtract')
         self.selection_intersect_btn.setChecked(mode == 'local_intersect')
+        self.selection_inner_btn.setChecked(mode == 'selection_inner')
         self.selection_transfer_btn.setChecked(mode == 'transfer_from_other')
         self.selection_ctd_btn.setChecked(mode == 'ctd_detect_selection')
+        self.update_selection_combine_controls_visibility()
         self.update_local_intersect_controls_visibility()
         self.update_selection_combine_status()
+
+    def selection_mode_allowed_for_tool(self, mode: str, tool: str) -> bool:
+        if tool == 'brush':
+            return mode in ('add', 'subtract')
+        if tool == 'rect':
+            return mode != 'selection_inner'
+        if tool == 'magic':
+            return mode in SELECTION_COMBINE_LABELS
+        return False
+
+    def update_selection_combine_controls_visibility(self) -> None:
+        if getattr(self, 'selection_inner_btn', None) is None:
+            return
+        tool = self.mask_view.tool
+        rect_or_magic = tool in ('rect', 'magic')
+        self.selection_add_btn.setVisible(tool in ('rect', 'magic', 'brush'))
+        self.selection_subtract_btn.setVisible(tool in ('rect', 'magic', 'brush'))
+        self.selection_intersect_btn.setVisible(rect_or_magic)
+        self.selection_inner_btn.setVisible(tool == 'magic')
+        self.selection_transfer_btn.setVisible(rect_or_magic)
+        self.selection_ctd_btn.setVisible(rect_or_magic)
 
     def update_local_intersect_controls_visibility(self) -> None:
         if getattr(self, 'local_intersect_controls', None) is None:
@@ -2796,7 +2865,8 @@ class MainWindow(QMainWindow):
         if getattr(self, 'mask_view', None) is None:
             return
         if self.mask_view.tool == 'brush':
-            self.status.showMessage('筆刷左鍵添加；右鍵拖矩形清除所有 mask')
+            label = SELECTION_COMBINE_LABELS.get(self.selection_combine_mode, '添加')
+            self.status.showMessage(f'筆刷模式：{label}；右鍵拖矩形清除所有 mask')
             return
         label = SELECTION_COMBINE_LABELS.get(self.selection_combine_mode, '添加')
         self.status.showMessage(f'選區模式：{label}；右鍵拖矩形清除所有 mask')
@@ -3343,12 +3413,13 @@ class MainWindow(QMainWindow):
             f'塗白 UI\n'
             f'版本：{APP_VERSION}\n\n'
             '滑鼠操作：\n'
-            '筆刷左鍵：添加 mask\n'
+            '筆刷左鍵：按「添加 / 減去」處理目前 mask\n'
             '右鍵拖拽：不分工具，矩形清除自動 / 強制純色 / 需要修改 mask\n'
             '筆刷 Shift + 按下拖到鬆開：連接按下和鬆開位置\n'
-            '矩形 / 魔法棒左鍵：按「添加 / 減去 / 局部交集 / 從其他轉入 / 添加CTD檢測選區」處理目前 mask\n'
+            '矩形 / 魔法棒左鍵：按「添加 / 減去 / 局部交集 / 選區內部 / 從其他轉入 / 添加CTD檢測選區」處理目前 mask\n'
             '局部交集：只裁切本次選區碰到的既有 mask 區塊\n'
             '交集偏移：局部交集結果正數擴展，負數收縮，0 保持原大小\n'
+            '選區內部：魔法棒專用，提取本次選區包圍住的內部孔洞\n'
             '從其他轉入：把選區內其他 mask 的重疊部分移到目前 mask\n'
             '添加CTD檢測選區：只對本次選區跑 CTD，將檢測結果添加到目前 mask\n'
             '魔法棒：點擊相近的連續區域\n'
