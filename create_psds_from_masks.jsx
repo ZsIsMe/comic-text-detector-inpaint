@@ -15,7 +15,7 @@ Output:
 
 Each PSD contains:
 - bg
-- alpha channel: OTHER_CHANNEL
+- alpha channel: OTHER_CHANNEL, or hidden layer OTHER_CHANNEL when enabled
 
 The selected Photoshop action is executed only when the source mask has content.
 */
@@ -102,9 +102,12 @@ The selected Photoshop action is executed only when the source mask has content.
                 }
 
                 app.activeDocument = doc;
+                if (settings.convertOtherChannelToLayer) {
+                    convertAlphaChannelToHiddenLayer(doc, "OTHER_CHANNEL", "OTHER_CHANNEL");
+                }
                 setRGBChannels(doc);
                 var saveOptions = new PhotoshopSaveOptions();
-                saveOptions.alphaChannels = true;
+                saveOptions.alphaChannels = !settings.convertOtherChannelToLayer;
                 saveOptions.layers = true;
                 saveOptions.maximizeCompatibility = true;
                 doc.saveAs(psdFile, saveOptions, true, Extension.LOWERCASE);
@@ -195,6 +198,12 @@ The selected Photoshop action is executed only when the source mask has content.
         var restartCheckbox = restartGroup.add("checkbox", undefined, "重新开始（覆盖已有 PSD）");
         restartCheckbox.value = false;
 
+        var convertChannelGroup = dialog.add("group");
+        convertChannelGroup.orientation = "row";
+        convertChannelGroup.alignChildren = ["left", "center"];
+        var convertOtherChannelCheckbox = convertChannelGroup.add("checkbox", undefined, "OTHER_CHANNEL 通道改为图层（动作后）");
+        convertOtherChannelCheckbox.value = false;
+
         var actionSetGroup = dialog.add("group");
         actionSetGroup.orientation = "row";
         actionSetGroup.alignChildren = ["left", "center"];
@@ -272,6 +281,7 @@ The selected Photoshop action is executed only when the source mask has content.
             maskFolder: trimString(maskPathInput.text),
             outputFolderName: trimString(outputNameInput.text),
             restart: restartCheckbox.value,
+            convertOtherChannelToLayer: convertOtherChannelCheckbox.value,
             actionSetName: selectedSet ? selectedSet.name : "",
             actionName: selectedAction ? selectedAction.name : ""
         };
@@ -333,6 +343,45 @@ The selected Photoshop action is executed only when the source mask has content.
         alpha.name = channelName;
         setRGBChannels(targetDoc);
         return hasContent;
+    }
+
+    function convertAlphaChannelToHiddenLayer(doc, channelName, layerName) {
+        app.activeDocument = doc;
+        var channel = getChannelByName(doc, channelName);
+        if (!channel) return false;
+
+        if (isChannelAllBlack(channel)) {
+            channel.remove();
+            setRGBChannels(doc);
+            return false;
+        }
+
+        setRGBChannels(doc);
+        var layer = doc.artLayers.add();
+        layer.name = layerName;
+        doc.activeLayer = layer;
+
+        doc.selection.deselect();
+        doc.selection.load(channel, SelectionType.REPLACE);
+
+        var white = new SolidColor();
+        white.rgb.red = 255;
+        white.rgb.green = 255;
+        white.rgb.blue = 255;
+        doc.selection.fill(white, ColorBlendMode.NORMAL, 100, false);
+        doc.selection.deselect();
+
+        layer.visible = false;
+        channel.remove();
+        setRGBChannels(doc);
+        return true;
+    }
+
+    function getChannelByName(doc, channelName) {
+        for (var i = 0; i < doc.channels.length; i++) {
+            if (doc.channels[i].name === channelName) return doc.channels[i];
+        }
+        return null;
     }
 
     function isChannelAllBlack(channel) {
@@ -406,6 +455,7 @@ The selected Photoshop action is executed only when the source mask has content.
         reportFile.writeln("Action set: " + settings.actionSetName);
         reportFile.writeln("Action: " + settings.actionName);
         reportFile.writeln("Restart: " + (settings.restart ? "yes" : "no"));
+        reportFile.writeln("Convert OTHER_CHANNEL to hidden layer after action: " + (settings.convertOtherChannelToLayer ? "yes" : "no"));
         reportFile.writeln("Action executed: " + actionRun.length);
         reportFile.writeln("Action skipped empty mask: " + actionSkipped.length);
         reportFile.writeln("Action failed: " + actionErrors.length);

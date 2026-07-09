@@ -5,7 +5,6 @@ Run in Photoshop:
 File > Scripts > Browse... > create_psds_from_outputs.jsx
 
 Expected input layout:
-<image folder>/ctd_inpainted/mask/<name>.png
 <image folder>/ctd_inpainted/other_mask/<name>.png
 <image folder>/ctd_inpainted/inpainted/<name>.png
 
@@ -15,8 +14,7 @@ Output:
 Each PSD contains:
 - bg
 - overlay-manual
-- TEXT_CHANNEL
-- OTHER_CHANNEL
+- OTHER_CHANNEL, or hidden layer OTHER_CHANNEL when enabled
 */
 
 #target photoshop
@@ -33,17 +31,12 @@ Each PSD contains:
 
         var imageFolder = new Folder(settings.imageFolder);
         var outputRoot = new Folder(settings.outputRoot);
-        var maskFolder = new Folder(outputRoot.fsName + "/mask");
         var otherMaskFolder = new Folder(outputRoot.fsName + "/other_mask");
         var overlayFolder = new Folder(outputRoot.fsName + "/inpainted");
         var psdFolder = new Folder(outputRoot.fsName + "/psd");
 
         if (!imageFolder.exists) {
             alert("原图文件夹不存在：\n" + imageFolder.fsName);
-            return;
-        }
-        if (!maskFolder.exists) {
-            alert("mask 文件夹不存在：\n" + maskFolder.fsName);
             return;
         }
         if (!otherMaskFolder.exists) {
@@ -81,14 +74,9 @@ Each PSD contains:
                 continue;
             }
 
-            var maskFile = findMaskFile(maskFolder, stem);
             var otherMaskFile = findMaskFile(otherMaskFolder, stem);
             var overlayFile = findMaskFile(overlayFolder, stem);
 
-            if (!maskFile) {
-                skipped.push(imageFile.name + "：缺少 mask");
-                continue;
-            }
             if (!otherMaskFile) {
                 skipped.push(imageFile.name + "：缺少 other_mask");
                 continue;
@@ -102,7 +90,6 @@ Each PSD contains:
             try {
                 doc = createDocument(imageFile);
                 importOverlayLayer(doc, overlayFile, "overlay-manual");
-                importMaskAsAlpha(doc, maskFile, "TEXT_CHANNEL");
                 importMaskAsAlpha(doc, otherMaskFile, "OTHER_CHANNEL", true);
 
                 if (settings.runAction && hasChannel(doc, "OTHER_CHANNEL")) {
@@ -116,9 +103,12 @@ Each PSD contains:
                 }
 
                 app.activeDocument = doc;
+                if (settings.convertOtherChannelToLayer) {
+                    convertAlphaChannelToHiddenLayer(doc, "OTHER_CHANNEL", "OTHER_CHANNEL");
+                }
                 setRGBChannels(doc);
                 var saveOptions = new PhotoshopSaveOptions();
-                saveOptions.alphaChannels = true;
+                saveOptions.alphaChannels = !settings.convertOtherChannelToLayer;
                 saveOptions.layers = true;
                 saveOptions.maximizeCompatibility = true;
                 doc.saveAs(psdFile, saveOptions, true, Extension.LOWERCASE);
@@ -207,6 +197,12 @@ Each PSD contains:
         var actionCheckbox = actionEnableGroup.add("checkbox", undefined, "有 OTHER_CHANNEL 时执行动作");
         actionCheckbox.value = false;
 
+        var convertChannelGroup = dialog.add("group");
+        convertChannelGroup.orientation = "row";
+        convertChannelGroup.alignChildren = ["left", "center"];
+        var convertOtherChannelCheckbox = convertChannelGroup.add("checkbox", undefined, "OTHER_CHANNEL 通道改为图层（动作后）");
+        convertOtherChannelCheckbox.value = false;
+
         var actionSetGroup = dialog.add("group");
         actionSetGroup.orientation = "row";
         actionSetGroup.alignChildren = ["left", "center"];
@@ -285,6 +281,7 @@ Each PSD contains:
             outputRoot: trimString(outputPathInput.text),
             restart: restartCheckbox.value,
             runAction: actionCheckbox.value,
+            convertOtherChannelToLayer: convertOtherChannelCheckbox.value,
             actionSetName: selectedSet ? selectedSet.name : "",
             actionName: selectedAction ? selectedAction.name : ""
         };
@@ -410,10 +407,46 @@ Each PSD contains:
     }
 
     function hasChannel(doc, channelName) {
-        for (var i = 0; i < doc.channels.length; i++) {
-            if (doc.channels[i].name === channelName) return true;
+        return getChannelByName(doc, channelName) !== null;
+    }
+
+    function convertAlphaChannelToHiddenLayer(doc, channelName, layerName) {
+        app.activeDocument = doc;
+        var channel = getChannelByName(doc, channelName);
+        if (!channel) return false;
+
+        if (isChannelAllBlack(channel)) {
+            channel.remove();
+            setRGBChannels(doc);
+            return false;
         }
-        return false;
+
+        setRGBChannels(doc);
+        var layer = doc.artLayers.add();
+        layer.name = layerName;
+        doc.activeLayer = layer;
+
+        doc.selection.deselect();
+        doc.selection.load(channel, SelectionType.REPLACE);
+
+        var white = new SolidColor();
+        white.rgb.red = 255;
+        white.rgb.green = 255;
+        white.rgb.blue = 255;
+        doc.selection.fill(white, ColorBlendMode.NORMAL, 100, false);
+        doc.selection.deselect();
+
+        layer.visible = false;
+        channel.remove();
+        setRGBChannels(doc);
+        return true;
+    }
+
+    function getChannelByName(doc, channelName) {
+        for (var i = 0; i < doc.channels.length; i++) {
+            if (doc.channels[i].name === channelName) return doc.channels[i];
+        }
+        return null;
     }
 
     function isChannelAllBlack(channel) {
@@ -485,6 +518,7 @@ Each PSD contains:
         reportFile.writeln("Saved PSD files: " + made);
         reportFile.writeln("Restart: " + (settings.restart ? "yes" : "no"));
         reportFile.writeln("Run action: " + (settings.runAction ? "yes" : "no"));
+        reportFile.writeln("Convert OTHER_CHANNEL to hidden layer after action: " + (settings.convertOtherChannelToLayer ? "yes" : "no"));
         if (settings.runAction) {
             reportFile.writeln("Action set: " + settings.actionSetName);
             reportFile.writeln("Action: " + settings.actionName);
