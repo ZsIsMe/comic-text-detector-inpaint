@@ -136,7 +136,9 @@ def refine_undetected_mask(img: np.ndarray, mask_pred: np.ndarray, mask_refined:
     mask_pred[np.where(mask_refined > 30)] = 0
     _, pred_mask_t = cv2.threshold(mask_pred, 30, 255, cv2.THRESH_BINARY)
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(pred_mask_t, 4, cv2.CV_16U)
-    valid_labels = np.where(stats[:, -1] > 50)[0]
+    # Keep small disconnected marks such as ellipsis dots and exclamation
+    # points that may be separated from the main text mask after a line break.
+    valid_labels = np.where(stats[:, -1] > 10)[0]
     seg_blk_list = []
     if len(valid_labels) > 0:
         for lab_index in valid_labels[1:]:

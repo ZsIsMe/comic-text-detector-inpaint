@@ -890,7 +890,7 @@ def create_detector() -> TextDetector:
     model_path = osp.abspath(str(MODEL_PATH))
     if not osp.isfile(model_path):
         raise FileNotFoundError(f'找不到模型檔：{model_path}')
-    return TextDetector(model_path=model_path, input_size=1024, device='cpu', act='leaky')
+    return TextDetector(model_path=model_path, input_size=1536, device='cpu', act='leaky')
 
 
 def process_image_with_detector(

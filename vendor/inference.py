@@ -21,7 +21,7 @@ def model2annotations(model_path, img_dir_list, save_dir, save_json=False):
         img_dir_list = [img_dir_list]
     cuda = torch.cuda.is_available()
     device = 'cuda' if cuda else 'cpu'
-    model = TextDetector(model_path=model_path, input_size=1024, device=device, act='leaky')  
+    model = TextDetector(model_path=model_path, input_size=1536, device=device, act='leaky')
     imglist = []
     for img_dir in img_dir_list:
         imglist += find_all_imgs(img_dir, abs_path=True)
@@ -117,7 +117,7 @@ class TextDetector:
     lang_list = ['eng', 'ja', 'unknown']
     langcls2idx = {'eng': 0, 'ja': 1, 'unknown': 2}
 
-    def __init__(self, model_path, input_size=1024, device='cpu', half=False, nms_thresh=0.35, conf_thresh=0.4, mask_thresh=0.3, act='leaky'):
+    def __init__(self, model_path, input_size=1536, device='cpu', half=False, nms_thresh=0.35, conf_thresh=0.4, mask_thresh=0.3, act='leaky'):
         super(TextDetector, self).__init__()
         cuda = device == 'cuda'
 
