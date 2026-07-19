@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 import urllib.request
@@ -48,10 +49,29 @@ def run(cmd: list[str], *, cwd: Path | None = None) -> None:
         fail(f'Command failed with exit code {exc.returncode}: {" ".join(cmd)}', exc.returncode)
 
 
+def is_venv_healthy(python: Path) -> bool:
+    try:
+        subprocess.check_call(
+            [str(python), '--version'],
+            cwd=str(ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return True
+
+
 def ensure_venv() -> Path:
     python = venv_python()
     if python.exists():
-        return python
+        if is_venv_healthy(python):
+            return python
+        info('Virtual environment is broken. Recreating it...')
+        try:
+            shutil.rmtree(VENV_DIR)
+        except Exception as exc:
+            fail(f'Could not remove broken virtual environment: {exc}')
 
     info('Creating virtual environment...')
     try:

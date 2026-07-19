@@ -335,12 +335,13 @@ The selected Photoshop action is executed only when the source mask has content.
 
         app.activeDocument = maskDoc;
         var sourceChannel = maskDoc.channels[0];
-        var hasContent = !isChannelAllBlack(sourceChannel);
         var alpha = sourceChannel.duplicate(targetDoc);
         maskDoc.close(SaveOptions.DONOTSAVECHANGES);
 
         app.activeDocument = targetDoc;
         alpha.name = channelName;
+        var hasContent = loadChannelSelection(targetDoc, alpha);
+        targetDoc.selection.deselect();
         setRGBChannels(targetDoc);
         return hasContent;
     }
@@ -350,7 +351,7 @@ The selected Photoshop action is executed only when the source mask has content.
         var channel = getChannelByName(doc, channelName);
         if (!channel) return false;
 
-        if (isChannelAllBlack(channel)) {
+        if (!loadChannelSelection(doc, channel)) {
             channel.remove();
             setRGBChannels(doc);
             return false;
@@ -360,9 +361,6 @@ The selected Photoshop action is executed only when the source mask has content.
         var layer = doc.artLayers.add();
         layer.name = layerName;
         doc.activeLayer = layer;
-
-        doc.selection.deselect();
-        doc.selection.load(channel, SelectionType.REPLACE);
 
         var white = new SolidColor();
         white.rgb.red = 255;
@@ -384,12 +382,18 @@ The selected Photoshop action is executed only when the source mask has content.
         return null;
     }
 
-    function isChannelAllBlack(channel) {
-        var histogram = channel.histogram;
-        for (var i = 1; i < histogram.length; i++) {
-            if (histogram[i] > 0) return false;
+    function loadChannelSelection(doc, channel) {
+        app.activeDocument = doc;
+        doc.selection.deselect();
+        doc.selection.load(channel, SelectionType.REPLACE);
+        try {
+            var bounds = doc.selection.bounds;
+            return Math.round(bounds[2].as("px")) > Math.round(bounds[0].as("px")) &&
+                Math.round(bounds[3].as("px")) > Math.round(bounds[1].as("px"));
+        } catch (e) {
+            doc.selection.deselect();
+            return false;
         }
-        return true;
     }
 
     function getActionSets() {

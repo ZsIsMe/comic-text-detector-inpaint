@@ -373,15 +373,16 @@ Each PSD contains:
 
         app.activeDocument = maskDoc;
         var sourceChannel = maskDoc.channels[0];
-        if (skipIfAllBlack && isChannelAllBlack(sourceChannel)) {
-            maskDoc.close(SaveOptions.DONOTSAVECHANGES);
-            return false;
-        }
         var alpha = sourceChannel.duplicate(targetDoc);
         maskDoc.close(SaveOptions.DONOTSAVECHANGES);
 
         app.activeDocument = targetDoc;
         alpha.name = channelName;
+        if (skipIfAllBlack && !loadChannelSelection(targetDoc, alpha)) {
+            alpha.remove();
+            setRGBChannels(targetDoc);
+            return false;
+        }
         targetDoc.activeChannels = [alpha];
         addWhiteCornerPixels(targetDoc);
         setRGBChannels(targetDoc);
@@ -415,7 +416,7 @@ Each PSD contains:
         var channel = getChannelByName(doc, channelName);
         if (!channel) return false;
 
-        if (isChannelAllBlack(channel)) {
+        if (!loadChannelSelection(doc, channel)) {
             channel.remove();
             setRGBChannels(doc);
             return false;
@@ -425,9 +426,6 @@ Each PSD contains:
         var layer = doc.artLayers.add();
         layer.name = layerName;
         doc.activeLayer = layer;
-
-        doc.selection.deselect();
-        doc.selection.load(channel, SelectionType.REPLACE);
 
         var white = new SolidColor();
         white.rgb.red = 255;
@@ -449,12 +447,18 @@ Each PSD contains:
         return null;
     }
 
-    function isChannelAllBlack(channel) {
-        var histogram = channel.histogram;
-        for (var i = 1; i < histogram.length; i++) {
-            if (histogram[i] > 0) return false;
+    function loadChannelSelection(doc, channel) {
+        app.activeDocument = doc;
+        doc.selection.deselect();
+        doc.selection.load(channel, SelectionType.REPLACE);
+        try {
+            var bounds = doc.selection.bounds;
+            return Math.round(bounds[2].as("px")) > Math.round(bounds[0].as("px")) &&
+                Math.round(bounds[3].as("px")) > Math.round(bounds[1].as("px"));
+        } catch (e) {
+            doc.selection.deselect();
+            return false;
         }
-        return true;
     }
 
     function getActionSets() {
