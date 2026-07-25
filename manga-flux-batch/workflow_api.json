@@ -1,0 +1,126 @@
+{
+  "1": {
+    "inputs": {"image": "codex_18_original.png"},
+    "class_type": "LoadImage",
+    "_meta": {"title": "Original manga page"}
+  },
+  "2": {
+    "inputs": {"image": "codex_18_mask.png"},
+    "class_type": "LoadImage",
+    "_meta": {"title": "Complete mask image"}
+  },
+  "3": {
+    "inputs": {"channel": "red", "image": ["2", 0]},
+    "class_type": "ImageToMask",
+    "_meta": {"title": "Mask image to mask"}
+  },
+  "4": {
+    "inputs": {"value": 0.5, "mask": ["3", 0]},
+    "class_type": "ThresholdMask",
+    "_meta": {"title": "Binary mask"}
+  },
+  "5": {
+    "inputs": {"expand": 10, "tapered_corners": true, "mask": ["4", 0]},
+    "class_type": "GrowMask",
+    "_meta": {"title": "Expand mask 10px"}
+  },
+  "6": {
+    "inputs": {
+      "unet_name": "flux1-Fill-Dev_FP8.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {"title": "FLUX.1 Fill Dev FP8"}
+  },
+  "7": {
+    "inputs": {
+      "clip_name1": "clip_l.safetensors",
+      "clip_name2": "t5xxl_fp8_e4m3fn.safetensors",
+      "type": "flux",
+      "device": "default"
+    },
+    "class_type": "DualCLIPLoader",
+    "_meta": {"title": "CLIP-L + T5XXL FP8"}
+  },
+  "8": {
+    "inputs": {"vae_name": "ae.safetensors"},
+    "class_type": "VAELoader",
+    "_meta": {"title": "FLUX AE"}
+  },
+  "9": {
+    "inputs": {
+      "text": "Completely remove all masked Japanese sound-effect lettering. Reconstruct the concealed black-and-white manga artwork semantically from the surrounding context, including characters, anatomy, clothing, stadium architecture, panel borders, motion lines, speed lines, ink contours and screentone patterns. Continue every visible structural line naturally through each masked region. Keep outer page margins pure white. Preserve the original vintage monochrome manga style. Do not generate any text, glyphs, logos, symbols or new sound effects.",
+      "clip": ["7", 0]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {"title": "Manga semantic fill prompt"}
+  },
+  "10": {
+    "inputs": {"guidance": 30.0, "conditioning": ["9", 0]},
+    "class_type": "FluxGuidance",
+    "_meta": {"title": "Flux Guidance 30"}
+  },
+  "11": {
+    "inputs": {"conditioning": ["9", 0]},
+    "class_type": "ConditioningZeroOut",
+    "_meta": {"title": "Zero negative conditioning"}
+  },
+  "12": {
+    "inputs": {"model": ["6", 0]},
+    "class_type": "DifferentialDiffusion",
+    "_meta": {"title": "Differential Diffusion"}
+  },
+  "13": {
+    "inputs": {
+      "positive": ["10", 0],
+      "negative": ["11", 0],
+      "vae": ["8", 0],
+      "pixels": ["1", 0],
+      "mask": ["5", 0],
+      "noise_mask": true
+    },
+    "class_type": "InpaintModelConditioning",
+    "_meta": {"title": "Native FLUX Fill conditioning"}
+  },
+  "14": {
+    "inputs": {
+      "seed": 1800180018,
+      "steps": 20,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "normal",
+      "denoise": 1.0,
+      "model": ["12", 0],
+      "positive": ["13", 0],
+      "negative": ["13", 1],
+      "latent_image": ["13", 2]
+    },
+    "class_type": "KSampler",
+    "_meta": {"title": "FLUX Fill 20 steps"}
+  },
+  "15": {
+    "inputs": {"samples": ["14", 0], "vae": ["8", 0]},
+    "class_type": "VAEDecode",
+    "_meta": {"title": "Decode fill result"}
+  },
+  "16": {
+    "inputs": {
+      "x": 0,
+      "y": 0,
+      "resize_source": false,
+      "destination": ["1", 0],
+      "source": ["15", 0],
+      "mask": ["5", 0]
+    },
+    "class_type": "ImageCompositeMasked",
+    "_meta": {"title": "Preserve all unmasked pixels"}
+  },
+  "17": {
+    "inputs": {
+      "filename_prefix": "Flux1-Fill-FP8-Manga-18-Test",
+      "images": ["16", 0]
+    },
+    "class_type": "SaveImage",
+    "_meta": {"title": "Save test result"}
+  }
+}

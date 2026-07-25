@@ -1,0 +1,22 @@
+{
+  "server": "http://127.0.0.1:8188",
+  "original_folder": "C:\\Users\\zs\\Downloads\\85",
+  "mask_folder": "C:\\Users\\zs\\Downloads\\85\\other_mask",
+  "output_folder": "C:\\Users\\zs\\Downloads\\85\\flux_inpainted",
+  "workflow": "workflow_api.json",
+  "original_node_id": "1",
+  "mask_node_id": "2",
+  "save_node_id": "17",
+  "sampler_node_id": "14",
+  "recursive": false,
+  "skip_existing": true,
+  "request_timeout_seconds": 60,
+  "prompt_timeout_seconds": 600,
+  "poll_seconds": 2,
+  "progress_interval_seconds": 5,
+  "create_pdf": true,
+  "pdf_name": "comparison.pdf",
+  "overlay_opacity": 0.35,
+  "mask_expand": 4,
+  "invert_mask": false
+}
