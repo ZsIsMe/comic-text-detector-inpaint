@@ -955,34 +955,51 @@ def regenerate_image_from_mask(
     return page_summary
 
 
-def regenerate_image_from_ysgyolo_mask(
+def regenerate_image_from_imported_mask(
     img_path: str,
     paths: dict[str, str],
-    ysgyolo_dir: str,
+    imported_mask_dir: str,
+    mode: str,
 ) -> dict:
+    imported_path = osp.join(imported_mask_dir, f'{Path(img_path).stem}.png')
+    if not osp.isfile(imported_path):
+        return regenerate_image_from_mask(img_path, paths)
+
+    imported_mask = imread(imported_path, cv2.IMREAD_GRAYSCALE)
+    if imported_mask is None:
+        raise FileNotFoundError(f'無法讀取傳入 Mask：{imported_path}')
+    imported_mask = np.where(imported_mask > 0, 255, 0).astype(np.uint8)
+
+    if mode == 'replace':
+        source_image = imread(img_path, cv2.IMREAD_COLOR)
+        if source_image is None:
+            raise FileNotFoundError(f'無法讀取圖片：{img_path}')
+        if imported_mask.shape[:2] != source_image.shape[:2]:
+            raise ValueError(
+                f'傳入 Mask 尺寸不一致：{imported_path} '
+                f'{imported_mask.shape[1]}x{imported_mask.shape[0]}，'
+                f'原圖 {source_image.shape[1]}x{source_image.shape[0]}'
+            )
+        return regenerate_image_from_mask(img_path, paths, imported_mask)
+
+    if mode != 'intersect':
+        raise ValueError(f'不支援的傳入 Mask 處理方式：{mode}')
+
     mask_path = _mask_path(paths, img_path)
     if not osp.isfile(mask_path):
-        raise FileNotFoundError(f'找不到 mask：{mask_path}')
+        raise FileNotFoundError(f'找不到目前 Mask：{mask_path}')
     mask = imread(mask_path, cv2.IMREAD_GRAYSCALE)
     if mask is None:
-        raise FileNotFoundError(f'無法讀取 mask：{mask_path}')
-
-    ysgyolo_path = osp.join(ysgyolo_dir, f'{Path(img_path).stem}.png')
-    if not osp.isfile(ysgyolo_path):
-        return regenerate_image_from_mask(img_path, paths, mask)
-    ysgyolo_mask = imread(ysgyolo_path, cv2.IMREAD_GRAYSCALE)
-    if ysgyolo_mask is None:
-        raise FileNotFoundError(f'無法讀取 ysgyolo mask：{ysgyolo_path}')
-    if ysgyolo_mask.shape[:2] != mask.shape[:2]:
+        raise FileNotFoundError(f'無法讀取目前 Mask：{mask_path}')
+    if imported_mask.shape[:2] != mask.shape[:2]:
         raise ValueError(
-            f'ysgyolo mask 尺寸不一致：{ysgyolo_path} '
-            f'{ysgyolo_mask.shape[1]}x{ysgyolo_mask.shape[0]}，'
-            f'原 mask {mask.shape[1]}x{mask.shape[0]}'
+            f'傳入 Mask 尺寸不一致：{imported_path} '
+            f'{imported_mask.shape[1]}x{imported_mask.shape[0]}，'
+            f'目前 Mask {mask.shape[1]}x{mask.shape[0]}'
         )
 
     mask_bin = np.where(mask > 0, 255, 0).astype(np.uint8)
-    ysgyolo_bin = np.where(ysgyolo_mask > 0, 255, 0).astype(np.uint8)
-    merged_mask = cv2.bitwise_and(mask_bin, ysgyolo_bin)
+    merged_mask = cv2.bitwise_and(mask_bin, imported_mask)
     return regenerate_image_from_mask(img_path, paths, merged_mask)
 
 

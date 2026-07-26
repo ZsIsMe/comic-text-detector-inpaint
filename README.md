@@ -103,8 +103,7 @@ py -3 -m venv .venv
 選擇圖片資料夾
 打開最近列表
 偵測並生成
-不修改 mask 重生成
-使用ysgyolo更新mask圖
+使用傳入 Mask 運行
 顯示進度
 瀏覽圖片列表
 Mask / 原圖疊加預覽
@@ -123,9 +122,9 @@ Inpainted 合成預覽
 
 紅色的「偵測並生成」會重新跑 detector，並覆蓋已有的 `mask`、`other_mask` 和 `inpainted` 輸出。如果輸出資料夾內已有 mask，UI 會要求確認。
 
-「不修改 mask 重生成」不會重新跑 detector，也不會覆蓋 `mask`。它會讀取現有的 `ctd_inpainted/mask/<name>.png`，批量重新生成 `other_mask`、`inpainted` 和 `solid_inpaint_report.json`。適合在外部替換或批量修正 mask 後使用。
+「使用傳入 Mask 運行」提供兩種方式。「取代目前 Mask」會讓你選擇傳入 Mask 文件夾；若裡面存在同名 PNG，會覆蓋 `ctd_inpainted/mask/<name>.png`，再重新運行。缺少同名 PNG 的頁面會保留原 mask。
 
-「使用ysgyolo更新mask圖」會讓你選擇 ysgyolo mask 文件夾。若裡面存在同名 PNG，會用 `現有 mask ∩ ysgyolo mask` 覆蓋現有 mask，然後重新生成 `other_mask`、`inpainted` 和 `solid_inpaint_report.json`；缺少同名 PNG 的頁面會保留原 mask。
+「取兩者交集」會讓你選擇傳入 Mask 文件夾。若裡面存在同名 PNG，會用 `目前 mask ∩ 傳入 mask` 覆蓋目前 mask，然後重新生成 `other_mask`、`inpainted` 和 `solid_inpaint_report.json`；缺少同名 PNG 的頁面會保留原 mask。
 
 快捷鍵：
 

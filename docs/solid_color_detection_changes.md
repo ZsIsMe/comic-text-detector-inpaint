@@ -214,8 +214,7 @@ sample
 
 ```text
 偵測並生成
-不修改 mask 重生成
-使用 ysgyolo 更新 mask 圖
+使用傳入 Mask 運行（取代目前 Mask / 取兩者交集）
 單頁手動修改 mask 後自動重生成
 切換頁面時補算缺失 cache
 ```
