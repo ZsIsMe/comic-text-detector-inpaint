@@ -55,7 +55,7 @@ Windows：
 ```text
 1. 建立 .venv
 2. 安裝 requirements.txt
-3. 下載 models/comictextdetector.pt
+3. 下載 CTBD 與 CTD 模型
 4. 啟動圖形界面
 ```
 
@@ -257,10 +257,17 @@ OTHER_CHANNEL
 模型不包含在 git 倉庫中。首次啟動時 `bootstrap.py` 會下載：
 
 ```text
+models/comic-text-and-bubble-detector.onnx
 models/comictextdetector.pt
 ```
 
-模型來源：
+CTBD 模型來源：
+
+```text
+https://huggingface.co/ogkalu/comic-text-and-bubble-detector
+```
+
+CTD 模型來源：
 
 ```text
 https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.2.1/comictextdetector.pt
@@ -268,7 +275,17 @@ https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.2.1/c
 
 模型授權與歸屬屬於原項目。
 
-如果缺少模型，命令行和圖形界面都會提示找不到模型文件。
+點擊「偵測並生成」後可以選擇：
+
+```text
+1. CTBD（文字＋氣泡偵測）
+2. CTD
+```
+
+選擇 CTBD 時，可以在執行前設定 Mask 膨脹尺寸、Mask 合併方式和文字區域篩選。
+選擇與 CTBD 設定會自動保存，下一次打開對話框時沿用。
+
+如果缺少所選模型，命令行和圖形界面都會提示找不到模型文件。
 
 ## GitHub Pages
 
@@ -312,6 +329,7 @@ detect_solid_inpaint_folder.py
 solid_inpaint_ui.py
 create_psds_from_outputs.jsx
 models/.gitkeep
+ctbd_detector.py
 docs/
 icons/
 vendor/
@@ -325,6 +343,7 @@ __pycache__/
 .DS_Store
 ctd_inpainted/
 models/comictextdetector.pt
+models/comic-text-and-bubble-detector.onnx
 ```
 
 ## 開發注意

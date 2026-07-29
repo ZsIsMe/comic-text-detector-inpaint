@@ -24,6 +24,7 @@ if str(VENDOR_DIR) not in sys.path:
     sys.path.insert(0, str(VENDOR_DIR))
 
 from inference import TextDetector
+from ctbd_detector import ComicTextAndBubbleDetector
 from utils.io_utils import find_all_imgs, imread, imwrite
 from utils.textmask import REFINEMASK_ANNOTATION
 
@@ -38,6 +39,14 @@ BACKGROUND_SAMPLE_CACHE_DIR = 'background_sample_cache'
 REPORT_JSON = 'solid_inpaint_report.json'
 PREVIEW_PDF = 'preview_report.pdf'
 MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'comictextdetector.pt'
+CTBD_MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'comic-text-and-bubble-detector.onnx'
+DETECTOR_CTBD = 'ctbd'
+DETECTOR_LEGACY_CTD = 'legacy_ctd'
+DEFAULT_DETECTOR = DETECTOR_LEGACY_CTD
+DETECTOR_LABELS = {
+    DETECTOR_CTBD: 'CTBD',
+    DETECTOR_LEGACY_CTD: 'CTD',
+}
 NATURAL_SORT_RE = re.compile(r'(\d+)')
 
 REPAIR_EXPAND_PX = 3
@@ -886,11 +895,24 @@ def natural_sort_key(name: str) -> tuple:
     return tuple((1, int(part), part) if part.isdigit() else (0, part) for part in parts)
 
 
-def create_detector() -> TextDetector:
-    model_path = osp.abspath(str(MODEL_PATH))
+def detector_model_path(detector_name: str) -> Path:
+    if detector_name == DETECTOR_CTBD:
+        return CTBD_MODEL_PATH
+    if detector_name == DETECTOR_LEGACY_CTD:
+        return MODEL_PATH
+    raise ValueError(f'不支援的 detector：{detector_name}')
+
+
+def create_detector(
+    detector_name: str = DEFAULT_DETECTOR,
+    detector_params: dict | None = None,
+):
+    model_path = osp.abspath(str(detector_model_path(detector_name)))
     if not osp.isfile(model_path):
         raise FileNotFoundError(f'找不到模型檔：{model_path}')
-    return TextDetector(model_path=model_path, input_size=1536, device='cpu', act='leaky')
+    if detector_name == DETECTOR_CTBD:
+        return ComicTextAndBubbleDetector(model_path, **(detector_params or {}))
+    return TextDetector(model_path=model_path, input_size=1024, device='cpu', act='leaky')
 
 
 def process_image_with_detector(
@@ -1008,6 +1030,7 @@ def build_report(
     paths: dict[str, str],
     imglist: list[str],
     pages: dict,
+    detector_name: str = DEFAULT_DETECTOR,
 ) -> dict:
     summary = {
         'total': len(imglist),
@@ -1025,7 +1048,9 @@ def build_report(
     return {
         'image_dir': osp.abspath(img_dir),
         'output_dir': paths['output'],
-        'model': osp.abspath(str(MODEL_PATH)),
+        'detector': detector_name,
+        'detector_label': DETECTOR_LABELS.get(detector_name, detector_name),
+        'model': osp.abspath(str(detector_model_path(detector_name))),
         'device': 'cpu',
         'pages': pages,
         'summary': summary,
@@ -1047,11 +1072,11 @@ def load_report(paths: dict[str, str]) -> dict:
         return json.load(f)
 
 
-def run(img_dir: str) -> int:
+def run(img_dir: str, detector_name: str = DEFAULT_DETECTOR) -> int:
     img_dir = osp.abspath(img_dir)
     if not osp.isdir(img_dir):
         raise FileNotFoundError(f'找不到資料夾：{img_dir}')
-    model_path = osp.abspath(str(MODEL_PATH))
+    model_path = osp.abspath(str(detector_model_path(detector_name)))
     if not osp.isfile(model_path):
         raise FileNotFoundError(f'找不到模型檔：{model_path}')
     device = 'cpu'
@@ -1068,7 +1093,7 @@ def run(img_dir: str) -> int:
     print(f'裝置：{device}')
     print(f'圖片數量：{len(imglist)}')
 
-    detector = create_detector()
+    detector = create_detector(detector_name)
     pages = {}
 
     for img_path in tqdm(imglist, desc='solid inpaint'):
@@ -1078,7 +1103,7 @@ def run(img_dir: str) -> int:
         except Exception as exc:
             pages[img_name] = {'error': str(exc)}
 
-    report = build_report(img_dir, paths, imglist, pages)
+    report = build_report(img_dir, paths, imglist, pages, detector_name)
     report_path = write_report(paths, report)
     preview_pdf_path = _write_preview_pdf(imglist, paths, report)
 
@@ -1100,8 +1125,14 @@ def main() -> None:
         description='偵測文字 mask，生成純色背景 inpainted overlay 和 other_mask。',
     )
     parser.add_argument('img_dir', help='輸入圖片資料夾路徑')
+    parser.add_argument(
+        '--detector',
+        choices=(DETECTOR_CTBD, DETECTOR_LEGACY_CTD),
+        default=DEFAULT_DETECTOR,
+        help='文字偵測模型；ctbd 使用 RT-DETR-V2 ONNX 模型，legacy_ctd 使用 CTD 模型。',
+    )
     args = parser.parse_args()
-    run(args.img_dir)
+    run(args.img_dir, args.detector)
 
 
 if __name__ == '__main__':

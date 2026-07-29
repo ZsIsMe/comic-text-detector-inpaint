@@ -16,6 +16,9 @@ from pathlib import Path
 APP_NAME = '塗白'
 MODEL_URL = 'https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.2.1/comictextdetector.pt'
 MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'comictextdetector.pt'
+CTBD_MODEL_URL = 'https://huggingface.co/ogkalu/comic-text-and-bubble-detector/resolve/main/detector.onnx'
+CTBD_MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'comic-text-and-bubble-detector.onnx'
+CTBD_MODEL_SHA256 = '065744e91c0594ad8663aa8b870ce3fb27222942eded5a3cc388ce23421bd195'
 ROOT = Path(__file__).resolve().parent
 VENV_DIR = ROOT / '.venv'
 REQUIREMENTS = ROOT / 'requirements.txt'
@@ -100,19 +103,26 @@ def ensure_dependencies(python: Path) -> None:
     stamp.write_text(str(req_mtime), encoding='utf-8')
 
 
-def download_model() -> None:
-    if MODEL_PATH.exists():
+def download_model(url: str, model_path: Path, expected_sha256: str | None = None) -> None:
+    if model_path.exists():
+        if expected_sha256:
+            hasher = hashlib.sha256()
+            with model_path.open('rb') as source:
+                while chunk := source.read(1024 * 1024):
+                    hasher.update(chunk)
+            if hasher.hexdigest() != expected_sha256:
+                fail(f'Model checksum does not match: {model_path}')
         return
 
-    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = MODEL_PATH.with_suffix('.pt.download')
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = model_path.with_suffix(model_path.suffix + '.download')
     info('Model file is missing.')
     info('Downloading model from the original public release:')
-    info(MODEL_URL)
+    info(url)
     info('Model license and ownership belong to the original project.')
 
     try:
-        with urllib.request.urlopen(MODEL_URL, timeout=30) as response:
+        with urllib.request.urlopen(url, timeout=30) as response:
             total = int(response.headers.get('Content-Length') or 0)
             downloaded = 0
             hasher = hashlib.sha256()
@@ -134,14 +144,18 @@ def download_model() -> None:
             tmp_path.unlink()
         fail(
             'Could not download the model. You can manually place it at '
-            f'{MODEL_PATH}. Details: {exc}'
+            f'{model_path}. Details: {exc}'
         )
 
     if tmp_path.stat().st_size < 1024 * 1024:
         tmp_path.unlink()
         fail('Downloaded model is unexpectedly small.')
 
-    tmp_path.replace(MODEL_PATH)
+    if expected_sha256 and hasher.hexdigest() != expected_sha256:
+        tmp_path.unlink()
+        fail(f'Downloaded model checksum does not match: {model_path}')
+
+    tmp_path.replace(model_path)
     info('Model downloaded successfully.')
 
 
@@ -154,7 +168,10 @@ def main() -> None:
     ensure_python_version()
     python = ensure_venv()
     ensure_dependencies(python)
-    download_model()
+    # Download both choices so selecting either detector never starts an
+    # unexpected network operation inside the UI worker thread.
+    download_model(CTBD_MODEL_URL, CTBD_MODEL_PATH, CTBD_MODEL_SHA256)
+    download_model(MODEL_URL, MODEL_PATH)
     launch_app(python)
 
 

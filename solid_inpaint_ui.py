@@ -68,6 +68,10 @@ from detect_solid_inpaint_folder import (
     _write_preview_pdf,
     build_report,
     create_detector,
+    DEFAULT_DETECTOR,
+    DETECTOR_CTBD,
+    DETECTOR_LABELS,
+    DETECTOR_LEGACY_CTD,
     image_files_in_folder,
     iter_background_samples_from_mask,
     load_report,
@@ -1107,6 +1111,8 @@ class FolderWorker(QObject):
         image_paths: list[str] | None = None,
         imported_mask_dir: str = '',
         imported_mask_mode: str = '',
+        detector_name: str = DEFAULT_DETECTOR,
+        detector_params: dict | None = None,
     ) -> None:
         super().__init__()
         self.folder = folder
@@ -1114,12 +1120,18 @@ class FolderWorker(QObject):
         self.image_paths = image_paths
         self.imported_mask_dir = imported_mask_dir
         self.imported_mask_mode = imported_mask_mode
+        self.detector_name = detector_name
+        self.detector_params = dict(detector_params or {})
 
     def run(self) -> None:
         try:
             paths = _ensure_dirs(self.folder)
             imglist = self.image_paths or image_files_in_folder(self.folder)
-            detector = create_detector() if self.mode == 'detect' else None
+            detector = (
+                create_detector(self.detector_name, self.detector_params)
+                if self.mode == 'detect'
+                else None
+            )
             existing = load_report(paths)
             pages = dict(existing.get('pages', {}))
             total = len(imglist)
@@ -1140,7 +1152,18 @@ class FolderWorker(QObject):
                         pages[name] = regenerate_image_from_mask(img_path, paths)
                 except Exception as exc:
                     pages[name] = {'error': str(exc)}
-            report = build_report(self.folder, paths, image_files_in_folder(self.folder), pages)
+            report_detector = (
+                self.detector_name
+                if self.mode == 'detect'
+                else existing.get('detector', DEFAULT_DETECTOR)
+            )
+            report = build_report(
+                self.folder,
+                paths,
+                image_files_in_folder(self.folder),
+                pages,
+                report_detector,
+            )
             write_report(paths, report)
             self.finished.emit(report)
         except Exception as exc:
@@ -1172,7 +1195,13 @@ class ConvertMasksWorker(QObject):
                     pages[name] = regenerate_image_from_mask(img_path, self.paths, auto_mask)
                 except Exception as exc:
                     pages[name] = {'error': str(exc)}
-            report = build_report(self.folder, self.paths, self.imglist, pages)
+            report = build_report(
+                self.folder,
+                self.paths,
+                self.imglist,
+                pages,
+                existing.get('detector', DEFAULT_DETECTOR),
+            )
             write_report(self.paths, report)
             self.finished.emit(report)
         except Exception as exc:
@@ -1197,7 +1226,13 @@ class PageRegenerateWorker(QObject):
             pages = dict(existing.get('pages', {}))
             summary = regenerate_image_from_mask(self.img_path, self.paths, self.mask)
             pages[osp.basename(self.img_path)] = summary
-            report = build_report(self.folder, self.paths, self.imglist, pages)
+            report = build_report(
+                self.folder,
+                self.paths,
+                self.imglist,
+                pages,
+                existing.get('detector', DEFAULT_DETECTOR),
+            )
             write_report(self.paths, report)
             self.finished.emit(self.img_path, report)
         except Exception as exc:
@@ -1255,6 +1290,156 @@ class ConvertMasksDialog(QDialog):
 
     def selected_scope(self) -> str:
         return 'all' if self.all_pages_radio.isChecked() else 'current'
+
+
+class DetectorSelectionDialog(QDialog):
+    """Choose which text detector is used by the destructive batch action."""
+
+    def __init__(self, settings: QSettings, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.settings = settings
+        self.setWindowTitle('選擇文字偵測模型')
+        self.setMinimumWidth(500)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(12)
+
+        title = QLabel('偵測並生成')
+        title_font = title.font()
+        title_font.setBold(True)
+        title_font.setPointSize(title_font.pointSize() + 2)
+        title.setFont(title_font)
+        layout.addWidget(title)
+
+        description = QLabel('選擇這次要使用的文字偵測模型。CTBD 可在執行前調整 Mask 設定。')
+        description.setWordWrap(True)
+        layout.addWidget(description)
+
+        self.group = QButtonGroup(self)
+        self.buttons: dict[str, QRadioButton] = {}
+        saved_detector = str(self.settings.value('detector/last_name', DETECTOR_CTBD))
+        if saved_detector not in {DETECTOR_CTBD, DETECTOR_LEGACY_CTD}:
+            saved_detector = DETECTOR_CTBD
+        options = (
+            (
+                DETECTOR_CTBD,
+                DETECTOR_LABELS[DETECTOR_CTBD],
+                'RT-DETR-V2 ONNX 模型；先偵測文字區域，再生成文字 Mask。',
+            ),
+            (
+                DETECTOR_LEGACY_CTD,
+                DETECTOR_LABELS[DETECTOR_LEGACY_CTD],
+                'comictextdetector.pt；使用原有的偵測與 Mask 流程。',
+            ),
+        )
+        for detector_name, label, detail in options:
+            frame = QFrame()
+            frame.setFrameShape(QFrame.Shape.StyledPanel)
+            option_layout = QVBoxLayout(frame)
+            option_layout.setContentsMargins(14, 10, 14, 10)
+            option_layout.setSpacing(4)
+
+            radio = QRadioButton(label)
+            radio.setChecked(detector_name == saved_detector)
+            self.group.addButton(radio)
+            self.buttons[detector_name] = radio
+            option_layout.addWidget(radio)
+
+            detail_label = QLabel(detail)
+            detail_label.setWordWrap(True)
+            detail_label.setIndent(22)
+            detail_label.setProperty('secondary', True)
+            option_layout.addWidget(detail_label)
+            layout.addWidget(frame)
+
+        self.ctbd_config_frame = QFrame()
+        self.ctbd_config_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        config_layout = QGridLayout(self.ctbd_config_frame)
+        config_layout.setContentsMargins(14, 12, 14, 12)
+        config_layout.setHorizontalSpacing(14)
+        config_layout.setVerticalSpacing(10)
+
+        config_title = QLabel('CTBD 設定')
+        config_title_font = config_title.font()
+        config_title_font.setBold(True)
+        config_title.setFont(config_title_font)
+        config_layout.addWidget(config_title, 0, 0, 1, 2)
+
+        config_layout.addWidget(QLabel('Mask 膨脹尺寸'), 1, 0)
+        self.dilate_spin = QSpinBox()
+        self.dilate_spin.setRange(0, 64)
+        self.dilate_spin.setSuffix(' px')
+        self.dilate_spin.setToolTip('對每個文字區域的 Mask 進行膨脹，用來連接文字碎片。')
+        try:
+            saved_dilate = int(self.settings.value('detector/ctbd/inpaint_mask_dilate', 4))
+        except (TypeError, ValueError):
+            saved_dilate = 4
+        self.dilate_spin.setValue(max(0, min(64, saved_dilate)))
+        config_layout.addWidget(self.dilate_spin, 1, 1)
+
+        config_layout.addWidget(QLabel('Mask 合併方式'), 2, 0)
+        self.unification_combo = QComboBox()
+        self.unification_combo.addItem('不合併', 'none')
+        self.unification_combo.addItem('外接矩形', 'rectangle')
+        self.unification_combo.addItem('凸包', 'hull')
+        self.unification_combo.setToolTip('決定每個文字區域內的 Mask 碎片如何合併。')
+        saved_unification = str(
+            self.settings.value('detector/ctbd/mask_unification_method', 'none')
+        )
+        unification_index = self.unification_combo.findData(saved_unification)
+        self.unification_combo.setCurrentIndex(max(0, unification_index))
+        config_layout.addWidget(self.unification_combo, 2, 1)
+
+        config_layout.addWidget(QLabel('文字區域篩選'), 3, 0)
+        self.region_filter_combo = QComboBox()
+        self.region_filter_combo.addItem('全部文字', 'all')
+        self.region_filter_combo.addItem('僅氣泡內文字', 'text_bubble')
+        self.region_filter_combo.addItem('僅氣泡外文字', 'text_free')
+        self.region_filter_combo.setToolTip('根據文字框與氣泡框的關係，篩選要生成 Mask 的文字。')
+        saved_region_filter = str(
+            self.settings.value('detector/ctbd/text_region_filter', 'all')
+        )
+        region_filter_index = self.region_filter_combo.findData(saved_region_filter)
+        self.region_filter_combo.setCurrentIndex(max(0, region_filter_index))
+        config_layout.addWidget(self.region_filter_combo, 3, 1)
+        config_layout.setColumnStretch(1, 1)
+        layout.addWidget(self.ctbd_config_frame)
+
+        self.buttons[DETECTOR_CTBD].toggled.connect(self.ctbd_config_frame.setEnabled)
+        self.ctbd_config_frame.setEnabled(self.buttons[DETECTOR_CTBD].isChecked())
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText('開始偵測')
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('取消')
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_detector(self) -> str:
+        for detector_name, button in self.buttons.items():
+            if button.isChecked():
+                return detector_name
+        return DETECTOR_CTBD
+
+    def selected_detector_params(self) -> dict:
+        if self.selected_detector() != DETECTOR_CTBD:
+            return {}
+        return {
+            'inpaint_mask_dilate': self.dilate_spin.value(),
+            'mask_unification_method': self.unification_combo.currentData(),
+            'text_region_filter': self.region_filter_combo.currentData(),
+        }
+
+    def save_settings(self) -> None:
+        self.settings.setValue('detector/last_name', self.selected_detector())
+        params = self.selected_detector_params()
+        if params:
+            for key, value in params.items():
+                self.settings.setValue(f'detector/ctbd/{key}', value)
+        self.settings.sync()
 
 
 class BackgroundSampleWorker(QObject):
@@ -2326,11 +2511,21 @@ class MainWindow(QMainWindow):
         if self.page_worker_thread is not None or self.render_timer.isActive():
             QMessageBox.information(self, '正在生成預覽', '請等待當前頁預覽生成完成後再重新偵測。')
             return
+
+        detector_dialog = DetectorSelectionDialog(self.settings, self)
+        if detector_dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        detector_name = detector_dialog.selected_detector()
+        detector_params = detector_dialog.selected_detector_params()
+        detector_dialog.save_settings()
+        detector_label = DETECTOR_LABELS.get(detector_name, detector_name)
+
         if self.has_existing_masks():
             reply = QMessageBox.warning(
                 self,
                 '確認重新偵測',
                 '當前文件夾已存在 mask。\n\n'
+                f'這次將使用：{detector_label}\n\n'
                 '「偵測並生成」會重新跑 detector，並覆蓋已有的 mask、other_mask 和 inpainted 輸出。\n'
                 '如果你已經手動修改過 mask，這些修改會丟失。\n\n'
                 '確定要繼續嗎？',
@@ -2339,7 +2534,13 @@ class MainWindow(QMainWindow):
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
-        self.start_worker('detect', self.imglist)
+        self.status.showMessage(f'準備使用 {detector_label}...')
+        self.start_worker(
+            'detect',
+            self.imglist,
+            detector_name=detector_name,
+            detector_params=detector_params,
+        )
 
     def run_with_imported_masks(self, mode: str) -> None:
         if not self.folder:
@@ -2442,6 +2643,8 @@ class MainWindow(QMainWindow):
         image_paths: list[str],
         imported_mask_dir: str = '',
         imported_mask_mode: str = '',
+        detector_name: str = DEFAULT_DETECTOR,
+        detector_params: dict | None = None,
     ) -> None:
         if self.worker_thread is not None:
             QMessageBox.information(self, '正在執行', '已有任務在執行中。')
@@ -2451,7 +2654,15 @@ class MainWindow(QMainWindow):
             return
         self.progress.setValue(0)
         self.worker_thread = QThread()
-        self.worker = FolderWorker(self.folder, mode, image_paths, imported_mask_dir, imported_mask_mode)
+        self.worker = FolderWorker(
+            self.folder,
+            mode,
+            image_paths,
+            imported_mask_dir,
+            imported_mask_mode,
+            detector_name,
+            detector_params,
+        )
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
         self.worker.progress.connect(self.on_worker_progress)
@@ -3341,7 +3552,13 @@ class MainWindow(QMainWindow):
     def on_page_render_failed(self, img_path: str, message: str) -> None:
         pages = dict(self.report.get('pages', {}))
         pages[osp.basename(img_path)] = {'error': message}
-        self.report = build_report(self.folder, self.paths, self.imglist, pages)
+        self.report = build_report(
+            self.folder,
+            self.paths,
+            self.imglist,
+            pages,
+            self.report.get('detector', DEFAULT_DETECTOR),
+        )
         write_report(self.paths, self.report)
         self.refresh_list()
         self.status.showMessage(f'{osp.basename(img_path)} 預覽生成失敗：{message}')
