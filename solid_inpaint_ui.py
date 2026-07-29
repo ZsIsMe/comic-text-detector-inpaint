@@ -546,6 +546,7 @@ class RubberBandRectItem(QGraphicsRectItem):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
         glow_pen = QPen(QColor(115, 135, 150, 95), 8, Qt.PenStyle.SolidLine)
+        glow_pen.setCosmetic(True)
         painter.setPen(glow_pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRect(rect.adjusted(-2, -2, 2, 2))
@@ -557,6 +558,7 @@ class RubberBandRectItem(QGraphicsRectItem):
         painter.save()
         painter.setClipRect(rect)
         hatch_pen = QPen(QColor(182, 194, 204, 145), 1)
+        hatch_pen.setCosmetic(True)
         painter.setPen(hatch_pen)
         step = 10
         left = int(rect.left())
@@ -569,6 +571,7 @@ class RubberBandRectItem(QGraphicsRectItem):
         painter.restore()
 
         border_pen = QPen(QColor('#9aa7b3'), 3, Qt.PenStyle.DashLine)
+        border_pen.setCosmetic(True)
         painter.setPen(border_pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRect(rect)
@@ -607,8 +610,14 @@ class MaskEditorView(ImageView):
         self._rect_pen_remove = QPen(QColor('#ff8f8f'), 2, Qt.PenStyle.DashLine)
         self._rect_pen_intersect = QPen(QColor('#ffd86f'), 2, Qt.PenStyle.DashLine)
         self._rect_pen_detect = QPen(QColor('#70bdff'), 2, Qt.PenStyle.DashLine)
+        for pen in (
+            self._rect_pen_add,
+            self._rect_pen_remove,
+            self._rect_pen_intersect,
+            self._rect_pen_detect,
+        ):
+            pen.setCosmetic(True)
         self._rect_brush_default = QBrush(QColor(255, 255, 255, 30))
-        self._brush_pen = QPen(QColor('#e9fffb'), 2)
         self._brush_line_pen_add = QPen(QColor('#e9fffb'), 2, Qt.PenStyle.DashLine)
         self._brush_line_pen_remove = QPen(QColor('#ff8f8f'), 2, Qt.PenStyle.DashLine)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
@@ -1059,7 +1068,7 @@ class MaskEditorView(ImageView):
         if self._brush_cursor is None:
             self._brush_cursor = QGraphicsEllipseItem()
             self._brush_cursor.setBrush(QColor(233, 255, 251, 28))
-            self._brush_cursor.setPen(self._brush_pen)
+            self._brush_cursor.setPen(QPen(Qt.PenStyle.NoPen))
             self._brush_cursor.setZValue(10)
             self.scene().addItem(self._brush_cursor)
         radius = self.brush_radius
