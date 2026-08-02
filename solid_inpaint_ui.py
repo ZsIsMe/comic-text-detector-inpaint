@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QCheckBox,
     QComboBox,
+    QColorDialog,
     QProgressBar,
     QRadioButton,
     QSlider,
@@ -1292,6 +1293,79 @@ class ConvertMasksDialog(QDialog):
         return 'all' if self.all_pages_radio.isChecked() else 'current'
 
 
+class ColoredExportDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle('導出右圖')
+        self.setMinimumWidth(360)
+        self.color = QColor(255, 110, 165)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        layout.addWidget(QLabel('導出範圍'))
+        scope_layout = QHBoxLayout()
+        self.current_page_radio = QRadioButton('當前頁')
+        self.current_page_radio.setChecked(True)
+        self.all_pages_radio = QRadioButton('全部頁面')
+        scope_group = QButtonGroup(self)
+        scope_group.addButton(self.current_page_radio)
+        scope_group.addButton(self.all_pages_radio)
+        scope_layout.addWidget(self.current_page_radio)
+        scope_layout.addWidget(self.all_pages_radio)
+        scope_layout.addStretch()
+        layout.addLayout(scope_layout)
+
+        color_layout = QHBoxLayout()
+        color_layout.addWidget(QLabel('標記顏色'))
+        self.color_button = QPushButton()
+        self.color_button.clicked.connect(self.choose_color)
+        color_layout.addWidget(self.color_button)
+        color_layout.addSpacing(12)
+        color_layout.addWidget(QLabel('透明度'))
+        self.alpha_spinbox = QSpinBox()
+        self.alpha_spinbox.setRange(0, 100)
+        self.alpha_spinbox.setValue(round(OTHER_MASK_DISPLAY_ALPHA * 100))
+        self.alpha_spinbox.setSuffix('%')
+        color_layout.addWidget(self.alpha_spinbox)
+        color_layout.addStretch()
+        layout.addLayout(color_layout)
+
+        hint = QLabel('會導出右側的去字合成與 other_mask 標記；不包含淡紫色擴展外圈。')
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText('導出')
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('取消')
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.update_color_button()
+
+    def choose_color(self) -> None:
+        color = QColorDialog.getColor(self.color, self, '選擇 other_mask 標記顏色')
+        if color.isValid():
+            self.color = color
+            self.update_color_button()
+
+    def update_color_button(self) -> None:
+        self.color_button.setText(self.color.name().upper())
+        text_color = '#10161a' if self.color.lightness() > 140 else '#f4f7fa'
+        self.color_button.setStyleSheet(
+            f'background: {self.color.name()}; color: {text_color};'
+        )
+
+    def selected_scope(self) -> str:
+        return 'all' if self.all_pages_radio.isChecked() else 'current'
+
+    def selected_color_bgr(self) -> tuple[int, int, int]:
+        return (self.color.blue(), self.color.green(), self.color.red())
+
+    def selected_alpha(self) -> float:
+        return self.alpha_spinbox.value() / 100.0
+
+
 class DetectorSelectionDialog(QDialog):
     """Choose which text detector is used by the destructive batch action."""
 
@@ -2134,6 +2208,10 @@ class MainWindow(QMainWindow):
         self.other_mask_expand_spinbox.setToolTip('只影響右側淡紫色預覽，不改變輸出的 OTHER_CHANNEL')
         self.other_mask_expand_spinbox.valueChanged.connect(self.on_other_mask_preview_expand_changed)
         view_options.addWidget(self.other_mask_expand_spinbox)
+        self.export_colored_btn = QPushButton('導出右圖')
+        self.export_colored_btn.setToolTip('導出右側去字預覽與 other_mask 紫色標記；不包含淡紫色擴展外圈')
+        self.export_colored_btn.clicked.connect(self.export_colored_preview)
+        view_options.addWidget(self.export_colored_btn)
         view_options.addSpacing(12)
         fit_btn = QPushButton('F4')
         fit_btn.setToolTip('兩張圖同時適應窗口')
@@ -2194,6 +2272,7 @@ class MainWindow(QMainWindow):
             self.redo_btn,
             self.brush_down_btn,
             self.brush_up_btn,
+            self.export_colored_btn,
             fit_btn,
         ):
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -2852,6 +2931,78 @@ class MainWindow(QMainWindow):
             OTHER_MASK_DISPLAY_ALPHA,
             EDIT_MODE_COLORS['manual_other'],
         )
+
+    def export_colored_preview(self) -> None:
+        if not self.current_img_path or self.current_base is None or not self.paths:
+            self.status.showMessage('請先選擇並載入一張圖片。')
+            return
+
+        dialog = ColoredExportDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        img_paths = self.imglist if dialog.selected_scope() == 'all' else [self.current_img_path]
+        self.export_colored_images(img_paths, dialog.selected_color_bgr(), dialog.selected_alpha())
+
+    def export_colored_images(
+        self,
+        img_paths: list[str],
+        color_bgr: tuple[int, int, int],
+        alpha: float,
+    ) -> None:
+        if not self.paths:
+            return
+        colored_dir = osp.join(self.paths['output'], 'colored')
+        os.makedirs(colored_dir, exist_ok=True)
+        made = 0
+        failed: list[str] = []
+        total = len(img_paths)
+        for index, img_path in enumerate(img_paths, start=1):
+            self.status.showMessage(f'正在導出右圖：{index}/{total}')
+            QApplication.processEvents()
+            try:
+                self.export_one_colored_image(img_path, colored_dir, color_bgr, alpha)
+                made += 1
+            except Exception as exc:
+                failed.append(f'{osp.basename(img_path)}：{exc}')
+
+        if failed:
+            QMessageBox.warning(
+                self,
+                '部分導出失敗',
+                f'已導出 {made}/{total} 張。\n\n' + '\n'.join(failed[:8]),
+            )
+        else:
+            self.status.showMessage(f'已導出 {made} 張右圖：{colored_dir}')
+
+    def export_one_colored_image(
+        self,
+        img_path: str,
+        colored_dir: str,
+        color_bgr: tuple[int, int, int],
+        alpha: float,
+    ) -> None:
+        base = _optional_imread(img_path, cv2.IMREAD_UNCHANGED)
+        if base is None:
+            raise FileNotFoundError('無法讀取原圖')
+        overlay = _optional_imread(_output_path(self.paths, img_path), cv2.IMREAD_UNCHANGED)
+        other_mask = _optional_imread(_other_mask_path(self.paths, img_path), cv2.IMREAD_GRAYSCALE)
+        if overlay is not None:
+            colored = _compose_overlay_preview(base, overlay)
+        else:
+            colored = (
+                base[:, :, :3].copy()
+                if len(base.shape) == 3
+                else cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
+            )
+
+        # This deliberately omits the expanded preview ring: it is UI-only.
+        colored = _overlay_mask_on_bgr(
+            colored,
+            other_mask,
+            alpha,
+            color_bgr,
+        )
+        imwrite(osp.join(colored_dir, f'{Path(img_path).stem}.png'), colored)
 
     def refresh_mask_preview(self, keep_view: bool = True) -> None:
         if self.current_base is None:
