@@ -126,6 +126,7 @@ SELECTION_COMBINE_LABELS = {
     'subtract': '減去',
     'local_intersect': '局部交集',
     'selection_inner': '選區內部',
+    'add_selection_inner': '添加＋內部',
     'transfer_from_other': '從其他轉入',
     'ctd_detect_selection': '添加CTD檢測選區',
 }
@@ -944,6 +945,9 @@ class MaskEditorView(ImageView):
             return
         if operation == 'selection_inner' and self.tool == 'magic':
             self._apply_selection_inner(selection)
+            return
+        if operation == 'add_selection_inner' and self.tool == 'magic':
+            self._apply_selection_add_inner(selection)
 
     def _selection_operation_for_button(self, button: Qt.MouseButton) -> str:
         if button == Qt.MouseButton.RightButton:
@@ -979,6 +983,14 @@ class MaskEditorView(ImageView):
     def _apply_selection_inner(self, selection: np.ndarray) -> None:
         if self.mask is None:
             return
+        holes = self._selection_holes(selection)
+        if np.any(holes):
+            self.mask[holes] = 255
+
+    def _apply_selection_add_inner(self, selection: np.ndarray) -> None:
+        if self.mask is None:
+            return
+        self.mask[selection] = 255
         holes = self._selection_holes(selection)
         if np.any(holes):
             self.mask[holes] = 255
@@ -1037,7 +1049,7 @@ class MaskEditorView(ImageView):
             self._rubber_band.setPen(self._rect_pen_remove)
         elif operation == 'ctd_detect_selection':
             self._rubber_band.setPen(self._rect_pen_detect)
-        elif operation in ('local_intersect', 'selection_inner', 'transfer_from_other'):
+        elif operation in ('local_intersect', 'selection_inner', 'add_selection_inner', 'transfer_from_other'):
             self._rubber_band.setPen(self._rect_pen_intersect)
         else:
             self._rubber_band.setPen(self._rect_pen_add)
@@ -2280,10 +2292,14 @@ class MainWindow(QMainWindow):
         self.convert_masks_btn = QPushButton('批處理')
         self.convert_masks_btn.setToolTip('將全部選區轉為指定類型；此操作不能回撤')
         self.convert_masks_btn.clicked.connect(self.show_convert_masks_dialog)
+        self.export_colored_btn = QPushButton('導出右圖')
+        self.export_colored_btn.setToolTip('導出右側去字預覽與 other_mask 紫色標記；不包含淡紫色擴展外圈')
+        self.export_colored_btn.clicked.connect(self.export_colored_preview)
         mode_toolbar.addWidget(self.edit_mask_btn)
         mode_toolbar.addWidget(self.edit_manual_solid_btn)
         mode_toolbar.addWidget(self.edit_manual_other_btn)
         mode_toolbar.addWidget(self.convert_masks_btn)
+        mode_toolbar.addWidget(self.export_colored_btn)
         mode_toolbar.addStretch()
         workspace_layout.addLayout(mode_toolbar)
 
@@ -2310,6 +2326,9 @@ class MainWindow(QMainWindow):
         self.selection_inner_btn = QPushButton('選區內部')
         self.selection_inner_btn.setCheckable(True)
         self.selection_inner_btn.setToolTip('魔法棒專用：提取本次選區包圍住的內部孔洞，例如點氣泡空白後取得文字')
+        self.selection_add_inner_btn = QPushButton('添加＋內部')
+        self.selection_add_inner_btn.setCheckable(True)
+        self.selection_add_inner_btn.setToolTip('魔法棒專用：同時添加選區與內部孔洞')
         self.selection_transfer_btn = QPushButton('F12 從其他轉入')
         self.selection_transfer_btn.setCheckable(True)
         self.selection_transfer_btn.setToolTip('把本次選區內其他 mask 的重疊部分移到目前 mask，並從原 mask 移除')
@@ -2322,12 +2341,14 @@ class MainWindow(QMainWindow):
         self.selection_combine_group.addButton(self.selection_subtract_btn)
         self.selection_combine_group.addButton(self.selection_intersect_btn)
         self.selection_combine_group.addButton(self.selection_inner_btn)
+        self.selection_combine_group.addButton(self.selection_add_inner_btn)
         self.selection_combine_group.addButton(self.selection_transfer_btn)
         self.selection_combine_group.addButton(self.selection_ctd_btn)
         self.selection_add_btn.clicked.connect(lambda: self.set_selection_combine_mode('add'))
         self.selection_subtract_btn.clicked.connect(lambda: self.set_selection_combine_mode('subtract'))
         self.selection_intersect_btn.clicked.connect(lambda: self.set_selection_combine_mode('local_intersect'))
         self.selection_inner_btn.clicked.connect(lambda: self.set_selection_combine_mode('selection_inner'))
+        self.selection_add_inner_btn.clicked.connect(lambda: self.set_selection_combine_mode('add_selection_inner'))
         self.selection_transfer_btn.clicked.connect(lambda: self.set_selection_combine_mode('transfer_from_other'))
         self.selection_ctd_btn.clicked.connect(lambda: self.set_selection_combine_mode('ctd_detect_selection'))
         self.undo_btn = QPushButton('撤銷')
@@ -2372,6 +2393,7 @@ class MainWindow(QMainWindow):
         selection_combine_layout.addWidget(self.selection_subtract_btn)
         selection_combine_layout.addWidget(self.selection_intersect_btn)
         selection_combine_layout.addWidget(self.selection_inner_btn)
+        selection_combine_layout.addWidget(self.selection_add_inner_btn)
         selection_combine_layout.addWidget(self.selection_transfer_btn)
         selection_combine_layout.addWidget(self.selection_ctd_btn)
         edit_toolbar.addWidget(self.selection_combine_controls)
@@ -2456,10 +2478,6 @@ class MainWindow(QMainWindow):
         self.other_mask_expand_spinbox.setToolTip('只影響右側淡紫色預覽，不改變輸出的 OTHER_CHANNEL')
         self.other_mask_expand_spinbox.valueChanged.connect(self.on_other_mask_preview_expand_changed)
         view_options.addWidget(self.other_mask_expand_spinbox)
-        self.export_colored_btn = QPushButton('導出右圖')
-        self.export_colored_btn.setToolTip('導出右側去字預覽與 other_mask 紫色標記；不包含淡紫色擴展外圈')
-        self.export_colored_btn.clicked.connect(self.export_colored_preview)
-        view_options.addWidget(self.export_colored_btn)
         view_options.addSpacing(12)
         fit_btn = QPushButton('F4')
         fit_btn.setToolTip('兩張圖同時適應窗口')
@@ -2514,6 +2532,7 @@ class MainWindow(QMainWindow):
             self.selection_subtract_btn,
             self.selection_intersect_btn,
             self.selection_inner_btn,
+            self.selection_add_inner_btn,
             self.selection_transfer_btn,
             self.selection_ctd_btn,
             self.undo_btn,
@@ -3536,6 +3555,7 @@ class MainWindow(QMainWindow):
         self.selection_subtract_btn.setChecked(mode == 'subtract')
         self.selection_intersect_btn.setChecked(mode == 'local_intersect')
         self.selection_inner_btn.setChecked(mode == 'selection_inner')
+        self.selection_add_inner_btn.setChecked(mode == 'add_selection_inner')
         self.selection_transfer_btn.setChecked(mode == 'transfer_from_other')
         self.selection_ctd_btn.setChecked(mode == 'ctd_detect_selection')
         self.update_selection_combine_controls_visibility()
@@ -3546,7 +3566,7 @@ class MainWindow(QMainWindow):
         if tool == 'brush':
             return mode in ('add', 'subtract')
         if tool == 'rect':
-            return mode != 'selection_inner'
+            return mode not in ('selection_inner', 'add_selection_inner')
         if tool == 'magic':
             return mode in SELECTION_COMBINE_LABELS
         return False
@@ -3560,6 +3580,7 @@ class MainWindow(QMainWindow):
         self.selection_subtract_btn.setVisible(tool in ('rect', 'magic', 'brush'))
         self.selection_intersect_btn.setVisible(rect_or_magic)
         self.selection_inner_btn.setVisible(tool == 'magic')
+        self.selection_add_inner_btn.setVisible(tool == 'magic')
         self.selection_transfer_btn.setVisible(rect_or_magic)
         self.selection_ctd_btn.setVisible(rect_or_magic)
 
@@ -4133,10 +4154,11 @@ class MainWindow(QMainWindow):
             '筆刷左鍵：按「添加 / 減去」處理目前 mask\n'
             '右鍵拖拽：不分工具，矩形清除自動 / 強制純色 / 需要修改 mask\n'
             '筆刷 Shift + 按下拖到鬆開：連接按下和鬆開位置\n'
-            '矩形 / 魔法棒左鍵：按「添加 / 減去 / 局部交集 / 選區內部 / 從其他轉入 / 添加CTD檢測選區」處理目前 mask\n'
+            '矩形 / 魔法棒左鍵：按「添加 / 減去 / 局部交集 / 選區內部 / 添加＋內部 / 從其他轉入 / 添加CTD檢測選區」處理目前 mask\n'
             '局部交集：只裁切本次選區碰到的既有 mask 區塊\n'
             '交集偏移：局部交集結果正數擴展，負數收縮，0 保持原大小\n'
             '選區內部：魔法棒專用，提取本次選區包圍住的內部孔洞\n'
+            '添加＋內部：魔法棒專用，同時添加本次選區和其內部孔洞\n'
             '從其他轉入：把選區內其他 mask 的重疊部分移到目前 mask\n'
             '添加CTD檢測選區：只對本次選區跑 CTD，將檢測結果添加到目前 mask\n'
             '魔法棒：點擊相近的連續區域\n'
