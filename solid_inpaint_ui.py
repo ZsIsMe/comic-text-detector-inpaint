@@ -67,6 +67,7 @@ from detect_solid_inpaint_folder import (
     _output_path,
     _save_background_sample_cache,
     _write_preview_pdf,
+    add_detection_to_mask,
     build_report,
     create_detector,
     DEFAULT_DETECTOR,
@@ -1115,6 +1116,7 @@ class FolderWorker(QObject):
         imported_mask_mode: str = '',
         detector_name: str = DEFAULT_DETECTOR,
         detector_params: dict | None = None,
+        target_mode: str = 'mask',
     ) -> None:
         super().__init__()
         self.folder = folder
@@ -1124,6 +1126,7 @@ class FolderWorker(QObject):
         self.imported_mask_mode = imported_mask_mode
         self.detector_name = detector_name
         self.detector_params = dict(detector_params or {})
+        self.target_mode = target_mode
 
     def run(self) -> None:
         try:
@@ -1131,7 +1134,7 @@ class FolderWorker(QObject):
             imglist = self.image_paths or image_files_in_folder(self.folder)
             detector = (
                 create_detector(self.detector_name, self.detector_params)
-                if self.mode == 'detect'
+                if self.mode in ('detect', 'add_detection')
                 else None
             )
             existing = load_report(paths)
@@ -1143,6 +1146,13 @@ class FolderWorker(QObject):
                 try:
                     if self.mode == 'detect':
                         pages[name] = process_image_with_detector(img_path, paths, detector)
+                    elif self.mode == 'add_detection':
+                        pages[name] = add_detection_to_mask(
+                            img_path,
+                            paths,
+                            detector,
+                            self.target_mode,
+                        )
                     elif self.mode == 'imported_mask':
                         pages[name] = regenerate_image_from_imported_mask(
                             img_path,
@@ -1156,11 +1166,13 @@ class FolderWorker(QObject):
                     pages[name] = {'error': str(exc)}
             report_detector = (
                 self.detector_name
-                if self.mode == 'detect'
+                if self.mode in ('detect', 'add_detection')
                 else existing.get('detector', DEFAULT_DETECTOR)
             )
             report_device = (
-                getattr(detector, 'device', 'cpu') if self.mode == 'detect' else 'cpu'
+                getattr(detector, 'device', 'cpu')
+                if self.mode in ('detect', 'add_detection')
+                else 'cpu'
             )
             report = build_report(
                 self.folder,
@@ -1381,25 +1393,17 @@ class ColoredExportDialog(QDialog):
         return self.alpha_slider.value() / 100.0
 
 
-class DetectorSelectionDialog(QDialog):
-    """Choose which text detector is used by the destructive batch action."""
+class DetectorSelectorWidget(QWidget):
+    """Detector 選擇與設定面板，供「偵測並生成」與「添加偵測」共用。"""
 
     def __init__(self, settings: QSettings, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.settings = settings
-        self.setWindowTitle('選擇文字偵測模型')
         self.setMinimumWidth(500)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 18, 20, 16)
         layout.setSpacing(12)
-
-        title = QLabel('偵測並生成')
-        title_font = title.font()
-        title_font.setBold(True)
-        title_font.setPointSize(title_font.pointSize() + 2)
-        title.setFont(title_font)
-        layout.addWidget(title)
 
         description = QLabel('選擇這次要使用的文字偵測模型。CTBD 與 RF-DETR 可在執行前調整 Mask 設定。')
         description.setWordWrap(True)
@@ -1561,15 +1565,6 @@ class DetectorSelectionDialog(QDialog):
         self.buttons[DETECTOR_RFDETR].toggled.connect(self.rfdetr_config_frame.setVisible)
         self.rfdetr_config_frame.setVisible(self.buttons[DETECTOR_RFDETR].isChecked())
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText('開始偵測')
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('取消')
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
     def selected_detector(self) -> str:
         for detector_name, button in self.buttons.items():
             if button.isChecked():
@@ -1600,6 +1595,146 @@ class DetectorSelectionDialog(QDialog):
             for key, value in params.items():
                 self.settings.setValue(f'detector/{detector_name}/{key}', value)
         self.settings.sync()
+
+
+class DetectorSelectionDialog(QDialog):
+    """選擇 detector 並重新偵測生成（覆蓋式）。"""
+
+    def __init__(self, settings: QSettings, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle('偵測並生成')
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        title = QLabel('偵測並生成')
+        title_font = title.font()
+        title_font.setBold(True)
+        title_font.setPointSize(title_font.pointSize() + 2)
+        title.setFont(title_font)
+        title.setContentsMargins(20, 18, 20, 0)
+        layout.addWidget(title)
+
+        self.selector = DetectorSelectorWidget(settings, self)
+        self.buttons = self.selector.buttons
+        self.ctbd_config_frame = self.selector.ctbd_config_frame
+        self.rfdetr_config_frame = self.selector.rfdetr_config_frame
+        layout.addWidget(self.selector)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText('開始偵測')
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('取消')
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_detector(self) -> str:
+        return self.selector.selected_detector()
+
+    def selected_detector_params(self) -> dict:
+        return self.selector.selected_detector_params()
+
+    def save_settings(self) -> None:
+        self.selector.save_settings()
+
+
+class AddDetectionDialog(QDialog):
+    """添加偵測：選 detector + 加入層 + 範圍，不覆蓋既有 mask。"""
+
+    def __init__(self, settings: QSettings, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle('添加偵測')
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        title = QLabel('添加偵測')
+        title_font = title.font()
+        title_font.setBold(True)
+        title_font.setPointSize(title_font.pointSize() + 2)
+        title.setFont(title_font)
+        title.setContentsMargins(20, 18, 20, 0)
+        layout.addWidget(title)
+
+        self.selector = DetectorSelectorWidget(settings, self)
+        self.buttons = self.selector.buttons
+        layout.addWidget(self.selector)
+
+        add_frame = QFrame()
+        add_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        add_layout = QVBoxLayout(add_frame)
+        add_layout.setContentsMargins(14, 12, 14, 12)
+        add_layout.setSpacing(10)
+
+        add_title = QLabel('添加設定')
+        add_title_font = add_title.font()
+        add_title_font.setBold(True)
+        add_title.setFont(add_title_font)
+        add_layout.addWidget(add_title)
+
+        hint = QLabel('新偵測到的文字區域會「加入」所選層，不會覆蓋該層或其他層既有的內容。')
+        hint.setWordWrap(True)
+        hint.setProperty('secondary', True)
+        add_layout.addWidget(hint)
+
+        add_layout.addWidget(QLabel('加入的層'))
+        self.target_group = QButtonGroup(self)
+        self.target_buttons: dict[str, QRadioButton] = {}
+        target_layout = QHBoxLayout()
+        for mode, label in EDIT_MODE_LABELS.items():
+            button = QRadioButton(label)
+            button.setChecked(mode == 'mask')
+            self.target_group.addButton(button)
+            self.target_buttons[mode] = button
+            target_layout.addWidget(button)
+        target_layout.addStretch()
+        add_layout.addLayout(target_layout)
+
+        add_layout.addWidget(QLabel('作用範圍'))
+        self.scope_group = QButtonGroup(self)
+        self.scope_buttons: dict[str, QRadioButton] = {}
+        scope_layout = QHBoxLayout()
+        for scope, label in (('current', '當前頁'), ('all', '全部頁面')):
+            button = QRadioButton(label)
+            button.setChecked(scope == 'current')
+            self.scope_group.addButton(button)
+            self.scope_buttons[scope] = button
+            scope_layout.addWidget(button)
+        scope_layout.addStretch()
+        add_layout.addLayout(scope_layout)
+        layout.addWidget(add_frame)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText('開始添加')
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('取消')
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_detector(self) -> str:
+        return self.selector.selected_detector()
+
+    def selected_detector_params(self) -> dict:
+        return self.selector.selected_detector_params()
+
+    def save_settings(self) -> None:
+        self.selector.save_settings()
+
+    def selected_target_mode(self) -> str:
+        for mode, button in self.target_buttons.items():
+            if button.isChecked():
+                return mode
+        return 'mask'
+
+    def selected_scope(self) -> str:
+        for scope, button in self.scope_buttons.items():
+            if button.isChecked():
+                return scope
+        return 'current'
 
 
 class BackgroundSampleWorker(QObject):
@@ -2073,6 +2208,15 @@ class MainWindow(QMainWindow):
         self.detect_button.setProperty('primary', True)
         self.detect_button.clicked.connect(self.run_or_load)
         toolbar.addWidget(self.detect_button)
+
+        self.add_detect_button = QToolButton()
+        self.add_detect_button.setText('添加偵測')
+        self.add_detect_button.setToolTip(
+            '在不覆蓋現有 mask 的狀況下，把新偵測到的文字區域加入所選層'
+            '（自動 / 強制純色 / 需要修改），可選當前頁或全部頁面。'
+        )
+        self.add_detect_button.clicked.connect(self.run_add_detection)
+        toolbar.addWidget(self.add_detect_button)
 
         self.imported_mask_button = QToolButton()
         self.imported_mask_button.setText('使用傳入 Mask 運行')
@@ -2754,6 +2898,52 @@ class MainWindow(QMainWindow):
             detector_params=detector_params,
         )
 
+    def run_add_detection(self) -> None:
+        if not self.folder:
+            self.choose_folder()
+            if not self.folder:
+                return
+        if not self.imglist:
+            QMessageBox.information(self, '沒有圖片', '當前文件夾內沒有可處理的圖片。')
+            return
+        if self.worker_thread is not None:
+            QMessageBox.information(self, '正在執行', '已有任務在執行中。')
+            return
+        if self.page_worker_thread is not None or self.render_timer.isActive():
+            QMessageBox.information(self, '正在生成預覽', '請等待當前頁預覽生成完成後再添加偵測。')
+            return
+
+        dialog = AddDetectionDialog(self.settings, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        detector_name = dialog.selected_detector()
+        detector_params = dialog.selected_detector_params()
+        target_mode = dialog.selected_target_mode()
+        scope = dialog.selected_scope()
+        dialog.save_settings()
+
+        detector_label = DETECTOR_LABELS.get(detector_name, detector_name)
+        mode_label = EDIT_MODE_LABELS.get(target_mode, target_mode)
+        if scope == 'current':
+            if not self.current_img_path:
+                QMessageBox.information(self, '沒有當前頁', '請先在左側選擇要處理的頁面。')
+                return
+            image_paths = [self.current_img_path]
+            scope_label = '當前頁'
+        else:
+            image_paths = self.imglist
+            scope_label = '全部頁面'
+        self.status.showMessage(
+            f'添加偵測：{detector_label} → {mode_label}（{scope_label}，{len(image_paths)} 頁）...'
+        )
+        self.start_worker(
+            'add_detection',
+            image_paths,
+            detector_name=detector_name,
+            detector_params=detector_params,
+            target_mode=target_mode,
+        )
+
     def run_with_imported_masks(self, mode: str) -> None:
         if not self.folder:
             self.choose_folder()
@@ -2857,6 +3047,7 @@ class MainWindow(QMainWindow):
         imported_mask_mode: str = '',
         detector_name: str = DEFAULT_DETECTOR,
         detector_params: dict | None = None,
+        target_mode: str = 'mask',
     ) -> None:
         if self.worker_thread is not None:
             QMessageBox.information(self, '正在執行', '已有任務在執行中。')
@@ -2874,6 +3065,7 @@ class MainWindow(QMainWindow):
             imported_mask_mode,
             detector_name,
             detector_params,
+            target_mode,
         )
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
@@ -3976,6 +4168,7 @@ class MainWindow(QMainWindow):
             'Ctrl+Z：撤銷\n'
             'Ctrl+Shift+Z：重做\n\n'
             '注意：綠色「偵測並生成」會重新跑 detector，可能覆蓋已有 mask。\n'
+            '「添加偵測」不會覆蓋，只把新偵測到的區域加入所選層（自動 / 強制純色 / 需要修改）。\n'
             '「使用傳入 Mask 運行」提供兩種方式：\n'
             '「取代目前 Mask」會選擇傳入 Mask 文件夾，用同名 PNG 覆蓋目前 mask 後重生成輸出。\n'
             '「取兩者交集」會選擇傳入 Mask 文件夾，用同名 PNG 與目前 mask 取交集後重生成輸出。',

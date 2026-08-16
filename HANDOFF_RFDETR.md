@@ -122,7 +122,11 @@ detections = model.predict(
   CLI `--detector rfdetr`
 - `solid_inpaint_ui.py`：偵測模型選擇對話框新增「RF-DETR」選項與設定面板
   （運算裝置、Mask 膨脹尺寸、塗白範圍），設定持久化於 `detector/rfdetr/*`；批次 worker
-  把實際裝置寫入 report
+  把實際裝置寫入 report；另新增「添加偵測」按鈕與 `AddDetectionDialog`（選 detector +
+  加入層 自動/強制純色/需要修改 + 範圍 當前頁/全部頁面），與 `FolderWorker` 的
+  `add_detection` 模式；detector 選擇面板重構為共用的 `DetectorSelectorWidget`
+- `detect_solid_inpaint_folder.py`：新增 `add_detection_to_mask()`——偵測後與指定層
+  （`mask` / `manual_solid` / `manual_other`）做 union 合併，不覆蓋既有內容，再重新生成
 
 ## 建議下一步
 

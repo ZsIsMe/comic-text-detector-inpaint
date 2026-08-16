@@ -951,6 +951,56 @@ def process_image_with_detector(
     return regenerate_image_from_mask(img_path, paths, mask_refined)
 
 
+ADD_DETECTION_TARGET_MODES = ('mask', 'manual_solid', 'manual_other')
+
+
+def add_detection_to_mask(
+    img_path: str,
+    paths: dict[str, str],
+    detector,
+    target_mode: str = 'mask',
+) -> dict:
+    """Run detector and union the new text mask into the chosen layer, then regenerate.
+
+    target_mode:
+        'mask'         -> merge into the auto text mask
+        'manual_solid' -> merge into the forced-solid layer
+        'manual_other' -> merge into the needs-editing (OTHER) layer
+
+    The chosen layer keeps its existing content (union, not replace); the other
+    layers are untouched. If no auto mask exists yet, an empty one is created so
+    the page can still be regenerated.
+    """
+    if target_mode not in ADD_DETECTION_TARGET_MODES:
+        raise ValueError(f'不支援的添加目標層：{target_mode}')
+    img = imread(img_path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise FileNotFoundError(f'無法讀取原圖：{img_path}')
+    detect_img = img[:, :, :3] if len(img.shape) == 3 else cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    height, width = detect_img.shape[:2]
+
+    _, mask_refined, _ = detector(
+        detect_img,
+        refine_mode=REFINEMASK_ANNOTATION,
+        keep_undetected_mask=True,
+    )
+    new_mask = np.where(mask_refined > 0, 255, 0).astype(np.uint8)
+
+    auto_mask_path = _mask_path(paths, img_path)
+    if not osp.isfile(auto_mask_path):
+        imwrite(auto_mask_path, np.zeros((height, width), dtype=np.uint8))
+
+    layer_path = {
+        'mask': auto_mask_path,
+        'manual_solid': _manual_solid_path(paths, img_path),
+        'manual_other': _manual_other_path(paths, img_path),
+    }[target_mode]
+    current = _read_optional_mask(layer_path, (height, width))
+    merged = np.logical_or(current > 0, new_mask > 0).astype(np.uint8) * 255
+    imwrite(layer_path, merged)
+    return regenerate_image_from_mask(img_path, paths)
+
+
 def regenerate_image_from_mask(
     img_path: str,
     paths: dict[str, str],
