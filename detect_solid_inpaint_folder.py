@@ -40,12 +40,20 @@ REPORT_JSON = 'solid_inpaint_report.json'
 PREVIEW_PDF = 'preview_report.pdf'
 MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'comictextdetector.pt'
 CTBD_MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'comic-text-and-bubble-detector.onnx'
+RF_DETR_MODEL_PATH = (
+    Path(__file__).resolve().parent
+    / 'models'
+    / 'koharu-layout-rfdetr-seg-2xl-1152'
+    / 'model.safetensors'
+)
 DETECTOR_CTBD = 'ctbd'
 DETECTOR_LEGACY_CTD = 'legacy_ctd'
+DETECTOR_RFDETR = 'rfdetr'
 DEFAULT_DETECTOR = DETECTOR_LEGACY_CTD
 DETECTOR_LABELS = {
     DETECTOR_CTBD: 'CTBD',
     DETECTOR_LEGACY_CTD: 'CTD',
+    DETECTOR_RFDETR: 'RF-DETR',
 }
 NATURAL_SORT_RE = re.compile(r'(\d+)')
 
@@ -900,6 +908,8 @@ def detector_model_path(detector_name: str) -> Path:
         return CTBD_MODEL_PATH
     if detector_name == DETECTOR_LEGACY_CTD:
         return MODEL_PATH
+    if detector_name == DETECTOR_RFDETR:
+        return RF_DETR_MODEL_PATH
     raise ValueError(f'不支援的 detector：{detector_name}')
 
 
@@ -912,6 +922,14 @@ def create_detector(
         raise FileNotFoundError(f'找不到模型檔：{model_path}')
     if detector_name == DETECTOR_CTBD:
         return ComicTextAndBubbleDetector(model_path, **(detector_params or {}))
+    if detector_name == DETECTOR_RFDETR:
+        try:
+            from rfdetr_detector import RfDetrSegDetector
+        except ImportError as exc:
+            raise RuntimeError(
+                'RF-DETR 需要 rfdetr 與相關依賴，請先完成依賴安裝（參考 HANDOFF_RFDETR.md）。'
+            ) from exc
+        return RfDetrSegDetector(model_path, **(detector_params or {}))
     return TextDetector(model_path=model_path, input_size=1024, device='cpu', act='leaky')
 
 
@@ -1031,6 +1049,8 @@ def build_report(
     imglist: list[str],
     pages: dict,
     detector_name: str = DEFAULT_DETECTOR,
+    *,
+    device: str = 'cpu',
 ) -> dict:
     summary = {
         'total': len(imglist),
@@ -1051,7 +1071,7 @@ def build_report(
         'detector': detector_name,
         'detector_label': DETECTOR_LABELS.get(detector_name, detector_name),
         'model': osp.abspath(str(detector_model_path(detector_name))),
-        'device': 'cpu',
+        'device': device,
         'pages': pages,
         'summary': summary,
     }
@@ -1094,6 +1114,7 @@ def run(img_dir: str, detector_name: str = DEFAULT_DETECTOR) -> int:
     print(f'圖片數量：{len(imglist)}')
 
     detector = create_detector(detector_name)
+    device = getattr(detector, 'device', 'cpu')
     pages = {}
 
     for img_path in tqdm(imglist, desc='solid inpaint'):
@@ -1103,7 +1124,7 @@ def run(img_dir: str, detector_name: str = DEFAULT_DETECTOR) -> int:
         except Exception as exc:
             pages[img_name] = {'error': str(exc)}
 
-    report = build_report(img_dir, paths, imglist, pages, detector_name)
+    report = build_report(img_dir, paths, imglist, pages, detector_name, device=device)
     report_path = write_report(paths, report)
     preview_pdf_path = _write_preview_pdf(imglist, paths, report)
 
@@ -1127,9 +1148,12 @@ def main() -> None:
     parser.add_argument('img_dir', help='輸入圖片資料夾路徑')
     parser.add_argument(
         '--detector',
-        choices=(DETECTOR_CTBD, DETECTOR_LEGACY_CTD),
+        choices=(DETECTOR_CTBD, DETECTOR_LEGACY_CTD, DETECTOR_RFDETR),
         default=DEFAULT_DETECTOR,
-        help='文字偵測模型；ctbd 使用 RT-DETR-V2 ONNX 模型，legacy_ctd 使用 CTD 模型。',
+        help=(
+            '文字偵測模型；ctbd 使用 RT-DETR-V2 ONNX 模型，'
+            'rfdetr 使用 RF-DETR 分割模型，legacy_ctd 使用 CTD 模型。'
+        ),
     )
     args = parser.parse_args()
     run(args.img_dir, args.detector)

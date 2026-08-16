@@ -73,6 +73,7 @@ from detect_solid_inpaint_folder import (
     DETECTOR_CTBD,
     DETECTOR_LABELS,
     DETECTOR_LEGACY_CTD,
+    DETECTOR_RFDETR,
     image_files_in_folder,
     iter_background_samples_from_mask,
     load_report,
@@ -1158,12 +1159,16 @@ class FolderWorker(QObject):
                 if self.mode == 'detect'
                 else existing.get('detector', DEFAULT_DETECTOR)
             )
+            report_device = (
+                getattr(detector, 'device', 'cpu') if self.mode == 'detect' else 'cpu'
+            )
             report = build_report(
                 self.folder,
                 paths,
                 image_files_in_folder(self.folder),
                 pages,
                 report_detector,
+                device=report_device,
             )
             write_report(paths, report)
             self.finished.emit(report)
@@ -1396,20 +1401,25 @@ class DetectorSelectionDialog(QDialog):
         title.setFont(title_font)
         layout.addWidget(title)
 
-        description = QLabel('選擇這次要使用的文字偵測模型。CTBD 可在執行前調整 Mask 設定。')
+        description = QLabel('選擇這次要使用的文字偵測模型。CTBD 與 RF-DETR 可在執行前調整 Mask 設定。')
         description.setWordWrap(True)
         layout.addWidget(description)
 
         self.group = QButtonGroup(self)
         self.buttons: dict[str, QRadioButton] = {}
         saved_detector = str(self.settings.value('detector/last_name', DETECTOR_CTBD))
-        if saved_detector not in {DETECTOR_CTBD, DETECTOR_LEGACY_CTD}:
+        if saved_detector not in {DETECTOR_CTBD, DETECTOR_LEGACY_CTD, DETECTOR_RFDETR}:
             saved_detector = DETECTOR_CTBD
         options = (
             (
                 DETECTOR_CTBD,
                 DETECTOR_LABELS[DETECTOR_CTBD],
                 'RT-DETR-V2 ONNX 模型；先偵測文字區域，再生成文字 Mask。',
+            ),
+            (
+                DETECTOR_RFDETR,
+                DETECTOR_LABELS[DETECTOR_RFDETR],
+                'RF-DETR 分割模型；直接輸出文字、狀聲詞、氣泡與分格的實例分割 Mask。',
             ),
             (
                 DETECTOR_LEGACY_CTD,
@@ -1490,8 +1500,66 @@ class DetectorSelectionDialog(QDialog):
         config_layout.setColumnStretch(1, 1)
         layout.addWidget(self.ctbd_config_frame)
 
-        self.buttons[DETECTOR_CTBD].toggled.connect(self.ctbd_config_frame.setEnabled)
-        self.ctbd_config_frame.setEnabled(self.buttons[DETECTOR_CTBD].isChecked())
+        self.rfdetr_config_frame = QFrame()
+        self.rfdetr_config_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        rfdetr_config_layout = QGridLayout(self.rfdetr_config_frame)
+        rfdetr_config_layout.setContentsMargins(14, 12, 14, 12)
+        rfdetr_config_layout.setHorizontalSpacing(14)
+        rfdetr_config_layout.setVerticalSpacing(10)
+
+        rfdetr_config_title = QLabel('RF-DETR 設定')
+        rfdetr_config_title_font = rfdetr_config_title.font()
+        rfdetr_config_title_font.setBold(True)
+        rfdetr_config_title.setFont(rfdetr_config_title_font)
+        rfdetr_config_layout.addWidget(rfdetr_config_title, 0, 0, 1, 2)
+
+        rfdetr_config_layout.addWidget(QLabel('運算裝置'), 1, 0)
+        self.rfdetr_device_combo = QComboBox()
+        self.rfdetr_device_combo.addItem('自動 (MPS)', 'auto')
+        self.rfdetr_device_combo.addItem('MPS (Apple Silicon)', 'mps')
+        self.rfdetr_device_combo.addItem('CPU', 'cpu')
+        self.rfdetr_device_combo.setToolTip('自動會在有 Metal 支援時優先使用 MPS。')
+        saved_rfdetr_device = str(self.settings.value('detector/rfdetr/device', 'auto'))
+        rfdetr_device_index = self.rfdetr_device_combo.findData(saved_rfdetr_device)
+        self.rfdetr_device_combo.setCurrentIndex(max(0, rfdetr_device_index))
+        rfdetr_config_layout.addWidget(self.rfdetr_device_combo, 1, 1)
+
+        rfdetr_config_layout.addWidget(QLabel('Mask 膨脹尺寸'), 2, 0)
+        self.rfdetr_dilate_spin = QSpinBox()
+        self.rfdetr_dilate_spin.setRange(0, 64)
+        self.rfdetr_dilate_spin.setSuffix(' px')
+        self.rfdetr_dilate_spin.setToolTip('對文字 Mask 進行膨脹，用來連接文字碎片。')
+        try:
+            saved_rfdetr_dilate = int(
+                self.settings.value('detector/rfdetr/inpaint_mask_dilate', 2)
+            )
+        except (TypeError, ValueError):
+            saved_rfdetr_dilate = 2
+        self.rfdetr_dilate_spin.setValue(max(0, min(64, saved_rfdetr_dilate)))
+        rfdetr_config_layout.addWidget(self.rfdetr_dilate_spin, 2, 1)
+
+        rfdetr_config_layout.addWidget(QLabel('塗白範圍'), 3, 0)
+        self.rfdetr_mask_mode_combo = QComboBox()
+        self.rfdetr_mask_mode_combo.addItem('文字 + 狀聲詞', 'text_onomatopoeia')
+        self.rfdetr_mask_mode_combo.addItem('僅文字', 'text')
+        self.rfdetr_mask_mode_combo.addItem('僅狀聲詞', 'onomatopoeia')
+        self.rfdetr_mask_mode_combo.addItem('全部四類（含氣泡、分格）', 'all')
+        self.rfdetr_mask_mode_combo.setToolTip(
+            '決定哪些類別要塗白：氣泡與分格通常不應塗白，僅在需要完整清空頁面時使用。'
+        )
+        saved_rfdetr_mask_mode = str(
+            self.settings.value('detector/rfdetr/mask_mode', 'text_onomatopoeia')
+        )
+        rfdetr_mask_mode_index = self.rfdetr_mask_mode_combo.findData(saved_rfdetr_mask_mode)
+        self.rfdetr_mask_mode_combo.setCurrentIndex(max(0, rfdetr_mask_mode_index))
+        rfdetr_config_layout.addWidget(self.rfdetr_mask_mode_combo, 3, 1)
+        rfdetr_config_layout.setColumnStretch(1, 1)
+        layout.addWidget(self.rfdetr_config_frame)
+
+        self.buttons[DETECTOR_CTBD].toggled.connect(self.ctbd_config_frame.setVisible)
+        self.ctbd_config_frame.setVisible(self.buttons[DETECTOR_CTBD].isChecked())
+        self.buttons[DETECTOR_RFDETR].toggled.connect(self.rfdetr_config_frame.setVisible)
+        self.rfdetr_config_frame.setVisible(self.buttons[DETECTOR_RFDETR].isChecked())
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -1509,20 +1577,28 @@ class DetectorSelectionDialog(QDialog):
         return DETECTOR_CTBD
 
     def selected_detector_params(self) -> dict:
-        if self.selected_detector() != DETECTOR_CTBD:
-            return {}
-        return {
-            'inpaint_mask_dilate': self.dilate_spin.value(),
-            'mask_unification_method': self.unification_combo.currentData(),
-            'text_region_filter': self.region_filter_combo.currentData(),
-        }
+        selected = self.selected_detector()
+        if selected == DETECTOR_CTBD:
+            return {
+                'inpaint_mask_dilate': self.dilate_spin.value(),
+                'mask_unification_method': self.unification_combo.currentData(),
+                'text_region_filter': self.region_filter_combo.currentData(),
+            }
+        if selected == DETECTOR_RFDETR:
+            return {
+                'device': self.rfdetr_device_combo.currentData(),
+                'inpaint_mask_dilate': self.rfdetr_dilate_spin.value(),
+                'mask_mode': self.rfdetr_mask_mode_combo.currentData(),
+            }
+        return {}
 
     def save_settings(self) -> None:
-        self.settings.setValue('detector/last_name', self.selected_detector())
+        detector_name = self.selected_detector()
+        self.settings.setValue('detector/last_name', detector_name)
         params = self.selected_detector_params()
         if params:
             for key, value in params.items():
-                self.settings.setValue(f'detector/ctbd/{key}', value)
+                self.settings.setValue(f'detector/{detector_name}/{key}', value)
         self.settings.sync()
 
 
