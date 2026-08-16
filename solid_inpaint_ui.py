@@ -95,8 +95,8 @@ MAX_UNDO_STEPS = 30
 DEFAULT_MASK_ALPHA_PERCENT = 80
 DEFAULT_OTHER_MASK_PREVIEW_EXPAND_PX = 5
 MAX_OTHER_MASK_PREVIEW_EXPAND_PX = 80
-OTHER_MASK_DISPLAY_ALPHA = 0.38
-OTHER_MASK_PREVIEW_RING_ALPHA = 0.16
+DEFAULT_OTHER_MASK_DISPLAY_ALPHA = 0.38
+OTHER_MASK_PREVIEW_RING_ALPHA_RATIO = 0.16 / DEFAULT_OTHER_MASK_DISPLAY_ALPHA
 DEFAULT_BRUSH_RADIUS = 24
 MIN_BRUSH_RADIUS = 2
 MAX_BRUSH_RADIUS = 160
@@ -1294,11 +1294,16 @@ class ConvertMasksDialog(QDialog):
 
 
 class ColoredExportDialog(QDialog):
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        default_color_bgr: tuple[int, int, int],
+        default_alpha: float,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle('導出右圖')
         self.setMinimumWidth(360)
-        self.color = QColor(255, 110, 165)
+        self.color = QColor(default_color_bgr[2], default_color_bgr[1], default_color_bgr[0])
 
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
@@ -1323,11 +1328,16 @@ class ColoredExportDialog(QDialog):
         color_layout.addWidget(self.color_button)
         color_layout.addSpacing(12)
         color_layout.addWidget(QLabel('透明度'))
-        self.alpha_spinbox = QSpinBox()
-        self.alpha_spinbox.setRange(0, 100)
-        self.alpha_spinbox.setValue(round(OTHER_MASK_DISPLAY_ALPHA * 100))
-        self.alpha_spinbox.setSuffix('%')
-        color_layout.addWidget(self.alpha_spinbox)
+        self.alpha_slider = QSlider(Qt.Orientation.Horizontal)
+        self.alpha_slider.setRange(0, 100)
+        self.alpha_slider.setValue(round(default_alpha * 100))
+        self.alpha_slider.setFixedWidth(130)
+        self.alpha_label = QLabel(f'{self.alpha_slider.value()}%')
+        self.alpha_slider.valueChanged.connect(
+            lambda value: self.alpha_label.setText(f'{value}%')
+        )
+        color_layout.addWidget(self.alpha_slider)
+        color_layout.addWidget(self.alpha_label)
         color_layout.addStretch()
         layout.addLayout(color_layout)
 
@@ -1363,7 +1373,7 @@ class ColoredExportDialog(QDialog):
         return (self.color.blue(), self.color.green(), self.color.red())
 
     def selected_alpha(self) -> float:
-        return self.alpha_spinbox.value() / 100.0
+        return self.alpha_slider.value() / 100.0
 
 
 class DetectorSelectionDialog(QDialog):
@@ -1824,9 +1834,12 @@ class MainWindow(QMainWindow):
         self.settings = QSettings('ComicTextDetector', 'SolidInpaintUI')
         self.mask_alpha_percent = self._load_mask_alpha_percent()
         self.other_mask_preview_expand_px = self._load_other_mask_preview_expand_px()
+        self.other_mask_display_color = self._load_other_mask_display_color()
+        self.other_mask_display_alpha_percent = self._load_other_mask_display_alpha_percent()
         self.navigator_visible = self._load_navigator_visible()
         self.navigator_position = self._load_navigator_position()
         self.alpha = self.mask_alpha_percent / 100.0
+        self.other_mask_display_alpha = self.other_mask_display_alpha_percent / 100.0
         self.mask_display_color = MASK_DISPLAY_COLORS['白色']
         self.show_other_mask = True
         self.show_background_sample = True
@@ -2200,6 +2213,21 @@ class MainWindow(QMainWindow):
         self.other_mask_checkbox.stateChanged.connect(self.on_show_other_mask_changed)
         view_options.addWidget(self.other_mask_checkbox)
         view_options.addSpacing(8)
+        view_options.addWidget(QLabel('標記顏色'))
+        self.other_mask_color_button = QPushButton()
+        self.other_mask_color_button.clicked.connect(self.choose_other_mask_display_color)
+        self.update_other_mask_color_button()
+        view_options.addWidget(self.other_mask_color_button)
+        view_options.addWidget(QLabel('透明度'))
+        self.other_mask_alpha_slider = QSlider(Qt.Orientation.Horizontal)
+        self.other_mask_alpha_slider.setRange(0, 100)
+        self.other_mask_alpha_slider.setValue(self.other_mask_display_alpha_percent)
+        self.other_mask_alpha_slider.setFixedWidth(110)
+        self.other_mask_alpha_slider.valueChanged.connect(self.on_other_mask_display_alpha_changed)
+        self.other_mask_alpha_label = QLabel(f'{self.other_mask_display_alpha_percent}%')
+        view_options.addWidget(self.other_mask_alpha_slider)
+        view_options.addWidget(self.other_mask_alpha_label)
+        view_options.addSpacing(8)
         view_options.addWidget(QLabel('PS 擴展預覽'))
         self.other_mask_expand_spinbox = QSpinBox()
         self.other_mask_expand_spinbox.setRange(0, MAX_OTHER_MASK_PREVIEW_EXPAND_PX)
@@ -2272,6 +2300,7 @@ class MainWindow(QMainWindow):
             self.redo_btn,
             self.brush_down_btn,
             self.brush_up_btn,
+            self.other_mask_color_button,
             self.export_colored_btn,
             fit_btn,
         ):
@@ -2385,6 +2414,34 @@ class MainWindow(QMainWindow):
 
     def save_mask_alpha_percent(self) -> None:
         self.settings.setValue('mask_alpha_percent', self.mask_alpha_percent)
+
+    def _load_other_mask_display_color(self) -> tuple[int, int, int]:
+        color = QColor(str(self.settings.value('other_mask_display_color', '#FF6EA5')))
+        if not color.isValid():
+            color = QColor(255, 110, 165)
+        return (color.blue(), color.green(), color.red())
+
+    def save_other_mask_display_color(self) -> None:
+        color = QColor(
+            self.other_mask_display_color[2],
+            self.other_mask_display_color[1],
+            self.other_mask_display_color[0],
+        )
+        self.settings.setValue('other_mask_display_color', color.name())
+
+    def _load_other_mask_display_alpha_percent(self) -> int:
+        value = self.settings.value(
+            'other_mask_display_alpha_percent',
+            round(DEFAULT_OTHER_MASK_DISPLAY_ALPHA * 100),
+        )
+        try:
+            percent = int(value)
+        except (TypeError, ValueError):
+            percent = round(DEFAULT_OTHER_MASK_DISPLAY_ALPHA * 100)
+        return max(0, min(100, percent))
+
+    def save_other_mask_display_alpha_percent(self) -> None:
+        self.settings.setValue('other_mask_display_alpha_percent', self.other_mask_display_alpha_percent)
 
     def _load_other_mask_preview_expand_px(self) -> int:
         value = self.settings.value('other_mask_preview_expand_px', DEFAULT_OTHER_MASK_PREVIEW_EXPAND_PX)
@@ -2922,14 +2979,14 @@ class MainWindow(QMainWindow):
         preview = _overlay_mask_on_bgr(
             preview,
             ring,
-            OTHER_MASK_PREVIEW_RING_ALPHA,
-            EDIT_MODE_COLORS['manual_other'],
+            self.other_mask_display_alpha * OTHER_MASK_PREVIEW_RING_ALPHA_RATIO,
+            self.other_mask_display_color,
         )
         return _overlay_mask_on_bgr(
             preview,
             other_mask,
-            OTHER_MASK_DISPLAY_ALPHA,
-            EDIT_MODE_COLORS['manual_other'],
+            self.other_mask_display_alpha,
+            self.other_mask_display_color,
         )
 
     def export_colored_preview(self) -> None:
@@ -2937,7 +2994,11 @@ class MainWindow(QMainWindow):
             self.status.showMessage('請先選擇並載入一張圖片。')
             return
 
-        dialog = ColoredExportDialog(self)
+        dialog = ColoredExportDialog(
+            self.other_mask_display_color,
+            self.other_mask_display_alpha,
+            self,
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         img_paths = self.imglist if dialog.selected_scope() == 'all' else [self.current_img_path]
@@ -3065,6 +3126,39 @@ class MainWindow(QMainWindow):
     def on_show_other_mask_changed(self, state: int) -> None:
         self.show_other_mask = state == Qt.CheckState.Checked.value
         self.reload_current()
+
+    def choose_other_mask_display_color(self) -> None:
+        current = QColor(
+            self.other_mask_display_color[2],
+            self.other_mask_display_color[1],
+            self.other_mask_display_color[0],
+        )
+        color = QColorDialog.getColor(current, self, '選擇 other_mask 預覽顏色')
+        if not color.isValid():
+            return
+        self.other_mask_display_color = (color.blue(), color.green(), color.red())
+        self.save_other_mask_display_color()
+        self.update_other_mask_color_button()
+        self.reload_current(keep_view=True)
+
+    def update_other_mask_color_button(self) -> None:
+        color = QColor(
+            self.other_mask_display_color[2],
+            self.other_mask_display_color[1],
+            self.other_mask_display_color[0],
+        )
+        text_color = '#10161a' if color.lightness() > 140 else '#f4f7fa'
+        self.other_mask_color_button.setText(color.name().upper())
+        self.other_mask_color_button.setStyleSheet(
+            f'background: {color.name()}; color: {text_color};'
+        )
+
+    def on_other_mask_display_alpha_changed(self, value: int) -> None:
+        self.other_mask_display_alpha_percent = max(0, min(100, int(value)))
+        self.other_mask_display_alpha = self.other_mask_display_alpha_percent / 100.0
+        self.other_mask_alpha_label.setText(f'{self.other_mask_display_alpha_percent}%')
+        self.save_other_mask_display_alpha_percent()
+        self.reload_current(keep_view=True)
 
     def on_other_mask_preview_expand_changed(self, value: int) -> None:
         self.other_mask_preview_expand_px = max(0, min(MAX_OTHER_MASK_PREVIEW_EXPAND_PX, int(value)))
