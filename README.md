@@ -115,6 +115,8 @@ Mask / 原圖疊加預覽
 自動重新生成當前頁預覽
 Inpainted 合成預覽
 可顯示 other_mask
+導出右圖
+導出待精修 ZIP
 打開輸出資料夾
 生成 PDF 預覽
 打開 PDF 預覽
@@ -125,6 +127,8 @@ Inpainted 合成預覽
 「使用傳入 Mask 運行」提供兩種方式。「取代目前 Mask」會讓你選擇傳入 Mask 文件夾；若裡面存在同名 PNG，會覆蓋 `ctd_inpainted/mask/<name>.png`，再重新運行。缺少同名 PNG 的頁面會保留原 mask。
 
 「取兩者交集」會讓你選擇傳入 Mask 文件夾。若裡面存在同名 PNG，會用 `目前 mask ∩ 傳入 mask` 覆蓋目前 mask，然後重新生成 `other_mask`、`inpainted` 和 `solid_inpaint_report.json`；缺少同名 PNG 的頁面會保留原 mask。
+
+「導出待精修」會導出全部頁面的 ZIP。壓縮包根目錄是原圖與 `inpainted` 的去字合成 PNG，`other_mask/` 放同名 mask，`colored/` 放與「導出右圖」一致的標記預覽。
 
 快捷鍵：
 
