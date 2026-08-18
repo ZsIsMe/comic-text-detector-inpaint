@@ -107,6 +107,9 @@ MAX_BRUSH_RADIUS = 160
 DEFAULT_MAGIC_TOLERANCE = 28
 MIN_MAGIC_TOLERANCE = 0
 MAX_MAGIC_TOLERANCE = 100
+DEFAULT_MAGIC_EXPAND_PX = 0
+MIN_MAGIC_EXPAND_PX = 0
+MAX_MAGIC_EXPAND_PX = 80
 DEFAULT_LOCAL_INTERSECT_OFFSET_PX = 0
 MIN_LOCAL_INTERSECT_OFFSET_PX = -80
 MAX_LOCAL_INTERSECT_OFFSET_PX = 80
@@ -582,6 +585,7 @@ class MaskEditorView(ImageView):
         self.selection_combine_mode = 'add'
         self.brush_radius = DEFAULT_BRUSH_RADIUS
         self.magic_tolerance = DEFAULT_MAGIC_TOLERANCE
+        self.magic_expand_px = DEFAULT_MAGIC_EXPAND_PX
         self.local_intersect_offset_px = DEFAULT_LOCAL_INTERSECT_OFFSET_PX
         self.mask: np.ndarray | None = None
         self.source_bgr: np.ndarray | None = None
@@ -599,7 +603,7 @@ class MaskEditorView(ImageView):
         self._magic_preview_item: QGraphicsPixmapItem | None = None
         self._magic_preview_pending_point: tuple[int, int] | None = None
         self._magic_preview_point: tuple[int, int] | None = None
-        self._magic_preview_cache_key: tuple[int, int, int] | None = None
+        self._magic_preview_cache_key: tuple[int, int, int, int] | None = None
         self._magic_preview_has_content = False
         self._magic_preview_timer = QTimer(self)
         self._magic_preview_timer.setSingleShot(True)
@@ -672,6 +676,13 @@ class MaskEditorView(ImageView):
 
     def set_magic_tolerance(self, tolerance: int) -> None:
         self.magic_tolerance = max(MIN_MAGIC_TOLERANCE, min(MAX_MAGIC_TOLERANCE, int(tolerance)))
+        self._invalidate_magic_preview()
+
+    def set_magic_expand_px(self, expand_px: int) -> None:
+        self.magic_expand_px = max(
+            MIN_MAGIC_EXPAND_PX,
+            min(MAX_MAGIC_EXPAND_PX, int(expand_px)),
+        )
         self._invalidate_magic_preview()
 
     def set_local_intersect_offset(self, offset_px: int) -> None:
@@ -935,7 +946,38 @@ class MaskEditorView(ImageView):
             flags,
         )
         selection = flood_mask[1:height + 1, 1:width + 1] > 0
-        return selection if np.any(selection) else None
+        if not np.any(selection):
+            return None
+        return self._expand_magic_selection(selection)
+
+    def _expand_magic_selection(self, selection: np.ndarray) -> np.ndarray:
+        expand_px = int(self.magic_expand_px)
+        if expand_px <= 0 or np.all(selection):
+            return selection
+        ys, xs = np.where(selection)
+        height, width = selection.shape[:2]
+        x1 = max(0, int(xs.min()) - expand_px)
+        x2 = min(width - 1, int(xs.max()) + expand_px)
+        y1 = max(0, int(ys.min()) - expand_px)
+        y2 = min(height - 1, int(ys.max()) + expand_px)
+        roi = selection[y1:y2 + 1, x1:x2 + 1]
+        if expand_px <= 16:
+            kernel_size = expand_px * 2 + 1
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (kernel_size, kernel_size),
+            )
+            expanded_roi = cv2.dilate(roi.astype(np.uint8), kernel, iterations=1) > 0
+        else:
+            distance = cv2.distanceTransform(
+                (~roi).astype(np.uint8),
+                cv2.DIST_L2,
+                cv2.DIST_MASK_PRECISE,
+            )
+            expanded_roi = distance <= expand_px
+        expanded = selection.copy()
+        expanded[y1:y2 + 1, x1:x2 + 1] = expanded_roi
+        return expanded
 
     def _update_magic_preview(self, point: tuple[int, int] | None) -> None:
         if (
@@ -948,7 +990,12 @@ class MaskEditorView(ImageView):
             self._clear_magic_preview()
             return
         self._magic_preview_pending_point = point
-        key = (point[0], point[1], int(self.magic_tolerance))
+        key = (
+            point[0],
+            point[1],
+            int(self.magic_tolerance),
+            int(self.magic_expand_px),
+        )
         if key == self._magic_preview_cache_key:
             if self._magic_preview_item is not None:
                 self._magic_preview_item.setVisible(self._magic_preview_has_content)
@@ -962,7 +1009,12 @@ class MaskEditorView(ImageView):
             return
         selection = self._magic_selection_at(point)
         self._magic_preview_point = point
-        self._magic_preview_cache_key = (point[0], point[1], int(self.magic_tolerance))
+        self._magic_preview_cache_key = (
+            point[0],
+            point[1],
+            int(self.magic_tolerance),
+            int(self.magic_expand_px),
+        )
         if selection is None or self.mask is None:
             self._clear_magic_preview()
             return
@@ -2492,6 +2544,13 @@ class MainWindow(QMainWindow):
         self.magic_tolerance_slider.setValue(DEFAULT_MAGIC_TOLERANCE)
         self.magic_tolerance_slider.setFixedWidth(130)
         self.magic_tolerance_slider.valueChanged.connect(self.on_magic_tolerance_changed)
+        self.magic_expand_label = QLabel(f'擴展 {DEFAULT_MAGIC_EXPAND_PX}px')
+        self.magic_expand_slider = QSlider(Qt.Orientation.Horizontal)
+        self.magic_expand_slider.setRange(MIN_MAGIC_EXPAND_PX, MAX_MAGIC_EXPAND_PX)
+        self.magic_expand_slider.setValue(DEFAULT_MAGIC_EXPAND_PX)
+        self.magic_expand_slider.setFixedWidth(120)
+        self.magic_expand_slider.setToolTip('魔法棒完成顏色選取後，再將選區向外擴展指定像素')
+        self.magic_expand_slider.valueChanged.connect(self.on_magic_expand_changed)
         self.local_intersect_controls = QWidget()
         local_intersect_layout = QHBoxLayout(self.local_intersect_controls)
         local_intersect_layout.setContentsMargins(0, 0, 0, 0)
@@ -2541,6 +2600,9 @@ class MainWindow(QMainWindow):
         magic_controls_layout.setSpacing(8)
         magic_controls_layout.addWidget(self.magic_tolerance_label)
         magic_controls_layout.addWidget(self.magic_tolerance_slider)
+        magic_controls_layout.addSpacing(4)
+        magic_controls_layout.addWidget(self.magic_expand_label)
+        magic_controls_layout.addWidget(self.magic_expand_slider)
         edit_toolbar.addWidget(self.magic_controls)
         edit_toolbar.addSpacing(10)
         edit_toolbar.addWidget(self.undo_btn)
@@ -3871,6 +3933,10 @@ class MainWindow(QMainWindow):
     def on_magic_tolerance_changed(self, value: int) -> None:
         self.mask_view.set_magic_tolerance(value)
         self.magic_tolerance_label.setText(f'容差 {value}')
+
+    def on_magic_expand_changed(self, value: int) -> None:
+        self.mask_view.set_magic_expand_px(value)
+        self.magic_expand_label.setText(f'擴展 {value}px')
 
     def on_local_intersect_offset_changed(self, value: int) -> None:
         self.mask_view.set_local_intersect_offset(value)
