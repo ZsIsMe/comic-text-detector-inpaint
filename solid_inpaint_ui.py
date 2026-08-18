@@ -14,7 +14,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PySide6.QtCore import QObject, QPoint, QRectF, QSettings, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap
+from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -143,6 +143,11 @@ APP_VERSION = '0.2.0'
 APP_ICON_PATH = SCRIPT_DIR / 'icons' / 'tubai_icon_1024.png'
 SAMPLE_RING_DISPLAY_ALPHA = 0.28
 SAMPLE_RING_DISPLAY_COLOR_BGR = (70, 235, 255)
+MAGIC_PREVIEW_ALPHA = 122
+MAGIC_PREVIEW_DELAY_MS = 30
+MAGIC_PREVIEW_COLOR_BGR = (255, 217, 0)
+MAGIC_PREVIEW_SUBTRACT_COLOR_BGR = (109, 66, 255)
+MAGIC_PREVIEW_SPECIAL_COLOR_BGR = (59, 212, 255)
 
 
 def _qimage_from_bgr(img: np.ndarray) -> QImage:
@@ -323,29 +328,6 @@ def _overlay_transparent_mask_on_bgr(
         + color[active].astype(np.float32) * alpha
     ).astype(np.uint8)
     return output
-
-
-def _make_magic_cursor() -> QCursor:
-    pixmap = QPixmap(32, 32)
-    pixmap.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setPen(QPen(QColor(8, 12, 16, 210), 4))
-    painter.drawLine(8, 25, 21, 12)
-    painter.setPen(QPen(QColor('#e9fffb'), 2))
-    painter.drawLine(8, 25, 21, 12)
-    painter.setPen(QPen(QColor(8, 12, 16, 230), 3))
-    painter.drawLine(22, 4, 22, 9)
-    painter.drawLine(22, 15, 22, 20)
-    painter.drawLine(14, 12, 19, 12)
-    painter.drawLine(25, 12, 30, 12)
-    painter.setPen(QPen(QColor('#f7d95c'), 1))
-    painter.drawLine(22, 4, 22, 9)
-    painter.drawLine(22, 15, 22, 20)
-    painter.drawLine(14, 12, 19, 12)
-    painter.drawLine(25, 12, 30, 12)
-    painter.end()
-    return QCursor(pixmap, 22, 12)
 
 
 class ImageView(QGraphicsView):
@@ -614,8 +596,16 @@ class MaskEditorView(ImageView):
         self._pan_last_pos: QPoint | None = None
         self._rubber_band: RubberBandRectItem | None = None
         self._brush_cursor: QGraphicsEllipseItem | None = None
+        self._magic_preview_item: QGraphicsPixmapItem | None = None
+        self._magic_preview_pending_point: tuple[int, int] | None = None
+        self._magic_preview_point: tuple[int, int] | None = None
+        self._magic_preview_cache_key: tuple[int, int, int] | None = None
+        self._magic_preview_has_content = False
+        self._magic_preview_timer = QTimer(self)
+        self._magic_preview_timer.setSingleShot(True)
+        self._magic_preview_timer.setInterval(MAGIC_PREVIEW_DELAY_MS)
+        self._magic_preview_timer.timeout.connect(self._refresh_magic_preview)
         self._edit_started = False
-        self._magic_cursor = _make_magic_cursor()
         self._rect_pen_add = QPen(QColor('#e9fffb'), 2, Qt.PenStyle.DashLine)
         self._rect_pen_remove = QPen(QColor('#ff8f8f'), 2, Qt.PenStyle.DashLine)
         self._rect_pen_intersect = QPen(QColor('#ffd86f'), 2, Qt.PenStyle.DashLine)
@@ -641,6 +631,7 @@ class MaskEditorView(ImageView):
         reset_brush_line: bool = False,
     ) -> None:
         self.image_shape = shape
+        self._clear_magic_preview()
         if reset_brush_line:
             self._brush_line_start = None
             self._clear_brush_line_preview()
@@ -650,6 +641,7 @@ class MaskEditorView(ImageView):
             self.mask = np.where(mask > 0, 255, 0).astype(np.uint8)
 
     def set_source_image(self, image: np.ndarray | None) -> None:
+        self._clear_magic_preview()
         if image is None:
             self.source_bgr = None
             return
@@ -663,6 +655,8 @@ class MaskEditorView(ImageView):
             self._brush_line_start = None
             self._clear_brush_line_preview()
         self.tool = tool
+        if tool != 'magic':
+            self._clear_magic_preview()
         self._clear_rubber_band()
         self._update_brush_cursor_visibility()
         self._update_tool_cursor()
@@ -670,6 +664,7 @@ class MaskEditorView(ImageView):
     def set_selection_combine_mode(self, mode: str) -> None:
         if mode in SELECTION_COMBINE_LABELS:
             self.selection_combine_mode = mode
+            self._invalidate_magic_preview()
 
     def set_brush_radius(self, radius: int) -> None:
         self.brush_radius = max(MIN_BRUSH_RADIUS, min(MAX_BRUSH_RADIUS, int(radius)))
@@ -677,6 +672,7 @@ class MaskEditorView(ImageView):
 
     def set_magic_tolerance(self, tolerance: int) -> None:
         self.magic_tolerance = max(MIN_MAGIC_TOLERANCE, min(MAX_MAGIC_TOLERANCE, int(tolerance)))
+        self._invalidate_magic_preview()
 
     def set_local_intersect_offset(self, offset_px: int) -> None:
         self.local_intersect_offset_px = max(
@@ -703,6 +699,7 @@ class MaskEditorView(ImageView):
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton and self._is_pan_modifier(event.modifiers()):
+            self._clear_magic_preview()
             self._panning = True
             self._pan_last_pos = event.position().toPoint()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
@@ -727,6 +724,7 @@ class MaskEditorView(ImageView):
             event.accept()
             return
         if self.tool == 'magic':
+            self._clear_magic_preview()
             if self._apply_magic_wand(point, event.button()):
                 self._begin_edit_once()
                 if self.mask is not None:
@@ -766,6 +764,7 @@ class MaskEditorView(ImageView):
             return
         hover_point = self.image_point_from_view(event.position().toPoint())
         self._update_brush_cursor(hover_point)
+        self._update_magic_preview(hover_point)
         if self._active_button is None:
             event.accept()
             return
@@ -821,10 +820,12 @@ class MaskEditorView(ImageView):
         self._edit_started = False
         self._clear_brush_line_preview()
         self._clear_rubber_band()
+        self._clear_magic_preview()
         event.accept()
 
     def leaveEvent(self, event) -> None:
         self._update_brush_cursor(None)
+        self._clear_magic_preview()
         super().leaveEvent(event)
 
     def _is_pan_modifier(self, modifiers: Qt.KeyboardModifier) -> bool:
@@ -901,18 +902,29 @@ class MaskEditorView(ImageView):
     ) -> bool:
         if self.mask is None or self.source_bgr is None:
             return False
+        selection = self._magic_selection_at(point)
+        if selection is None:
+            return False
+        if not np.any(selection):
+            return False
+        if self._should_emit_selection(button):
+            self.selectionCreated.emit(selection.copy())
+            return False
+        old_mask = self.mask.copy()
+        self._apply_selection(selection, button)
+        return not np.array_equal(old_mask, self.mask)
+
+    def _magic_selection_at(self, point: tuple[int, int]) -> np.ndarray | None:
+        """Return the flood-fill selection under a point without changing the mask."""
+        if self.mask is None or self.source_bgr is None:
+            return None
         height, width = self.mask.shape[:2]
         if not (0 <= point[0] < width and 0 <= point[1] < height):
-            return False
+            return None
         flood_mask = np.zeros((height + 2, width + 2), dtype=np.uint8)
         tolerance = int(self.magic_tolerance)
         diff = (tolerance, tolerance, tolerance)
-        flags = (
-            8
-            | cv2.FLOODFILL_FIXED_RANGE
-            | cv2.FLOODFILL_MASK_ONLY
-            | (255 << 8)
-        )
+        flags = 8 | cv2.FLOODFILL_FIXED_RANGE | cv2.FLOODFILL_MASK_ONLY | (255 << 8)
         cv2.floodFill(
             self.source_bgr.copy(),
             flood_mask,
@@ -923,14 +935,120 @@ class MaskEditorView(ImageView):
             flags,
         )
         selection = flood_mask[1:height + 1, 1:width + 1] > 0
-        if not np.any(selection):
-            return False
-        if self._should_emit_selection(button):
-            self.selectionCreated.emit(selection.copy())
-            return False
-        old_mask = self.mask.copy()
-        self._apply_selection(selection, button)
-        return not np.array_equal(old_mask, self.mask)
+        return selection if np.any(selection) else None
+
+    def _update_magic_preview(self, point: tuple[int, int] | None) -> None:
+        if (
+            self.tool != 'magic'
+            or point is None
+            or self.mask is None
+            or self.source_bgr is None
+            or self._active_button is not None
+        ):
+            self._clear_magic_preview()
+            return
+        self._magic_preview_pending_point = point
+        key = (point[0], point[1], int(self.magic_tolerance))
+        if key == self._magic_preview_cache_key:
+            if self._magic_preview_item is not None:
+                self._magic_preview_item.setVisible(self._magic_preview_has_content)
+            return
+        if not self._magic_preview_timer.isActive():
+            self._magic_preview_timer.start()
+
+    def _refresh_magic_preview(self) -> None:
+        point = self._magic_preview_pending_point
+        if self.tool != 'magic' or point is None:
+            return
+        selection = self._magic_selection_at(point)
+        self._magic_preview_point = point
+        self._magic_preview_cache_key = (point[0], point[1], int(self.magic_tolerance))
+        if selection is None or self.mask is None:
+            self._clear_magic_preview()
+            return
+        additions, removals, fallback = self._magic_preview_masks(selection)
+        visible_selection = additions | removals | fallback
+        if not np.any(visible_selection):
+            self._magic_preview_has_content = False
+            if self._magic_preview_item is not None:
+                self._magic_preview_item.setVisible(False)
+            return
+        ys, xs = np.where(visible_selection)
+        x1, x2 = int(xs.min()), int(xs.max())
+        y1, y2 = int(ys.min()), int(ys.max())
+        cropped_selection = visible_selection[y1:y2 + 1, x1:x2 + 1]
+        cropped_additions = additions[y1:y2 + 1, x1:x2 + 1]
+        cropped_removals = removals[y1:y2 + 1, x1:x2 + 1]
+        cropped_fallback = fallback[y1:y2 + 1, x1:x2 + 1]
+        overlay = np.zeros((*cropped_selection.shape, 4), dtype=np.uint8)
+        overlay[cropped_additions, 0] = MAGIC_PREVIEW_COLOR_BGR[0]
+        overlay[cropped_additions, 1] = MAGIC_PREVIEW_COLOR_BGR[1]
+        overlay[cropped_additions, 2] = MAGIC_PREVIEW_COLOR_BGR[2]
+        overlay[cropped_additions, 3] = MAGIC_PREVIEW_ALPHA
+        overlay[cropped_removals, 0] = MAGIC_PREVIEW_SUBTRACT_COLOR_BGR[0]
+        overlay[cropped_removals, 1] = MAGIC_PREVIEW_SUBTRACT_COLOR_BGR[1]
+        overlay[cropped_removals, 2] = MAGIC_PREVIEW_SUBTRACT_COLOR_BGR[2]
+        overlay[cropped_removals, 3] = MAGIC_PREVIEW_ALPHA
+        overlay[cropped_fallback, 0] = MAGIC_PREVIEW_SPECIAL_COLOR_BGR[0]
+        overlay[cropped_fallback, 1] = MAGIC_PREVIEW_SPECIAL_COLOR_BGR[1]
+        overlay[cropped_fallback, 2] = MAGIC_PREVIEW_SPECIAL_COLOR_BGR[2]
+        overlay[cropped_fallback, 3] = MAGIC_PREVIEW_ALPHA
+        if self._magic_preview_item is None:
+            self._magic_preview_item = QGraphicsPixmapItem()
+            self._magic_preview_item.setZValue(12)
+            self._magic_preview_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self._magic_preview_item.setAcceptHoverEvents(False)
+            self._magic_preview_item.setTransformationMode(Qt.TransformationMode.FastTransformation)
+            self.scene().addItem(self._magic_preview_item)
+        self._magic_preview_item.setOffset(x1, y1)
+        self._magic_preview_item.setPixmap(QPixmap.fromImage(_qimage_from_rgba(overlay)))
+        self._magic_preview_has_content = True
+        self._magic_preview_item.setVisible(True)
+
+    def _magic_preview_masks(self, selection: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Build the visible add/remove delta for the selected combine operation."""
+        if self.mask is None:
+            empty = np.zeros_like(selection, dtype=bool)
+            return empty, empty, empty
+        current = self.mask > 0
+        operation = self.selection_combine_mode
+        if operation == 'add':
+            empty = np.zeros_like(selection, dtype=bool)
+            return selection & ~current, empty, empty
+        if operation == 'subtract':
+            empty = np.zeros_like(selection, dtype=bool)
+            return empty, selection & current, empty
+        if operation not in ('local_intersect', 'selection_inner', 'add_selection_inner'):
+            return (
+                np.zeros_like(selection, dtype=bool),
+                np.zeros_like(selection, dtype=bool),
+                selection,
+            )
+        original_mask = self.mask
+        try:
+            self.mask = original_mask.copy()
+            self._apply_selection(selection, Qt.MouseButton.LeftButton)
+            next_mask = self.mask > 0
+        finally:
+            self.mask = original_mask
+        return next_mask & ~current, current & ~next_mask, np.zeros_like(selection, dtype=bool)
+
+    def _invalidate_magic_preview(self) -> None:
+        self._magic_preview_cache_key = None
+        if self.tool == 'magic' and self._magic_preview_point is not None:
+            self._magic_preview_pending_point = self._magic_preview_point
+            if not self._magic_preview_timer.isActive():
+                self._magic_preview_timer.start()
+
+    def _clear_magic_preview(self, keep_request: bool = False) -> None:
+        self._magic_preview_timer.stop()
+        if not keep_request:
+            self._magic_preview_pending_point = None
+            self._magic_preview_point = None
+            self._magic_preview_cache_key = None
+        self._magic_preview_has_content = False
+        if self._magic_preview_item is not None:
+            self._magic_preview_item.setVisible(False)
 
     def _apply_selection(self, selection: np.ndarray, button: Qt.MouseButton) -> None:
         if self.mask is None:
@@ -1111,7 +1229,7 @@ class MaskEditorView(ImageView):
         if self._panning:
             return
         if self.tool == 'magic':
-            self.setCursor(self._magic_cursor)
+            self.setCursor(Qt.CursorShape.ArrowCursor)
         else:
             self.unsetCursor()
 
