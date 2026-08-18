@@ -90,6 +90,13 @@ Each PSD contains:
             try {
                 doc = createDocument(imageFile);
                 importOverlayLayer(doc, overlayFile, "overlay-manual");
+                for (var extraIndex = 0; extraIndex < settings.extraLayers.length; extraIndex++) {
+                    var extraConfig = settings.extraLayers[extraIndex];
+                    var extraFile = findMaskFile(extraConfig.folder, stem);
+                    if (extraFile) {
+                        importAdditionalLayer(doc, extraFile, extraConfig.layerName);
+                    }
+                }
                 importMaskAsAlpha(doc, otherMaskFile, "OTHER_CHANNEL", true);
 
                 if (settings.runAction && hasChannel(doc, "OTHER_CHANNEL")) {
@@ -185,6 +192,67 @@ Each PSD contains:
         outputPathInput.characters = 52;
         var outputBrowseButton = outputGroup.add("button", undefined, "选择");
 
+        var extraLayersPanel = dialog.add("panel", undefined, "额外图层（按原图文件名匹配）");
+        extraLayersPanel.orientation = "column";
+        extraLayersPanel.alignChildren = ["fill", "top"];
+        extraLayersPanel.spacing = 6;
+        var extraLayersRows = extraLayersPanel.add("group");
+        extraLayersRows.orientation = "column";
+        extraLayersRows.alignChildren = ["fill", "top"];
+        extraLayersRows.spacing = 4;
+        var extraLayerConfigs = [];
+        var addExtraLayerButton = extraLayersPanel.add("button", undefined, "添加文件夹");
+
+        function addExtraLayerRow(folderPath, layerName) {
+            var row = extraLayersRows.add("group");
+            row.orientation = "row";
+            row.alignChildren = ["fill", "center"];
+
+            var folderInput = row.add("edittext", undefined, folderPath || "");
+            folderInput.characters = 34;
+            var browseButton = row.add("button", undefined, "选择文件夹");
+            var layerInput = row.add("edittext", undefined, layerName || "");
+            layerInput.characters = 16;
+            var removeButton = row.add("button", undefined, "删除");
+
+            browseButton.onClick = function () {
+                var selected = Folder.selectDialog("选择额外图层图片文件夹");
+                if (selected) folderInput.text = selected.fsName;
+            };
+            removeButton.onClick = function () {
+                row.parent.remove(row);
+                for (var configIndex = extraLayerConfigs.length - 1; configIndex >= 0; configIndex--) {
+                    if (extraLayerConfigs[configIndex].row === row) {
+                        extraLayerConfigs.splice(configIndex, 1);
+                        break;
+                    }
+                }
+                refreshExtraLayersLayout();
+            };
+
+            extraLayerConfigs.push({
+                row: row,
+                folderInput: folderInput,
+                layerInput: layerInput
+            });
+            refreshExtraLayersLayout();
+        }
+
+        addExtraLayerButton.onClick = function () {
+            addExtraLayerRow("", "");
+        };
+
+        function refreshExtraLayersLayout() {
+            extraLayersRows.preferredSize = [-1, -1];
+            extraLayersPanel.preferredSize = [-1, -1];
+            dialog.preferredSize = [-1, -1];
+            extraLayersRows.layout.layout(true);
+            extraLayersPanel.layout.layout(true);
+            dialog.layout.layout(true);
+            dialog.size = dialog.preferredSize;
+            dialog.layout.resize();
+        }
+
         var restartGroup = dialog.add("group");
         restartGroup.orientation = "row";
         restartGroup.alignChildren = ["left", "center"];
@@ -268,6 +336,25 @@ Each PSD contains:
                 alert("请先在 Photoshop Actions 面板载入动作，并选择动作组和动作。");
                 return;
             }
+
+            var extraLayers = [];
+            for (var extraIndex = 0; extraIndex < extraLayerConfigs.length; extraIndex++) {
+                var extraConfig = extraLayerConfigs[extraIndex];
+                var folderPath = trimString(extraConfig.folderInput.text);
+                var layerName = trimString(extraConfig.layerInput.text);
+                if (!folderPath && !layerName) continue;
+                if (!folderPath || !layerName) {
+                    alert("额外图层配置必须同时填写文件夹和图层名。");
+                    return;
+                }
+                var extraFolder = new Folder(folderPath);
+                if (!extraFolder.exists) {
+                    alert("额外图层文件夹不存在：\n" + folderPath);
+                    return;
+                }
+                extraLayers.push({ folder: extraFolder, layerName: layerName });
+            }
+            dialog.extraLayers = extraLayers;
             dialog.close(1);
         };
 
@@ -283,7 +370,8 @@ Each PSD contains:
             runAction: actionCheckbox.value,
             convertOtherChannelToLayer: convertOtherChannelCheckbox.value,
             actionSetName: selectedSet ? selectedSet.name : "",
-            actionName: selectedAction ? selectedAction.name : ""
+            actionName: selectedAction ? selectedAction.name : "",
+            extraLayers: dialog.extraLayers || []
         };
 
         function refreshActionDropdown() {
@@ -350,6 +438,45 @@ Each PSD contains:
         addWhiteCornerPixels(targetDoc);
 
         overlayDoc.close(SaveOptions.DONOTSAVECHANGES);
+
+        try {
+            var bgLayer = targetDoc.artLayers.getByName("bg");
+            importedLayer.move(bgLayer, ElementPlacement.PLACEBEFORE);
+        } catch (e) {
+        }
+    }
+
+    function importAdditionalLayer(targetDoc, imageFile, layerName) {
+        var sourceDoc = app.open(imageFile);
+        var targetWidth = Math.round(targetDoc.width.as("px"));
+        var targetHeight = Math.round(targetDoc.height.as("px"));
+        if (Math.round(sourceDoc.width.as("px")) !== targetWidth ||
+            Math.round(sourceDoc.height.as("px")) !== targetHeight) {
+            sourceDoc.close(SaveOptions.DONOTSAVECHANGES);
+            throw new Error(layerName + " 尺寸不一致");
+        }
+
+        app.activeDocument = sourceDoc;
+        if (sourceDoc.mode !== DocumentMode.RGB) {
+            sourceDoc.changeMode(ChangeMode.RGB);
+        }
+        if (sourceDoc.layers.length > 1) {
+            sourceDoc.mergeVisibleLayers();
+        }
+
+        var sourceLayer = sourceDoc.activeLayer;
+        var sourceBounds = getLayerBounds(sourceLayer);
+        var importedLayer = sourceLayer.duplicate(targetDoc, ElementPlacement.PLACEATBEGINNING);
+
+        app.activeDocument = targetDoc;
+        setRGBChannels(targetDoc);
+        targetDoc.activeLayer = importedLayer;
+        importedLayer.name = layerName;
+        alignLayerBounds(importedLayer, sourceBounds);
+        addWhiteCornerPixels(targetDoc);
+        importedLayer.visible = false;
+
+        sourceDoc.close(SaveOptions.DONOTSAVECHANGES);
 
         try {
             var bgLayer = targetDoc.artLayers.getByName("bg");
