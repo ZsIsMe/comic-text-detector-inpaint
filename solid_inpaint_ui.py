@@ -136,6 +136,7 @@ SELECTION_COMBINE_LABELS = {
     'add_selection_inner': '添加＋內部',
     'transfer_from_other': '從其他轉入',
     'ctd_detect_selection': '添加CTD檢測選區',
+    'local_edit_selection': '局部視窗',
 }
 EDIT_MODE_COLORS = {
     'mask': (255, 255, 255),
@@ -671,6 +672,7 @@ class MaskEditorView(ImageView):
         self.magic_tolerance = DEFAULT_MAGIC_TOLERANCE
         self.magic_expand_px = DEFAULT_MAGIC_EXPAND_PX
         self.local_intersect_offset_px = DEFAULT_LOCAL_INTERSECT_OFFSET_PX
+        self.edit_clip_rect: tuple[int, int, int, int] | None = None
         self.mask: np.ndarray | None = None
         self.source_bgr: np.ndarray | None = None
         self.image_shape: tuple[int, int] | None = None
@@ -789,6 +791,12 @@ class MaskEditorView(ImageView):
             min(MAX_LOCAL_INTERSECT_OFFSET_PX, int(offset_px)),
         )
 
+    def set_edit_clip_rect(self, rect: tuple[int, int, int, int] | None) -> None:
+        if rect == self.edit_clip_rect:
+            return
+        self.edit_clip_rect = rect
+        self._invalidate_magic_preview()
+
     def image_point_from_view(self, pos: QPoint, clamp: bool = False) -> tuple[int, int] | None:
         if self.image_shape is None:
             return None
@@ -806,7 +814,34 @@ class MaskEditorView(ImageView):
             return None
         return x, y
 
+    def _point_in_edit_clip(self, point: tuple[int, int]) -> bool:
+        if self.edit_clip_rect is None:
+            return True
+        x1, y1, x2, y2 = self.edit_clip_rect
+        return x1 <= point[0] < x2 and y1 <= point[1] < y2
+
+    def _constrain_point_to_edit_clip(self, point: tuple[int, int]) -> tuple[int, int]:
+        if self.edit_clip_rect is None:
+            return point
+        x1, y1, x2, y2 = self.edit_clip_rect
+        return (
+            max(x1, min(x2 - 1, point[0])),
+            max(y1, min(y2 - 1, point[1])),
+        )
+
+    def _clip_selection_to_edit_rect(self, selection: np.ndarray) -> np.ndarray:
+        selection = np.asarray(selection, dtype=bool)
+        if self.edit_clip_rect is None:
+            return selection
+        x1, y1, x2, y2 = self.edit_clip_rect
+        clipped = np.zeros_like(selection, dtype=bool)
+        clipped[y1:y2, x1:x2] = selection[y1:y2, x1:x2]
+        return clipped
+
     def mousePressEvent(self, event) -> None:
+        if self.tool == 'roi_bounds':
+            super().mousePressEvent(event)
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._is_pan_modifier(event.modifiers()):
             self._clear_magic_preview()
             self._panning = True
@@ -820,6 +855,9 @@ class MaskEditorView(ImageView):
         point = self.image_point_from_view(event.position().toPoint())
         if point is None or self.mask is None:
             super().mousePressEvent(event)
+            return
+        if not self._point_in_edit_clip(point):
+            event.accept()
             return
         if event.button() == Qt.MouseButton.RightButton:
             self._active_button = event.button()
@@ -867,6 +905,9 @@ class MaskEditorView(ImageView):
         event.accept()
 
     def mouseMoveEvent(self, event) -> None:
+        if self.tool == 'roi_bounds':
+            super().mouseMoveEvent(event)
+            return
         if self._panning:
             current = event.position().toPoint()
             if self._pan_last_pos is not None:
@@ -877,6 +918,8 @@ class MaskEditorView(ImageView):
             event.accept()
             return
         hover_point = self.image_point_from_view(event.position().toPoint())
+        if hover_point is not None and not self._point_in_edit_clip(hover_point):
+            hover_point = None
         self._update_brush_cursor(hover_point)
         self._update_magic_preview(hover_point)
         if self.tool == 'lasso' and self._lasso_points:
@@ -889,6 +932,7 @@ class MaskEditorView(ImageView):
         if point is None or self.mask is None:
             event.accept()
             return
+        point = self._constrain_point_to_edit_clip(point)
         if self._erase_all_drag:
             self._update_rubber_band(self._drag_start or point, point, self._active_button)
             event.accept()
@@ -909,6 +953,9 @@ class MaskEditorView(ImageView):
     def mouseDoubleClickEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton and self.tool == 'lasso':
             point = self.image_point_from_view(event.position().toPoint())
+            if point is not None and not self._point_in_edit_clip(point):
+                event.accept()
+                return
             if point is not None and (not self._lasso_points or self._lasso_points[-1] != point):
                 self._add_lasso_point(point)
             self.finish_lasso()
@@ -917,6 +964,9 @@ class MaskEditorView(ImageView):
         super().mouseDoubleClickEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
+        if self.tool == 'roi_bounds':
+            super().mouseReleaseEvent(event)
+            return
         if self._panning and event.button() == Qt.MouseButton.LeftButton:
             self._panning = False
             self._pan_last_pos = None
@@ -927,6 +977,8 @@ class MaskEditorView(ImageView):
             super().mouseReleaseEvent(event)
             return
         point = self.image_point_from_view(event.position().toPoint(), clamp=True)
+        if point is not None:
+            point = self._constrain_point_to_edit_clip(point)
         if self._erase_all_drag and self.mask is not None and self._drag_start is not None and point is not None:
             selection = self._selection_from_rect(self._drag_start, point)
             if selection is not None:
@@ -984,6 +1036,19 @@ class MaskEditorView(ImageView):
         if self.mask is None:
             return
         color = self._brush_color_for_button(button)
+        if self.edit_clip_rect is not None:
+            x1, y1, x2, y2 = self.edit_clip_rect
+            if not (x1 <= point[0] < x2 and y1 <= point[1] < y2):
+                return
+            cv2.circle(
+                self.mask[y1:y2, x1:x2],
+                (point[0] - x1, point[1] - y1),
+                self.brush_radius,
+                color,
+                thickness=-1,
+                lineType=cv2.LINE_8,
+            )
+            return
         cv2.circle(self.mask, point, self.brush_radius, color, thickness=-1, lineType=cv2.LINE_8)
 
     def _brush_color_for_button(self, button: Qt.MouseButton) -> int:
@@ -999,6 +1064,22 @@ class MaskEditorView(ImageView):
         if self.mask is None:
             return
         color = self._brush_color_for_button(button)
+        if self.edit_clip_rect is not None:
+            x1, y1, x2, y2 = self.edit_clip_rect
+            width, height = x2 - x1, y2 - y1
+            local_start = (start[0] - x1, start[1] - y1)
+            local_end = (end[0] - x1, end[1] - y1)
+            clipped, clipped_start, clipped_end = cv2.clipLine(
+                (0, 0, width, height),
+                local_start,
+                local_end,
+            )
+            if not clipped:
+                return
+            roi = self.mask[y1:y2, x1:x2]
+            cv2.line(roi, clipped_start, clipped_end, color, thickness=self.brush_radius * 2, lineType=cv2.LINE_8)
+            cv2.circle(roi, clipped_end, self.brush_radius, color, thickness=-1, lineType=cv2.LINE_8)
+            return
         cv2.line(self.mask, start, end, color, thickness=self.brush_radius * 2, lineType=cv2.LINE_8)
         cv2.circle(self.mask, end, self.brush_radius, color, thickness=-1, lineType=cv2.LINE_8)
 
@@ -1054,6 +1135,10 @@ class MaskEditorView(ImageView):
             return None
         x1, x2 = sorted((start[0], end[0]))
         y1, y2 = sorted((start[1], end[1]))
+        if self.edit_clip_rect is not None:
+            clip_x1, clip_y1, clip_x2, clip_y2 = self.edit_clip_rect
+            x1, y1 = max(x1, clip_x1), max(y1, clip_y1)
+            x2, y2 = min(x2, clip_x2 - 1), min(y2, clip_y2 - 1)
         if x2 < x1 or y2 < y1:
             return None
         selection = np.zeros(self.mask.shape[:2], dtype=bool)
@@ -1075,7 +1160,7 @@ class MaskEditorView(ImageView):
         points = np.asarray(self._lasso_points, dtype=np.int32)
         selection_u8 = np.zeros(self.mask.shape[:2], dtype=np.uint8)
         cv2.fillPoly(selection_u8, [points], 255, lineType=cv2.LINE_8)
-        selection = selection_u8 > 0
+        selection = self._clip_selection_to_edit_rect(selection_u8 > 0)
         self.cancel_lasso()
         if not np.any(selection):
             return False
@@ -1161,23 +1246,42 @@ class MaskEditorView(ImageView):
         height, width = self.mask.shape[:2]
         if not (0 <= point[0] < width and 0 <= point[1] < height):
             return None
-        flood_mask = np.zeros((height + 2, width + 2), dtype=np.uint8)
+        if self.edit_clip_rect is None:
+            x1, y1, x2, y2 = 0, 0, width, height
+        else:
+            clip_x1, clip_y1, clip_x2, clip_y2 = self.edit_clip_rect
+            x1 = max(0, min(width, int(clip_x1)))
+            y1 = max(0, min(height, int(clip_y1)))
+            x2 = max(x1, min(width, int(clip_x2)))
+            y2 = max(y1, min(height, int(clip_y2)))
+        if not (x1 <= point[0] < x2 and y1 <= point[1] < y2):
+            return None
+
+        # Flood-fill the ROI crop itself. Clipping only the finished selection is
+        # insufficient because a connected region can leave the ROI and re-enter
+        # it elsewhere, making pixels outside the local editor affect the result.
+        local_source = self.source_bgr[y1:y2, x1:x2]
+        local_height, local_width = local_source.shape[:2]
+        flood_mask = np.zeros((local_height + 2, local_width + 2), dtype=np.uint8)
         tolerance = int(self.magic_tolerance)
         diff = (tolerance, tolerance, tolerance)
         flags = 8 | cv2.FLOODFILL_FIXED_RANGE | cv2.FLOODFILL_MASK_ONLY | (255 << 8)
         cv2.floodFill(
-            self.source_bgr.copy(),
+            local_source.copy(),
             flood_mask,
-            point,
+            (point[0] - x1, point[1] - y1),
             (0, 0, 0),
             diff,
             diff,
             flags,
         )
-        selection = flood_mask[1:height + 1, 1:width + 1] > 0
-        if not np.any(selection):
+        local_selection = flood_mask[1:local_height + 1, 1:local_width + 1] > 0
+        if not np.any(local_selection):
             return None
-        return self._expand_magic_selection(selection)
+        local_selection = self._expand_magic_selection(local_selection)
+        selection = np.zeros((height, width), dtype=bool)
+        selection[y1:y2, x1:x2] = local_selection
+        return selection
 
     def _expand_magic_selection(self, selection: np.ndarray) -> np.ndarray:
         expand_px = int(self.magic_expand_px)
@@ -1334,6 +1438,24 @@ class MaskEditorView(ImageView):
     def _apply_selection(self, selection: np.ndarray, button: Qt.MouseButton) -> None:
         if self.mask is None:
             return
+        if self.edit_clip_rect is not None:
+            x1, y1, x2, y2 = self.edit_clip_rect
+            original_mask = self.mask
+            local_mask = original_mask[y1:y2, x1:x2].copy()
+            local_selection = np.asarray(selection[y1:y2, x1:x2], dtype=bool)
+            self.mask = local_mask
+            try:
+                self._apply_selection_operation(local_selection, button)
+                local_result = self.mask
+            finally:
+                self.mask = original_mask
+            original_mask[y1:y2, x1:x2] = local_result
+            return
+        self._apply_selection_operation(np.asarray(selection, dtype=bool), button)
+
+    def _apply_selection_operation(self, selection: np.ndarray, button: Qt.MouseButton) -> None:
+        if self.mask is None:
+            return
         operation = self._selection_operation_for_button(button)
         if operation == 'add':
             self.mask[selection] = 255
@@ -1358,7 +1480,11 @@ class MaskEditorView(ImageView):
     def _should_emit_selection(self, button: Qt.MouseButton) -> bool:
         return (
             button == Qt.MouseButton.LeftButton
-            and self.selection_combine_mode in ('transfer_from_other', 'ctd_detect_selection')
+            and self.selection_combine_mode in (
+                'transfer_from_other',
+                'ctd_detect_selection',
+                'local_edit_selection',
+            )
         )
 
     def _apply_local_intersection(self, selection: np.ndarray) -> None:
@@ -1448,7 +1574,7 @@ class MaskEditorView(ImageView):
         operation = self._selection_operation_for_button(button)
         if operation == 'subtract':
             self._rubber_band.setPen(self._rect_pen_remove)
-        elif operation == 'ctd_detect_selection':
+        elif operation in ('ctd_detect_selection', 'local_edit_selection'):
             self._rubber_band.setPen(self._rect_pen_detect)
         elif operation in ('local_intersect', 'selection_inner', 'add_selection_inner', 'transfer_from_other'):
             self._rubber_band.setPen(self._rect_pen_intersect)
@@ -1513,6 +1639,404 @@ class MaskEditorView(ImageView):
             self.setCursor(Qt.CursorShape.ArrowCursor)
         else:
             self.unsetCursor()
+
+
+class RoiBoundaryItem(QGraphicsLineItem):
+    def __init__(self, side: str, owner: 'LocalEditDialog') -> None:
+        super().__init__()
+        self.side = side
+        self.owner = owner
+        pen = QPen(QColor('#70bdff'), 3, Qt.PenStyle.SolidLine)
+        pen.setCosmetic(True)
+        self.setPen(pen)
+        self.setZValue(30)
+        self.setAcceptHoverEvents(True)
+        self.setCursor(
+            Qt.CursorShape.SizeVerCursor
+            if side in ('top', 'bottom')
+            else Qt.CursorShape.SizeHorCursor
+        )
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            event.accept()
+            return
+        event.ignore()
+
+    def mouseMoveEvent(self, event) -> None:
+        self.owner.move_roi_boundary(self.side, event.scenePos())
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:
+        event.accept()
+
+
+class LocalEditDialog(QDialog):
+    def __init__(
+        self,
+        source_bgr: np.ndarray,
+        mask: np.ndarray,
+        roi_box: tuple[int, int, int, int],
+        mask_color_bgr: tuple[int, int, int],
+        alpha: float,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle('局部編輯')
+        self.resize(1000, 760)
+        self.page_bgr = source_bgr[:, :, :3].copy()
+        self.current_mask = np.where(mask > 0, 255, 0).astype(np.uint8)
+        self.roi_box = self._clamp_roi_box(roi_box)
+        self.source_bgr = self.page_bgr
+        self.mask_color_bgr = mask_color_bgr
+        self.alpha = alpha
+        self.undo_stack: list[np.ndarray] = []
+        self.redo_stack: list[np.ndarray] = []
+        self._updating_roi_controls = False
+
+        layout = QVBoxLayout(self)
+        toolbar = QHBoxLayout()
+        self.rect_btn = QPushButton('矩形')
+        self.brush_btn = QPushButton('筆刷')
+        self.magic_btn = QPushButton('魔法棒')
+        self.lasso_btn = QPushButton('套索')
+        self.boundary_btn = QPushButton('調整邊框')
+        self.boundary_btn.setToolTip('只拖動 ROI 的上下左右邊界，不編輯 mask')
+        self.tool_group = QButtonGroup(self)
+        self.tool_group.setExclusive(True)
+        for button in (
+            self.rect_btn,
+            self.brush_btn,
+            self.magic_btn,
+            self.lasso_btn,
+            self.boundary_btn,
+        ):
+            button.setCheckable(True)
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            self.tool_group.addButton(button)
+            toolbar.addWidget(button)
+        self.rect_btn.clicked.connect(lambda: self.set_tool('rect'))
+        self.brush_btn.clicked.connect(lambda: self.set_tool('brush'))
+        self.magic_btn.clicked.connect(lambda: self.set_tool('magic'))
+        self.lasso_btn.clicked.connect(lambda: self.set_tool('lasso'))
+        self.boundary_btn.clicked.connect(lambda: self.set_tool('roi_bounds'))
+
+        toolbar.addSpacing(12)
+        self.add_btn = QPushButton('添加')
+        self.subtract_btn = QPushButton('減去')
+        self.combine_group = QButtonGroup(self)
+        self.combine_group.setExclusive(True)
+        for button in (self.add_btn, self.subtract_btn):
+            button.setCheckable(True)
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            self.combine_group.addButton(button)
+            toolbar.addWidget(button)
+        self.add_btn.clicked.connect(lambda: self.set_combine_mode('add'))
+        self.subtract_btn.clicked.connect(lambda: self.set_combine_mode('subtract'))
+
+        toolbar.addSpacing(12)
+        brush_down = QPushButton('−')
+        brush_up = QPushButton('+')
+        self.brush_label = QLabel(f'筆刷 {DEFAULT_BRUSH_RADIUS}px')
+        brush_down.clicked.connect(lambda: self.change_brush_radius(-4))
+        brush_up.clicked.connect(lambda: self.change_brush_radius(4))
+        toolbar.addWidget(brush_down)
+        toolbar.addWidget(self.brush_label)
+        toolbar.addWidget(brush_up)
+
+        toolbar.addSpacing(12)
+        undo_btn = QPushButton('撤銷')
+        redo_btn = QPushButton('重做')
+        undo_btn.clicked.connect(self.undo)
+        redo_btn.clicked.connect(self.redo)
+        toolbar.addWidget(undo_btn)
+        toolbar.addWidget(redo_btn)
+        toolbar.addStretch()
+        fit_btn = QPushButton('適應窗口')
+        zoom_out_btn = QPushButton('縮小')
+        zoom_in_btn = QPushButton('放大')
+        fit_btn.clicked.connect(self.fit_view)
+        zoom_out_btn.clicked.connect(lambda: self.view.zoom_by(1.0 / VIEW_ZOOM_STEP, keep_center=True))
+        zoom_in_btn.clicked.connect(lambda: self.view.zoom_by(VIEW_ZOOM_STEP, keep_center=True))
+        toolbar.addWidget(fit_btn)
+        toolbar.addWidget(zoom_out_btn)
+        toolbar.addWidget(zoom_in_btn)
+        layout.addLayout(toolbar)
+
+        roi_toolbar = QHBoxLayout()
+        roi_toolbar.addWidget(QLabel('ROI 範圍'))
+        self.roi_x_spin = QSpinBox()
+        self.roi_y_spin = QSpinBox()
+        self.roi_width_spin = QSpinBox()
+        self.roi_height_spin = QSpinBox()
+        page_height, page_width = self.page_bgr.shape[:2]
+        self.roi_x_spin.setRange(0, max(0, page_width - 1))
+        self.roi_y_spin.setRange(0, max(0, page_height - 1))
+        self.roi_width_spin.setRange(1, page_width)
+        self.roi_height_spin.setRange(1, page_height)
+        for label, spin in (
+            ('X', self.roi_x_spin),
+            ('Y', self.roi_y_spin),
+            ('寬', self.roi_width_spin),
+            ('高', self.roi_height_spin),
+        ):
+            spin.setKeyboardTracking(False)
+            spin.valueChanged.connect(self.on_roi_controls_changed)
+            roi_toolbar.addWidget(QLabel(label))
+            roi_toolbar.addWidget(spin)
+        expand_btn = QPushButton('外擴 32px')
+        shrink_btn = QPushButton('內縮 32px')
+        reset_roi_btn = QPushButton('重設範圍')
+        expand_btn.clicked.connect(lambda: self.offset_roi(32))
+        shrink_btn.clicked.connect(lambda: self.offset_roi(-32))
+        reset_roi_btn.clicked.connect(lambda: self.set_roi_box(roi_box))
+        roi_toolbar.addWidget(expand_btn)
+        roi_toolbar.addWidget(shrink_btn)
+        roi_toolbar.addWidget(reset_roi_btn)
+        roi_toolbar.addStretch()
+        layout.addLayout(roi_toolbar)
+
+        self.view = MaskEditorView()
+        self.view.editStarted.connect(self.on_edit_started)
+        self.view.brushPreviewChanged.connect(self.on_brush_preview_changed)
+        self.view.maskEdited.connect(self.on_mask_edited)
+        self.roi_boundaries = {
+            side: RoiBoundaryItem(side, self)
+            for side in ('top', 'bottom', 'left', 'right')
+        }
+        for boundary in self.roi_boundaries.values():
+            self.view.scene().addItem(boundary)
+        layout.addWidget(self.view, 1)
+
+        hint = QLabel(
+            '局部副本：先選「調整邊框」，再拖動藍色上下左右邊界調整 ROI；'
+            '切回其他工具後，邊界線不會攔截滑鼠。邊界不能互相穿越；只有按「套用」才會回寫主頁。'
+            '套索雙擊或 Enter 閉合；Esc 取消套索。'
+        )
+        layout.addWidget(hint)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText('套用')
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('取消')
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.refresh_preview(keep_view=False)
+        self._sync_roi_controls()
+        self.set_tool('brush')
+        self.set_combine_mode('add')
+        QTimer.singleShot(0, self.fit_view)
+
+    def result_mask(self) -> np.ndarray:
+        x1, y1, x2, y2 = self.roi_box
+        return self.current_mask[y1:y2, x1:x2].copy()
+
+    def result_roi_box(self) -> tuple[int, int, int, int]:
+        return self.roi_box
+
+    def _clamp_roi_box(self, box: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+        page_height, page_width = self.page_bgr.shape[:2]
+        x1, y1, x2, y2 = (int(value) for value in box)
+        x1 = max(0, min(page_width - 1, x1))
+        y1 = max(0, min(page_height - 1, y1))
+        x2 = max(x1 + 1, min(page_width, x2))
+        y2 = max(y1 + 1, min(page_height, y2))
+        return x1, y1, x2, y2
+
+    def _sync_roi_controls(self) -> None:
+        self._updating_roi_controls = True
+        try:
+            x1, y1, x2, y2 = self.roi_box
+            page_height, page_width = self.page_bgr.shape[:2]
+            self.roi_width_spin.setMaximum(page_width - x1)
+            self.roi_height_spin.setMaximum(page_height - y1)
+            self.roi_x_spin.setValue(x1)
+            self.roi_y_spin.setValue(y1)
+            self.roi_width_spin.setValue(x2 - x1)
+            self.roi_height_spin.setValue(y2 - y1)
+        finally:
+            self._updating_roi_controls = False
+
+    def on_roi_controls_changed(self) -> None:
+        if self._updating_roi_controls:
+            return
+        x1 = self.roi_x_spin.value()
+        y1 = self.roi_y_spin.value()
+        width = self.roi_width_spin.value()
+        height = self.roi_height_spin.value()
+        self.set_roi_box((x1, y1, x1 + width, y1 + height))
+
+    def set_roi_box(self, box: tuple[int, int, int, int]) -> None:
+        next_box = self._clamp_roi_box(box)
+        if next_box == self.roi_box:
+            self._sync_roi_controls()
+            return
+        self.roi_box = next_box
+        self.undo_stack = []
+        self.redo_stack = []
+        self._sync_roi_controls()
+        self.view.set_edit_clip_rect(self.roi_box)
+        self.update_roi_boundaries()
+
+    def update_roi_boundaries(self) -> None:
+        x1, y1, x2, y2 = self.roi_box
+        self.roi_boundaries['top'].setLine(x1, y1, x2, y1)
+        self.roi_boundaries['bottom'].setLine(x1, y2, x2, y2)
+        self.roi_boundaries['left'].setLine(x1, y1, x1, y2)
+        self.roi_boundaries['right'].setLine(x2, y1, x2, y2)
+
+    def move_roi_boundary(self, side: str, scene_pos: QPointF) -> None:
+        x1, y1, x2, y2 = self.roi_box
+        page_height, page_width = self.page_bgr.shape[:2]
+        if side == 'top':
+            y1 = max(0, min(y2 - 1, int(round(scene_pos.y()))))
+        elif side == 'bottom':
+            y2 = max(y1 + 1, min(page_height, int(round(scene_pos.y()))))
+        elif side == 'left':
+            x1 = max(0, min(x2 - 1, int(round(scene_pos.x()))))
+        elif side == 'right':
+            x2 = max(x1 + 1, min(page_width, int(round(scene_pos.x()))))
+        self.set_roi_box((x1, y1, x2, y2))
+
+    def offset_roi(self, pixels: int) -> None:
+        x1, y1, x2, y2 = self.roi_box
+        pixels = int(pixels)
+        if pixels >= 0:
+            self.set_roi_box((x1 - pixels, y1 - pixels, x2 + pixels, y2 + pixels))
+            return
+        inset = abs(pixels)
+        max_inset = max(0, min((x2 - x1 - 1) // 2, (y2 - y1 - 1) // 2))
+        inset = min(inset, max_inset)
+        self.set_roi_box((x1 + inset, y1 + inset, x2 - inset, y2 - inset))
+
+    def refresh_preview(self, keep_view: bool = True) -> None:
+        preview = _mask_overlay_image(
+            self.source_bgr,
+            self.current_mask,
+            self.alpha,
+            self.mask_color_bgr,
+        )
+        self.view.set_qimage(_qimage_from_bgr(preview), keep_view=keep_view)
+        self.view.set_mask(self.current_mask, self.source_bgr.shape[:2], reset_brush_line=True)
+        self.view.set_source_image(self.source_bgr)
+        self.view.set_edit_clip_rect(self.roi_box)
+        self.update_roi_boundaries()
+
+    def on_edit_started(self) -> None:
+        x1, y1, x2, y2 = self.roi_box
+        self.undo_stack.append(self.current_mask[y1:y2, x1:x2].copy())
+        self.undo_stack = self.undo_stack[-MAX_UNDO_STEPS:]
+        self.redo_stack = []
+        if self.view.tool != 'brush':
+            return
+        empty = np.zeros_like(self.current_mask)
+        preview = _mask_overlay_image(
+            self.source_bgr,
+            empty,
+            self.alpha,
+            self.mask_color_bgr,
+        )
+        self.view.set_qimage(_qimage_from_bgr(preview), keep_view=True)
+        self.view.start_live_mask_preview(self.render_live_patch)
+
+    def render_live_patch(self, x1: int, y1: int, x2: int, y2: int) -> np.ndarray:
+        live_mask = self.view.mask
+        if live_mask is None:
+            return np.zeros((y2 - y1, x2 - x1, 4), dtype=np.uint8)
+        crop = live_mask[y1:y2, x1:x2]
+        patch = np.zeros((*crop.shape, 4), dtype=np.uint8)
+        patch[:, :, :3] = self.mask_color_bgr
+        patch[:, :, 3] = (crop > 0) * max(1, min(255, round(self.alpha * 255)))
+        return patch
+
+    def on_brush_preview_changed(self, dirty_rect: object) -> None:
+        if self.view.mask is not None:
+            self.current_mask = self.view.mask
+        self.view.update_live_mask_preview(dirty_rect)
+
+    def on_mask_edited(self, mask: object) -> None:
+        self.view.stop_live_mask_preview()
+        self.current_mask = np.where(np.asarray(mask) > 0, 255, 0).astype(np.uint8)
+        self.refresh_preview(keep_view=True)
+
+    def set_tool(self, tool: str) -> None:
+        self.view.set_tool(tool)
+        self.rect_btn.setChecked(tool == 'rect')
+        self.brush_btn.setChecked(tool == 'brush')
+        self.magic_btn.setChecked(tool == 'magic')
+        self.lasso_btn.setChecked(tool == 'lasso')
+        self.boundary_btn.setChecked(tool == 'roi_bounds')
+        editing_enabled = tool != 'roi_bounds'
+        self.add_btn.setEnabled(editing_enabled)
+        self.subtract_btn.setEnabled(editing_enabled)
+        for boundary in self.roi_boundaries.values():
+            boundary.setAcceptedMouseButtons(
+                Qt.MouseButton.LeftButton
+                if tool == 'roi_bounds'
+                else Qt.MouseButton.NoButton
+            )
+
+    def set_combine_mode(self, mode: str) -> None:
+        self.view.set_selection_combine_mode(mode)
+        self.add_btn.setChecked(mode == 'add')
+        self.subtract_btn.setChecked(mode == 'subtract')
+
+    def change_brush_radius(self, delta: int) -> None:
+        self.view.set_brush_radius(self.view.brush_radius + delta)
+        self.brush_label.setText(f'筆刷 {self.view.brush_radius}px')
+
+    def undo(self) -> None:
+        if not self.undo_stack:
+            return
+        x1, y1, x2, y2 = self.roi_box
+        self.redo_stack.append(self.current_mask[y1:y2, x1:x2].copy())
+        self.current_mask[y1:y2, x1:x2] = self.undo_stack.pop()
+        self.refresh_preview(keep_view=True)
+
+    def redo(self) -> None:
+        if not self.redo_stack:
+            return
+        x1, y1, x2, y2 = self.roi_box
+        self.undo_stack.append(self.current_mask[y1:y2, x1:x2].copy())
+        self.current_mask[y1:y2, x1:x2] = self.redo_stack.pop()
+        self.refresh_preview(keep_view=True)
+
+    def fit_view(self) -> None:
+        x1, y1, x2, y2 = self.roi_box
+        self.view.resetTransform()
+        self.view.fitInView(QRectF(x1, y1, x2 - x1, y2 - y1), Qt.AspectRatioMode.KeepAspectRatio)
+        self.view._zoom = self.view.transform().m11()
+        self.view.centerOn((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_B:
+            self.set_tool('brush')
+            return
+        if event.key() == Qt.Key.Key_R:
+            self.set_tool('rect')
+            return
+        if event.key() == Qt.Key.Key_W:
+            self.set_tool('magic')
+            return
+        if event.key() == Qt.Key.Key_L:
+            self.set_tool('lasso')
+            return
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self.view.tool == 'lasso':
+            if self.view.finish_lasso():
+                return
+        if event.key() == Qt.Key.Key_Backspace and self.view.tool == 'lasso':
+            if self.view.remove_last_lasso_point():
+                return
+        if event.key() == Qt.Key.Key_Escape and self.view.tool == 'lasso' and self.view._lasso_points:
+            self.view.cancel_lasso()
+            return
+        if event.matches(QKeySequence.StandardKey.Undo):
+            self.undo()
+            return
+        if event.matches(QKeySequence.StandardKey.Redo):
+            self.redo()
+            return
+        super().keyPressEvent(event)
 
 
 class FolderWorker(QObject):
@@ -2487,6 +3011,7 @@ class MainWindow(QMainWindow):
         self.pending_render_img_path = ''
         self.pending_render_mask: np.ndarray | None = None
         self.is_mask_stroke_active = False
+        self.is_local_edit_active = False
         self.mask_revision = 0
         self.page_worker_revision = -1
         self.brush_live_color_bgr = self.mask_display_color
@@ -2751,6 +3276,9 @@ class MainWindow(QMainWindow):
         self.selection_ctd_btn = QPushButton('添加CTD檢測選區')
         self.selection_ctd_btn.setCheckable(True)
         self.selection_ctd_btn.setToolTip('只對本次矩形選區跑 CTD，並把檢測結果添加到目前 mask')
+        self.selection_local_edit_btn = QPushButton('局部視窗')
+        self.selection_local_edit_btn.setCheckable(True)
+        self.selection_local_edit_btn.setToolTip('用矩形框選一部分，在獨立放大視窗中編輯副本')
         self.selection_combine_group = QButtonGroup(self)
         self.selection_combine_group.setExclusive(True)
         self.selection_combine_group.addButton(self.selection_add_btn)
@@ -2760,6 +3288,7 @@ class MainWindow(QMainWindow):
         self.selection_combine_group.addButton(self.selection_add_inner_btn)
         self.selection_combine_group.addButton(self.selection_transfer_btn)
         self.selection_combine_group.addButton(self.selection_ctd_btn)
+        self.selection_combine_group.addButton(self.selection_local_edit_btn)
         self.selection_add_btn.clicked.connect(lambda: self.set_selection_combine_mode('add'))
         self.selection_subtract_btn.clicked.connect(lambda: self.set_selection_combine_mode('subtract'))
         self.selection_intersect_btn.clicked.connect(lambda: self.set_selection_combine_mode('local_intersect'))
@@ -2767,6 +3296,7 @@ class MainWindow(QMainWindow):
         self.selection_add_inner_btn.clicked.connect(lambda: self.set_selection_combine_mode('add_selection_inner'))
         self.selection_transfer_btn.clicked.connect(lambda: self.set_selection_combine_mode('transfer_from_other'))
         self.selection_ctd_btn.clicked.connect(lambda: self.set_selection_combine_mode('ctd_detect_selection'))
+        self.selection_local_edit_btn.clicked.connect(lambda: self.set_selection_combine_mode('local_edit_selection'))
         self.undo_btn = QPushButton('撤銷')
         self.undo_btn.clicked.connect(self.undo_mask)
         self.redo_btn = QPushButton('重做')
@@ -2820,6 +3350,7 @@ class MainWindow(QMainWindow):
         selection_combine_layout.addWidget(self.selection_add_inner_btn)
         selection_combine_layout.addWidget(self.selection_transfer_btn)
         selection_combine_layout.addWidget(self.selection_ctd_btn)
+        selection_combine_layout.addWidget(self.selection_local_edit_btn)
         edit_toolbar.addWidget(self.selection_combine_controls)
         edit_toolbar.addSpacing(10)
         edit_toolbar.addWidget(self.local_intersect_controls)
@@ -2967,6 +3498,7 @@ class MainWindow(QMainWindow):
             self.selection_add_inner_btn,
             self.selection_transfer_btn,
             self.selection_ctd_btn,
+            self.selection_local_edit_btn,
             self.undo_btn,
             self.redo_btn,
             self.brush_down_btn,
@@ -3657,7 +4189,7 @@ class MainWindow(QMainWindow):
             self.list_widget.setCurrentRow(row + 1)
 
     def reload_current(self, keep_view: bool = False) -> None:
-        if self.is_mask_stroke_active:
+        if self.is_mask_stroke_active or self.is_local_edit_active:
             return
         if not self.current_img_path:
             return
@@ -3922,7 +4454,7 @@ class MainWindow(QMainWindow):
         return encoded.tobytes()
 
     def refresh_mask_preview(self, keep_view: bool = True) -> None:
-        if self.is_mask_stroke_active:
+        if self.is_mask_stroke_active or self.is_local_edit_active:
             return
         if self.current_base is None:
             self.mask_view.set_qimage(None)
@@ -4130,11 +4662,14 @@ class MainWindow(QMainWindow):
         self.selection_add_inner_btn.setChecked(mode == 'add_selection_inner')
         self.selection_transfer_btn.setChecked(mode == 'transfer_from_other')
         self.selection_ctd_btn.setChecked(mode == 'ctd_detect_selection')
+        self.selection_local_edit_btn.setChecked(mode == 'local_edit_selection')
         self.update_selection_combine_controls_visibility()
         self.update_local_intersect_controls_visibility()
         self.update_selection_combine_status()
 
     def selection_mode_allowed_for_tool(self, mode: str, tool: str) -> bool:
+        if mode == 'local_edit_selection':
+            return tool == 'rect'
         if tool == 'brush':
             return mode in ('add', 'subtract')
         if tool == 'rect':
@@ -4157,6 +4692,7 @@ class MainWindow(QMainWindow):
         self.selection_add_inner_btn.setVisible(tool == 'magic')
         self.selection_transfer_btn.setVisible(selection_tool)
         self.selection_ctd_btn.setVisible(selection_tool)
+        self.selection_local_edit_btn.setVisible(tool == 'rect')
 
     def update_local_intersect_controls_visibility(self) -> None:
         if getattr(self, 'local_intersect_controls', None) is None:
@@ -4406,6 +4942,10 @@ class MainWindow(QMainWindow):
 
     def on_selection_created(self, selection: object) -> None:
         selection_mask = np.asarray(selection, dtype=bool)
+        if self.selection_combine_mode == 'local_edit_selection':
+            queued_selection = selection_mask.copy()
+            QTimer.singleShot(0, lambda: self.open_local_edit_dialog(queued_selection))
+            return
         if self.selection_combine_mode == 'ctd_detect_selection':
             self.start_ctd_selection_detection(selection_mask)
             return
@@ -4422,6 +4962,57 @@ class MainWindow(QMainWindow):
             self.status.showMessage('已從其他 mask 轉入選區重疊部分。')
         else:
             self.status.showMessage('選區沒有碰到其他 mask。')
+
+    def open_local_edit_dialog(self, selection: np.ndarray) -> None:
+        current = self.current_edit_mask()
+        if self.current_base is None or current is None or selection.shape != current.shape:
+            self.status.showMessage('沒有可局部編輯的目前圖片。')
+            return
+        ys, xs = np.where(selection)
+        if xs.size == 0 or ys.size == 0:
+            self.status.showMessage('局部編輯選區是空的。')
+            return
+        x1, x2 = int(xs.min()), int(xs.max()) + 1
+        y1, y2 = int(ys.min()), int(ys.max()) + 1
+        dialog = LocalEditDialog(
+            self.current_base,
+            current,
+            (x1, y1, x2, y2),
+            self.current_edit_color(),
+            self.alpha,
+            self,
+        )
+        self.is_local_edit_active = True
+        try:
+            dialog_result = dialog.exec()
+        finally:
+            self.is_local_edit_active = False
+        if dialog_result != QDialog.DialogCode.Accepted:
+            self.status.showMessage('已取消局部編輯，全局 mask 未改變。')
+            self.set_selection_combine_mode('add')
+            self.reload_current(keep_view=True)
+            return
+        edited_crop = dialog.result_mask()
+        x1, y1, x2, y2 = dialog.result_roi_box()
+        original_crop = current[y1:y2, x1:x2]
+        if edited_crop.shape != original_crop.shape or np.array_equal(edited_crop, original_crop):
+            self.status.showMessage('局部選區沒有修改。')
+            self.set_selection_combine_mode('add')
+            return
+        self.push_undo_snapshot()
+        self.mask_revision += 1
+        updated = current.copy()
+        updated[y1:y2, x1:x2] = edited_crop
+        self.set_current_edit_mask(updated)
+        if self.edit_mode == 'mask':
+            self.queue_background_sample()
+        self.save_current_edit_mask()
+        self.mask_view.set_mask(self.current_edit_mask(), self.current_base.shape[:2])
+        self.refresh_mask_preview(keep_view=True)
+        self.queue_auto_render()
+        self.update_edit_buttons()
+        self.set_selection_combine_mode('add')
+        self.status.showMessage(f'已套用局部編輯：{x2 - x1} × {y2 - y1}px。')
 
     def on_erase_all_masks_requested(self, selection: object) -> None:
         selection_mask = np.asarray(selection, dtype=bool)
@@ -4760,7 +5351,7 @@ class MainWindow(QMainWindow):
         if not stale_result:
             self.refresh_list()
         if img_path == self.current_img_path:
-            if self.is_mask_stroke_active:
+            if self.is_mask_stroke_active or self.is_local_edit_active:
                 self.status.showMessage('舊預覽已完成，等待目前筆畫結束。')
             elif stale_result or self.pending_render_img_path:
                 self.status.showMessage('預覽已更新，等待最新編輯。')
@@ -4844,6 +5435,7 @@ class MainWindow(QMainWindow):
             '矩形 / 魔法棒 / 套索：支援添加、減去、局部交集、從其他轉入和添加CTD檢測選區\n'
             '套索左鍵：逐點建立多邊形，雙擊或 Enter 閉合並套用\n'
             '套索 Backspace：退回上一點；Esc：取消目前套索\n'
+            '局部視窗：矩形框選區域後，在獨立放大視窗編輯副本；選「調整邊框」才可拖動藍色 ROI 邊界，套用後才回寫主頁\n'
             '局部交集：只裁切本次選區碰到的既有 mask 區塊\n'
             '交集偏移：局部交集結果正數擴展，負數收縮，0 保持原大小\n'
             '選區內部：魔法棒專用，提取本次選區包圍住的內部孔洞\n'
