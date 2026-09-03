@@ -3142,6 +3142,18 @@ class MainWindow(QMainWindow):
         self.navigator_action.triggered.connect(self.set_navigator_visible)
         toolbar.addAction(self.navigator_action)
 
+        self.export_colored_btn = QPushButton('導出右圖')
+        self.export_colored_btn.setToolTip('導出右側去字預覽與 other_mask 紫色標記；不包含淡紫色擴展外圈')
+        self.export_colored_btn.clicked.connect(self.export_colored_preview)
+        toolbar.addWidget(self.export_colored_btn)
+
+        self.export_refinement_btn = QPushButton('導出待精修')
+        self.export_refinement_btn.setToolTip(
+            '導出 ZIP：根目錄為去字合成圖，並包含 other_mask 與 colored 文件夾'
+        )
+        self.export_refinement_btn.clicked.connect(self.export_refinement_package)
+        toolbar.addWidget(self.export_refinement_btn)
+
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         toolbar.addWidget(spacer)
@@ -3223,20 +3235,14 @@ class MainWindow(QMainWindow):
         self.convert_masks_btn = QPushButton('批處理')
         self.convert_masks_btn.setToolTip('將全部選區轉為指定類型；此操作不能回撤')
         self.convert_masks_btn.clicked.connect(self.show_convert_masks_dialog)
-        self.export_colored_btn = QPushButton('導出右圖')
-        self.export_colored_btn.setToolTip('導出右側去字預覽與 other_mask 紫色標記；不包含淡紫色擴展外圈')
-        self.export_colored_btn.clicked.connect(self.export_colored_preview)
-        self.export_refinement_btn = QPushButton('導出待精修')
-        self.export_refinement_btn.setToolTip(
-            '導出 ZIP：根目錄為去字合成圖，並包含 other_mask 與 colored 文件夾'
-        )
-        self.export_refinement_btn.clicked.connect(self.export_refinement_package)
+        self.selection_local_edit_btn = QPushButton('局部視窗')
+        self.selection_local_edit_btn.setCheckable(True)
+        self.selection_local_edit_btn.setToolTip('用矩形框選一部分，在獨立放大視窗中編輯副本')
         mode_toolbar.addWidget(self.edit_mask_btn)
         mode_toolbar.addWidget(self.edit_manual_solid_btn)
         mode_toolbar.addWidget(self.edit_manual_other_btn)
         mode_toolbar.addWidget(self.convert_masks_btn)
-        mode_toolbar.addWidget(self.export_colored_btn)
-        mode_toolbar.addWidget(self.export_refinement_btn)
+        mode_toolbar.addWidget(self.selection_local_edit_btn)
         mode_toolbar.addStretch()
         workspace_layout.addLayout(mode_toolbar)
 
@@ -3276,9 +3282,6 @@ class MainWindow(QMainWindow):
         self.selection_ctd_btn = QPushButton('添加CTD檢測選區')
         self.selection_ctd_btn.setCheckable(True)
         self.selection_ctd_btn.setToolTip('只對本次矩形選區跑 CTD，並把檢測結果添加到目前 mask')
-        self.selection_local_edit_btn = QPushButton('局部視窗')
-        self.selection_local_edit_btn.setCheckable(True)
-        self.selection_local_edit_btn.setToolTip('用矩形框選一部分，在獨立放大視窗中編輯副本')
         self.selection_combine_group = QButtonGroup(self)
         self.selection_combine_group.setExclusive(True)
         self.selection_combine_group.addButton(self.selection_add_btn)
@@ -3350,7 +3353,6 @@ class MainWindow(QMainWindow):
         selection_combine_layout.addWidget(self.selection_add_inner_btn)
         selection_combine_layout.addWidget(self.selection_transfer_btn)
         selection_combine_layout.addWidget(self.selection_ctd_btn)
-        selection_combine_layout.addWidget(self.selection_local_edit_btn)
         edit_toolbar.addWidget(self.selection_combine_controls)
         edit_toolbar.addSpacing(10)
         edit_toolbar.addWidget(self.local_intersect_controls)
