@@ -13,8 +13,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QObject, QPoint, QRectF, QSettings, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap
+from PySide6.QtCore import QObject, QPoint, QPointF, QRectF, QSettings, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGraphicsEllipseItem,
     QGraphicsLineItem,
+    QGraphicsPolygonItem,
     QGraphicsPixmapItem,
     QGraphicsRectItem,
     QGraphicsScene,
@@ -599,6 +600,9 @@ class MaskEditorView(ImageView):
         self._panning = False
         self._pan_last_pos: QPoint | None = None
         self._rubber_band: RubberBandRectItem | None = None
+        self._lasso_points: list[tuple[int, int]] = []
+        self._lasso_hover_point: tuple[int, int] | None = None
+        self._lasso_preview: QGraphicsPolygonItem | None = None
         self._brush_cursor: QGraphicsEllipseItem | None = None
         self._magic_preview_item: QGraphicsPixmapItem | None = None
         self._magic_preview_pending_point: tuple[int, int] | None = None
@@ -636,6 +640,7 @@ class MaskEditorView(ImageView):
     ) -> None:
         self.image_shape = shape
         self._clear_magic_preview()
+        self.cancel_lasso()
         if reset_brush_line:
             self._brush_line_start = None
             self._clear_brush_line_preview()
@@ -655,6 +660,8 @@ class MaskEditorView(ImageView):
             self.source_bgr = image[:, :, :3].copy()
 
     def set_tool(self, tool: str) -> None:
+        if tool != 'lasso':
+            self.cancel_lasso()
         if tool != 'brush':
             self._brush_line_start = None
             self._clear_brush_line_preview()
@@ -669,6 +676,8 @@ class MaskEditorView(ImageView):
         if mode in SELECTION_COMBINE_LABELS:
             self.selection_combine_mode = mode
             self._invalidate_magic_preview()
+            if self._lasso_points:
+                self._update_lasso_preview()
 
     def set_brush_radius(self, radius: int) -> None:
         self.brush_radius = max(MIN_BRUSH_RADIUS, min(MAX_BRUSH_RADIUS, int(radius)))
@@ -743,6 +752,10 @@ class MaskEditorView(ImageView):
             self._edit_started = False
             event.accept()
             return
+        if self.tool == 'lasso':
+            self._add_lasso_point(point)
+            event.accept()
+            return
         if self.tool == 'brush':
             self._active_button = event.button()
             self._last_brush_point = point
@@ -776,6 +789,9 @@ class MaskEditorView(ImageView):
         hover_point = self.image_point_from_view(event.position().toPoint())
         self._update_brush_cursor(hover_point)
         self._update_magic_preview(hover_point)
+        if self.tool == 'lasso' and self._lasso_points:
+            self._lasso_hover_point = hover_point
+            self._update_lasso_preview()
         if self._active_button is None:
             event.accept()
             return
@@ -798,6 +814,16 @@ class MaskEditorView(ImageView):
         else:
             self._update_rubber_band(self._drag_start or point, point, self._active_button)
         event.accept()
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self.tool == 'lasso':
+            point = self.image_point_from_view(event.position().toPoint())
+            if point is not None and (not self._lasso_points or self._lasso_points[-1] != point):
+                self._add_lasso_point(point)
+            self.finish_lasso()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
         if self._panning and event.button() == Qt.MouseButton.LeftButton:
@@ -837,6 +863,9 @@ class MaskEditorView(ImageView):
     def leaveEvent(self, event) -> None:
         self._update_brush_cursor(None)
         self._clear_magic_preview()
+        if self.tool == 'lasso' and self._lasso_points:
+            self._lasso_hover_point = None
+            self._update_lasso_preview()
         super().leaveEvent(event)
 
     def _is_pan_modifier(self, modifiers: Qt.KeyboardModifier) -> bool:
@@ -905,6 +934,81 @@ class MaskEditorView(ImageView):
         selection = np.zeros(self.mask.shape[:2], dtype=bool)
         selection[y1:y2 + 1, x1:x2 + 1] = True
         return selection
+
+    def _add_lasso_point(self, point: tuple[int, int]) -> None:
+        if self.mask is None:
+            return
+        if self._lasso_points and self._lasso_points[-1] == point:
+            return
+        self._lasso_points.append(point)
+        self._lasso_hover_point = point
+        self._update_lasso_preview()
+
+    def finish_lasso(self) -> bool:
+        if self.mask is None or len(self._lasso_points) < 3:
+            return False
+        points = np.asarray(self._lasso_points, dtype=np.int32)
+        selection_u8 = np.zeros(self.mask.shape[:2], dtype=np.uint8)
+        cv2.fillPoly(selection_u8, [points], 255, lineType=cv2.LINE_8)
+        selection = selection_u8 > 0
+        self.cancel_lasso()
+        if not np.any(selection):
+            return False
+        if self._should_emit_selection(Qt.MouseButton.LeftButton):
+            self.selectionCreated.emit(selection.copy())
+            return True
+        old_mask = self.mask.copy()
+        self._apply_selection(selection, Qt.MouseButton.LeftButton)
+        if np.array_equal(old_mask, self.mask):
+            return False
+        self._begin_edit_once()
+        self.maskEdited.emit(self.mask.copy())
+        self._edit_started = False
+        return True
+
+    def cancel_lasso(self) -> None:
+        self._lasso_points = []
+        self._lasso_hover_point = None
+        if self._lasso_preview is not None:
+            self.scene().removeItem(self._lasso_preview)
+            self._lasso_preview = None
+
+    def remove_last_lasso_point(self) -> bool:
+        if not self._lasso_points:
+            return False
+        self._lasso_points.pop()
+        self._lasso_hover_point = self._lasso_points[-1] if self._lasso_points else None
+        if self._lasso_points:
+            self._update_lasso_preview()
+        else:
+            self.cancel_lasso()
+        return True
+
+    def _update_lasso_preview(self) -> None:
+        if not self._lasso_points:
+            self.cancel_lasso()
+            return
+        preview_points = list(self._lasso_points)
+        if self._lasso_hover_point is not None and self._lasso_hover_point != preview_points[-1]:
+            preview_points.append(self._lasso_hover_point)
+        polygon = QPolygonF([QPointF(float(x), float(y)) for x, y in preview_points])
+        if self._lasso_preview is None:
+            self._lasso_preview = QGraphicsPolygonItem()
+            self._lasso_preview.setZValue(11)
+            self._lasso_preview.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self.scene().addItem(self._lasso_preview)
+        operation = self.selection_combine_mode
+        if operation == 'subtract':
+            pen = self._rect_pen_remove
+        elif operation == 'ctd_detect_selection':
+            pen = self._rect_pen_detect
+        elif operation in ('local_intersect', 'transfer_from_other'):
+            pen = self._rect_pen_intersect
+        else:
+            pen = self._rect_pen_add
+        self._lasso_preview.setPen(pen)
+        self._lasso_preview.setBrush(self._rect_brush_default)
+        self._lasso_preview.setPolygon(polygon)
 
     def _apply_magic_wand(
         self,
@@ -1280,7 +1384,7 @@ class MaskEditorView(ImageView):
     def _update_tool_cursor(self) -> None:
         if self._panning:
             return
-        if self.tool == 'magic':
+        if self.tool in ('magic', 'lasso'):
             self.setCursor(Qt.CursorShape.ArrowCursor)
         else:
             self.unsetCursor()
@@ -2488,16 +2592,20 @@ class MainWindow(QMainWindow):
         self.magic_btn = QPushButton('F7 魔法棒')
         self.magic_btn.setCheckable(True)
         self.magic_btn.clicked.connect(lambda: self.set_edit_tool('magic'))
+        self.lasso_btn = QPushButton('F8 套索')
+        self.lasso_btn.setCheckable(True)
+        self.lasso_btn.setToolTip('左鍵逐點建立多邊形；雙擊或 Enter 閉合，Backspace 退回，Esc 取消')
+        self.lasso_btn.clicked.connect(lambda: self.set_edit_tool('lasso'))
         self.brush_btn = QPushButton('F6 筆刷')
         self.brush_btn.setCheckable(True)
         self.brush_btn.clicked.connect(lambda: self.set_edit_tool('brush'))
         self.selection_add_btn = QPushButton('F9 添加')
         self.selection_add_btn.setCheckable(True)
         self.selection_add_btn.setChecked(True)
-        self.selection_add_btn.setToolTip('筆刷、矩形和魔法棒左鍵添加到目前 mask')
+        self.selection_add_btn.setToolTip('筆刷、矩形、魔法棒和套索添加到目前 mask')
         self.selection_subtract_btn = QPushButton('F10 減去')
         self.selection_subtract_btn.setCheckable(True)
-        self.selection_subtract_btn.setToolTip('筆刷、矩形和魔法棒左鍵從目前 mask 減去；右鍵矩形會清除所有 mask')
+        self.selection_subtract_btn.setToolTip('筆刷、矩形、魔法棒和套索從目前 mask 減去；右鍵矩形會清除所有 mask')
         self.selection_intersect_btn = QPushButton('F11 局部交集')
         self.selection_intersect_btn.setCheckable(True)
         self.selection_intersect_btn.setToolTip('只裁切本次選區碰到的既有 mask 區塊，不影響其他區塊')
@@ -2569,6 +2677,7 @@ class MainWindow(QMainWindow):
         edit_toolbar.addWidget(self.rect_btn)
         edit_toolbar.addWidget(self.brush_btn)
         edit_toolbar.addWidget(self.magic_btn)
+        edit_toolbar.addWidget(self.lasso_btn)
         edit_toolbar.addSpacing(10)
         self.selection_combine_controls = QWidget()
         selection_combine_layout = QHBoxLayout(self.selection_combine_controls)
@@ -2716,6 +2825,7 @@ class MainWindow(QMainWindow):
             self.brush_btn,
             self.rect_btn,
             self.magic_btn,
+            self.lasso_btn,
             self.selection_add_btn,
             self.selection_subtract_btn,
             self.selection_intersect_btn,
@@ -3855,12 +3965,13 @@ class MainWindow(QMainWindow):
         self.brush_btn.setChecked(tool == 'brush')
         self.rect_btn.setChecked(tool == 'rect')
         self.magic_btn.setChecked(tool == 'magic')
+        self.lasso_btn.setChecked(tool == 'lasso')
         if (
             (reset_selection and self.selection_combine_mode != 'add')
             or not self.selection_mode_allowed_for_tool(self.selection_combine_mode, tool)
         ):
             self.set_selection_combine_mode('add')
-        self.selection_combine_controls.setVisible(tool in ('rect', 'magic', 'brush'))
+        self.selection_combine_controls.setVisible(tool in ('rect', 'magic', 'brush', 'lasso'))
         self.brush_controls.setVisible(tool == 'brush')
         self.magic_controls.setVisible(tool == 'magic')
         self.update_selection_combine_controls_visibility()
@@ -3890,6 +4001,8 @@ class MainWindow(QMainWindow):
             return mode in ('add', 'subtract')
         if tool == 'rect':
             return mode not in ('selection_inner', 'add_selection_inner')
+        if tool == 'lasso':
+            return mode not in ('selection_inner', 'add_selection_inner')
         if tool == 'magic':
             return mode in SELECTION_COMBINE_LABELS
         return False
@@ -3898,20 +4011,20 @@ class MainWindow(QMainWindow):
         if getattr(self, 'selection_inner_btn', None) is None:
             return
         tool = self.mask_view.tool
-        rect_or_magic = tool in ('rect', 'magic')
-        self.selection_add_btn.setVisible(tool in ('rect', 'magic', 'brush'))
-        self.selection_subtract_btn.setVisible(tool in ('rect', 'magic', 'brush'))
-        self.selection_intersect_btn.setVisible(rect_or_magic)
+        selection_tool = tool in ('rect', 'magic', 'lasso')
+        self.selection_add_btn.setVisible(tool in ('rect', 'magic', 'brush', 'lasso'))
+        self.selection_subtract_btn.setVisible(tool in ('rect', 'magic', 'brush', 'lasso'))
+        self.selection_intersect_btn.setVisible(selection_tool)
         self.selection_inner_btn.setVisible(tool == 'magic')
         self.selection_add_inner_btn.setVisible(tool == 'magic')
-        self.selection_transfer_btn.setVisible(rect_or_magic)
-        self.selection_ctd_btn.setVisible(rect_or_magic)
+        self.selection_transfer_btn.setVisible(selection_tool)
+        self.selection_ctd_btn.setVisible(selection_tool)
 
     def update_local_intersect_controls_visibility(self) -> None:
         if getattr(self, 'local_intersect_controls', None) is None:
             return
         visible = (
-            self.mask_view.tool in ('rect', 'magic')
+            self.mask_view.tool in ('rect', 'magic', 'lasso')
             and self.selection_combine_mode == 'local_intersect'
         )
         self.local_intersect_controls.setVisible(visible)
@@ -3922,6 +4035,12 @@ class MainWindow(QMainWindow):
         if self.mask_view.tool == 'brush':
             label = SELECTION_COMBINE_LABELS.get(self.selection_combine_mode, '添加')
             self.status.showMessage(f'筆刷模式：{label}；右鍵拖矩形清除所有 mask')
+            return
+        if self.mask_view.tool == 'lasso':
+            label = SELECTION_COMBINE_LABELS.get(self.selection_combine_mode, '添加')
+            self.status.showMessage(
+                f'套索模式：{label}；雙擊或 Enter 閉合，Backspace 退回，Esc 取消'
+            )
             return
         label = SELECTION_COMBINE_LABELS.get(self.selection_combine_mode, '添加')
         self.status.showMessage(f'選區模式：{label}；右鍵拖矩形清除所有 mask')
@@ -3998,6 +4117,9 @@ class MainWindow(QMainWindow):
         if event.key() == Qt.Key.Key_F7:
             self.set_edit_tool('magic')
             return
+        if event.key() == Qt.Key.Key_F8:
+            self.set_edit_tool('lasso')
+            return
         if event.key() == Qt.Key.Key_F9:
             self.set_selection_combine_mode('add')
             return
@@ -4019,6 +4141,20 @@ class MainWindow(QMainWindow):
         if event.key() == Qt.Key.Key_W:
             self.set_edit_tool('magic')
             return
+        if event.key() == Qt.Key.Key_L:
+            self.set_edit_tool('lasso')
+            return
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self.mask_view.tool == 'lasso' and self.mask_view.finish_lasso():
+                return
+        if event.key() == Qt.Key.Key_Backspace:
+            if self.mask_view.tool == 'lasso' and self.mask_view.remove_last_lasso_point():
+                return
+        if event.key() == Qt.Key.Key_Escape:
+            if self.mask_view.tool == 'lasso' and self.mask_view._lasso_points:
+                self.mask_view.cancel_lasso()
+                self.update_selection_combine_status()
+                return
         if event.key() == Qt.Key.Key_BracketLeft:
             self.change_brush_radius(-4)
             return
@@ -4481,7 +4617,9 @@ class MainWindow(QMainWindow):
             '筆刷左鍵：按「添加 / 減去」處理目前 mask\n'
             '右鍵拖拽：不分工具，矩形清除自動 / 強制純色 / 需要修改 mask\n'
             '筆刷 Shift + 按下拖到鬆開：連接按下和鬆開位置\n'
-            '矩形 / 魔法棒左鍵：按「添加 / 減去 / 局部交集 / 選區內部 / 添加＋內部 / 從其他轉入 / 添加CTD檢測選區」處理目前 mask\n'
+            '矩形 / 魔法棒 / 套索：支援添加、減去、局部交集、從其他轉入和添加CTD檢測選區\n'
+            '套索左鍵：逐點建立多邊形，雙擊或 Enter 閉合並套用\n'
+            '套索 Backspace：退回上一點；Esc：取消目前套索\n'
             '局部交集：只裁切本次選區碰到的既有 mask 區塊\n'
             '交集偏移：局部交集結果正數擴展，負數收縮，0 保持原大小\n'
             '選區內部：魔法棒專用，提取本次選區包圍住的內部孔洞\n'
@@ -4508,6 +4646,7 @@ class MainWindow(QMainWindow):
             'F5：矩形工具\n'
             'F6：筆刷工具\n'
             'F7：魔法棒工具\n'
+            'F8：套索工具\n'
             'F9：添加\n'
             'F10：減去\n'
             'F11：局部交集\n'

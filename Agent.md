@@ -160,6 +160,8 @@ inpainted 合成預覽
 other_mask 顯示
 矩形工具
 筆刷工具
+魔法棒工具
+多邊形套索工具
 撤銷 / 重做
 自動保存 mask
 自動重新生成當前頁 overlay
