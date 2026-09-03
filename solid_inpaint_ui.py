@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QGraphicsEllipseItem,
+    QGraphicsItem,
     QGraphicsLineItem,
     QGraphicsPolygonItem,
     QGraphicsPixmapItem,
@@ -574,9 +575,91 @@ class RubberBandRectItem(QGraphicsRectItem):
         painter.restore()
 
 
+class LiveMaskOverlayItem(QGraphicsItem):
+    TILE_SIZE = 128
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.image_width = 0
+        self.image_height = 0
+        self.renderer = None
+        self.tiles: dict[tuple[int, int], QImage] = {}
+        self.setZValue(2)
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.setVisible(False)
+
+    def boundingRect(self) -> QRectF:
+        return QRectF(0, 0, self.image_width, self.image_height)
+
+    def configure(self, width: int, height: int, renderer) -> None:
+        self.prepareGeometryChange()
+        self.image_width = max(0, int(width))
+        self.image_height = max(0, int(height))
+        self.renderer = renderer
+        self.tiles.clear()
+        self.setVisible(self.image_width > 0 and self.image_height > 0)
+        self.update()
+
+    def clear(self) -> None:
+        self.renderer = None
+        self.tiles.clear()
+        self.setVisible(False)
+
+    def invalidate(self, rect: QRectF) -> None:
+        if self.renderer is None or rect.isEmpty():
+            return
+        aligned = rect.toAlignedRect()
+        tile_size = self.TILE_SIZE
+        tx1 = max(0, aligned.left()) // tile_size
+        ty1 = max(0, aligned.top()) // tile_size
+        tx2 = max(0, aligned.right()) // tile_size
+        ty2 = max(0, aligned.bottom()) // tile_size
+        for ty in range(ty1, ty2 + 1):
+            for tx in range(tx1, tx2 + 1):
+                self.tiles.pop((tx, ty), None)
+        self.update(rect)
+
+    def _tile_image(self, tx: int, ty: int) -> QImage | None:
+        key = (tx, ty)
+        cached = self.tiles.get(key)
+        if cached is not None:
+            return cached
+        x1 = tx * self.TILE_SIZE
+        y1 = ty * self.TILE_SIZE
+        x2 = min(self.image_width, x1 + self.TILE_SIZE)
+        y2 = min(self.image_height, y1 + self.TILE_SIZE)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        patch = self.renderer(x1, y1, x2, y2)
+        if patch is None or patch.size == 0:
+            return None
+        image = _qimage_from_rgba(patch)
+        self.tiles[key] = image
+        return image
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:
+        if self.renderer is None or self.image_width <= 0 or self.image_height <= 0:
+            return
+        exposed = option.exposedRect.intersected(self.boundingRect()).toAlignedRect()
+        x1 = max(0, exposed.left())
+        y1 = max(0, exposed.top())
+        x2 = min(self.image_width, exposed.right() + 1)
+        y2 = min(self.image_height, exposed.bottom() + 1)
+        if x2 <= x1 or y2 <= y1:
+            return
+        tile_size = self.TILE_SIZE
+        for ty in range(y1 // tile_size, (y2 - 1) // tile_size + 1):
+            for tx in range(x1 // tile_size, (x2 - 1) // tile_size + 1):
+                image = self._tile_image(tx, ty)
+                if image is not None:
+                    painter.drawImage(QPointF(tx * tile_size, ty * tile_size), image)
+
+
 class MaskEditorView(ImageView):
     editStarted = Signal()
+    brushStrokeStateChanged = Signal(bool)
     maskEdited = Signal(object)
+    brushPreviewChanged = Signal(object)
     selectionCreated = Signal(object)
     eraseAllMasksRequested = Signal(object)
 
@@ -600,6 +683,8 @@ class MaskEditorView(ImageView):
         self._panning = False
         self._pan_last_pos: QPoint | None = None
         self._rubber_band: RubberBandRectItem | None = None
+        self._live_mask_overlay = LiveMaskOverlayItem()
+        self.scene().addItem(self._live_mask_overlay)
         self._lasso_points: list[tuple[int, int]] = []
         self._lasso_hover_point: tuple[int, int] | None = None
         self._lasso_preview: QGraphicsPolygonItem | None = None
@@ -614,6 +699,7 @@ class MaskEditorView(ImageView):
         self._magic_preview_timer.setInterval(MAGIC_PREVIEW_DELAY_MS)
         self._magic_preview_timer.timeout.connect(self._refresh_magic_preview)
         self._edit_started = False
+        self._brush_stroke_active = False
         self._rect_pen_add = QPen(QColor('#e9fffb'), 2, Qt.PenStyle.DashLine)
         self._rect_pen_remove = QPen(QColor('#ff8f8f'), 2, Qt.PenStyle.DashLine)
         self._rect_pen_intersect = QPen(QColor('#ffd86f'), 2, Qt.PenStyle.DashLine)
@@ -641,6 +727,7 @@ class MaskEditorView(ImageView):
         self.image_shape = shape
         self._clear_magic_preview()
         self.cancel_lasso()
+        self.stop_live_mask_preview()
         if reset_brush_line:
             self._brush_line_start = None
             self._clear_brush_line_preview()
@@ -663,6 +750,8 @@ class MaskEditorView(ImageView):
         if tool != 'lasso':
             self.cancel_lasso()
         if tool != 'brush':
+            self._set_brush_stroke_active(False)
+            self.stop_live_mask_preview()
             self._brush_line_start = None
             self._clear_brush_line_preview()
         self.tool = tool
@@ -760,13 +849,14 @@ class MaskEditorView(ImageView):
             self._active_button = event.button()
             self._last_brush_point = point
             self._edit_started = False
+            self._set_brush_stroke_active(True)
             if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
                 self._brush_line_start = point
                 self._update_brush_line_preview(point, point, event.button())
             else:
                 self._begin_edit_once()
                 self._paint_brush(point, event.button())
-                self.maskEdited.emit(self.mask.copy())
+                self.brushPreviewChanged.emit(self._brush_dirty_rect(point, point))
             event.accept()
             return
         self._active_button = event.button()
@@ -808,9 +898,10 @@ class MaskEditorView(ImageView):
                 self._update_brush_line_preview(self._brush_line_start, point, self._active_button)
             else:
                 self._begin_edit_once()
-                self._paint_line(self._last_brush_point or point, point, self._active_button)
+                start = self._last_brush_point or point
+                self._paint_line(start, point, self._active_button)
                 self._last_brush_point = point
-                self.maskEdited.emit(self.mask.copy())
+                self.brushPreviewChanged.emit(self._brush_dirty_rect(start, point))
         else:
             self._update_rubber_band(self._drag_start or point, point, self._active_button)
         event.accept()
@@ -840,9 +931,11 @@ class MaskEditorView(ImageView):
             selection = self._selection_from_rect(self._drag_start, point)
             if selection is not None:
                 self.eraseAllMasksRequested.emit(selection)
-        elif self.tool == 'brush' and self.mask is not None and self._brush_line_start is not None and point is not None:
-            self._begin_edit_once()
-            self._paint_line(self._brush_line_start, point, self._active_button)
+        elif self.tool == 'brush' and self.mask is not None:
+            if self._brush_line_start is not None and point is not None:
+                self._begin_edit_once()
+                self._paint_line(self._brush_line_start, point, self._active_button)
+            self._set_brush_stroke_active(False)
             self.maskEdited.emit(self.mask.copy())
         if not self._erase_all_drag and self.tool == 'rect' and self.mask is not None and self._drag_start is not None and point is not None:
             if self._apply_rect(self._drag_start, point, self._active_button):
@@ -859,6 +952,13 @@ class MaskEditorView(ImageView):
         self._clear_rubber_band()
         self._clear_magic_preview()
         event.accept()
+
+    def _set_brush_stroke_active(self, active: bool) -> None:
+        active = bool(active)
+        if self._brush_stroke_active == active:
+            return
+        self._brush_stroke_active = active
+        self.brushStrokeStateChanged.emit(active)
 
     def leaveEvent(self, event) -> None:
         self._update_brush_cursor(None)
@@ -901,6 +1001,31 @@ class MaskEditorView(ImageView):
         color = self._brush_color_for_button(button)
         cv2.line(self.mask, start, end, color, thickness=self.brush_radius * 2, lineType=cv2.LINE_8)
         cv2.circle(self.mask, end, self.brush_radius, color, thickness=-1, lineType=cv2.LINE_8)
+
+    def _brush_dirty_rect(self, start: tuple[int, int], end: tuple[int, int]) -> QRectF:
+        padding = self.brush_radius + 2
+        x1 = min(start[0], end[0]) - padding
+        y1 = min(start[1], end[1]) - padding
+        x2 = max(start[0], end[0]) + padding + 1
+        y2 = max(start[1], end[1]) + padding + 1
+        if self.image_shape is not None:
+            height, width = self.image_shape
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(width, x2), min(height, y2)
+        return QRectF(x1, y1, max(0, x2 - x1), max(0, y2 - y1))
+
+    def start_live_mask_preview(self, renderer) -> None:
+        if self.image_shape is None:
+            return
+        height, width = self.image_shape
+        self._live_mask_overlay.configure(width, height, renderer)
+
+    def update_live_mask_preview(self, dirty_rect: QRectF) -> None:
+        if self._live_mask_overlay.isVisible():
+            self._live_mask_overlay.invalidate(dirty_rect)
+
+    def stop_live_mask_preview(self) -> None:
+        self._live_mask_overlay.clear()
 
     def _apply_rect(
         self,
@@ -2361,6 +2486,11 @@ class MainWindow(QMainWindow):
         self.pdf_worker: PdfWorker | None = None
         self.pending_render_img_path = ''
         self.pending_render_mask: np.ndarray | None = None
+        self.is_mask_stroke_active = False
+        self.mask_revision = 0
+        self.page_worker_revision = -1
+        self.brush_live_color_bgr = self.mask_display_color
+        self.brush_live_alpha = self.alpha
         self.suppress_list_selection = False
         self._syncing_preview_view = False
         self.render_timer = QTimer(self)
@@ -2794,6 +2924,10 @@ class MainWindow(QMainWindow):
 
         self.mask_view = MaskEditorView()
         self.mask_view.editStarted.connect(self.push_undo_snapshot)
+        self.mask_view.editStarted.connect(self.begin_mask_edit_revision)
+        self.mask_view.brushStrokeStateChanged.connect(self.on_brush_stroke_state_changed)
+        self.mask_view.editStarted.connect(self.prepare_brush_live_preview)
+        self.mask_view.brushPreviewChanged.connect(self.update_brush_live_preview)
         self.mask_view.maskEdited.connect(self.on_mask_edited)
         self.mask_view.selectionCreated.connect(self.on_selection_created)
         self.mask_view.eraseAllMasksRequested.connect(self.on_erase_all_masks_requested)
@@ -3523,6 +3657,8 @@ class MainWindow(QMainWindow):
             self.list_widget.setCurrentRow(row + 1)
 
     def reload_current(self, keep_view: bool = False) -> None:
+        if self.is_mask_stroke_active:
+            return
         if not self.current_img_path:
             return
         base = _optional_imread(self.current_img_path, cv2.IMREAD_UNCHANGED)
@@ -3786,6 +3922,8 @@ class MainWindow(QMainWindow):
         return encoded.tobytes()
 
     def refresh_mask_preview(self, keep_view: bool = True) -> None:
+        if self.is_mask_stroke_active:
+            return
         if self.current_base is None:
             self.mask_view.set_qimage(None)
             if getattr(self, 'navigator', None) is not None:
@@ -4177,7 +4315,27 @@ class MainWindow(QMainWindow):
         self.redo_stack = []
         self.update_edit_buttons()
 
+    def begin_mask_edit_revision(self) -> None:
+        self.mask_revision += 1
+
+    def on_brush_stroke_state_changed(self, active: bool) -> None:
+        self.is_mask_stroke_active = bool(active)
+        if not active:
+            return
+        # Any background result already in flight belongs to the pre-stroke mask.
+        # Invalidate it before the first brush pixel is written so it cannot
+        # replace the live editor buffer or force a full left-preview refresh.
+        self.background_sample_request_id += 1
+        self.background_sample_timer.stop()
+        self.render_timer.stop()
+        self.resize_fit_timer.stop()
+        self.pending_background_img_path = ''
+        self.pending_background_mask = None
+        if self.background_worker is not None:
+            self.background_worker.cancel()
+
     def on_mask_edited(self, mask: object) -> None:
+        self.mask_view.stop_live_mask_preview()
         self.set_current_edit_mask(np.asarray(mask))
         if self.edit_mode == 'mask':
             self.queue_background_sample()
@@ -4185,6 +4343,66 @@ class MainWindow(QMainWindow):
         self.refresh_mask_preview(keep_view=True)
         self.queue_auto_render()
         self.update_edit_buttons()
+
+    def prepare_brush_live_preview(self) -> None:
+        if self.mask_view.tool != 'brush' or self.current_base is None:
+            return
+        empty_mask = np.zeros(self.current_base.shape[:2], dtype=np.uint8)
+        auto_mask = empty_mask if self.edit_mode == 'mask' else self.current_mask
+        manual_solid = None if self.edit_mode == 'manual_solid' else self.current_manual_solid
+        manual_other = None if self.edit_mode == 'manual_other' else self.current_manual_other
+        preview = _mask_overlay_image(
+            self.current_base,
+            auto_mask,
+            self.alpha,
+            self.mask_display_color,
+        )
+        preview = _overlay_transparent_mask_on_bgr(
+            preview,
+            manual_solid,
+            self.alpha,
+            EDIT_MODE_COLORS['manual_solid'],
+        )
+        preview = _overlay_transparent_mask_on_bgr(
+            preview,
+            manual_other,
+            self.alpha,
+            EDIT_MODE_COLORS['manual_other'],
+        )
+        if self.show_background_sample and self.current_background_sample is not None:
+            preview = _overlay_mask_on_bgr(
+                preview,
+                self.current_background_sample,
+                SAMPLE_RING_DISPLAY_ALPHA,
+                SAMPLE_RING_DISPLAY_COLOR_BGR,
+            )
+        self.mask_view.set_qimage(_qimage_from_bgr(preview), keep_view=True)
+        self.brush_live_color_bgr = self.current_edit_color()
+        self.brush_live_alpha = self.alpha
+        self.mask_view.start_live_mask_preview(self.render_brush_live_patch)
+
+    def render_brush_live_patch(self, x1: int, y1: int, x2: int, y2: int) -> np.ndarray:
+        live_mask = self.mask_view.mask
+        if live_mask is None:
+            return np.zeros((y2 - y1, x2 - x1, 4), dtype=np.uint8)
+        live_crop = live_mask[y1:y2, x1:x2]
+        patch = np.zeros((*live_crop.shape, 4), dtype=np.uint8)
+        patch[:, :, :3] = self.brush_live_color_bgr
+        alpha = max(1, min(255, round(self.brush_live_alpha * 255)))
+        patch[:, :, 3] = (live_crop > 0) * alpha
+        return patch
+
+    def update_brush_live_preview(self, dirty_rect: object) -> None:
+        mask = self.mask_view.mask
+        if mask is None:
+            return
+        if self.edit_mode == 'manual_solid':
+            self.current_manual_solid = mask
+        elif self.edit_mode == 'manual_other':
+            self.current_manual_other = mask
+        else:
+            self.current_mask = mask
+        self.mask_view.update_live_mask_preview(dirty_rect)
 
     def on_selection_created(self, selection: object) -> None:
         selection_mask = np.asarray(selection, dtype=bool)
@@ -4519,6 +4737,7 @@ class MainWindow(QMainWindow):
             return
         img_path = self.pending_render_img_path
         mask = self.pending_render_mask.copy()
+        self.page_worker_revision = self.mask_revision
         self.pending_render_img_path = ''
         self.pending_render_mask = None
         self.page_worker_thread = QThread()
@@ -4533,12 +4752,17 @@ class MainWindow(QMainWindow):
         self.page_worker_thread.start()
 
     def on_page_render_finished(self, img_path: str, report: dict) -> None:
-        self.report = report
+        stale_result = self.page_worker_revision != self.mask_revision
+        if not stale_result:
+            self.report = report
         if self.pending_render_img_path == img_path and self.pending_render_mask is not None:
             imwrite(_mask_path(self.paths, img_path), self.pending_render_mask)
-        self.refresh_list()
+        if not stale_result:
+            self.refresh_list()
         if img_path == self.current_img_path:
-            if self.pending_render_img_path:
+            if self.is_mask_stroke_active:
+                self.status.showMessage('舊預覽已完成，等待目前筆畫結束。')
+            elif stale_result or self.pending_render_img_path:
                 self.status.showMessage('預覽已更新，等待最新編輯。')
             else:
                 self.reload_current(keep_view=True)
@@ -4684,6 +4908,8 @@ class MainWindow(QMainWindow):
 
 
 def main() -> None:
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_CompressHighFrequencyEvents, False)
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_CompressTabletEvents, False)
     app = QApplication(sys.argv)
     app.setApplicationName('塗白')
     app.setOrganizationName('ComicTextDetector')
