@@ -86,6 +86,14 @@ other_mask/<name>.png
 需要人工注意的區域。這些區域可能背景不夠純、取樣不足、色彩分布不穩定，或不適合用純色直接覆蓋。
 
 ```text
+export_pair/<name>.png
+export_pair/other_mask/<name>.png
+export_pair/colored/<name>.png
+```
+
+「導出待精修」產生的固定位置配對圖片，不壓縮。
+
+```text
 solid_inpaint_report.json
 ```
 

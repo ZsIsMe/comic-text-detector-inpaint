@@ -7,8 +7,6 @@ import os
 import os.path as osp
 import subprocess
 import sys
-import tempfile
-import zipfile
 from pathlib import Path
 
 import cv2
@@ -3149,7 +3147,8 @@ class MainWindow(QMainWindow):
 
         self.export_refinement_btn = QPushButton('導出待精修')
         self.export_refinement_btn.setToolTip(
-            '導出 ZIP：根目錄為去字合成圖，並包含 other_mask 與 colored 文件夾'
+            '導出到 ctd_inpainted/export_pair：根目錄為去字合成圖，'
+            '並包含 other_mask 與 colored 文件夾'
         )
         self.export_refinement_btn.clicked.connect(self.export_refinement_package)
         toolbar.addWidget(self.export_refinement_btn)
@@ -4352,85 +4351,63 @@ class MainWindow(QMainWindow):
             )
             return
 
-        default_name = f'{Path(self.folder).name}_待精修.zip'
-        default_path = str(Path(self.folder).parent / default_name)
-        zip_path, _ = QFileDialog.getSaveFileName(
-            self,
-            '導出待精修壓縮包',
-            default_path,
-            'ZIP 壓縮包 (*.zip)',
+        export_dir = self.paths.get(
+            'export_pair',
+            osp.join(self.paths['output'], 'export_pair'),
         )
-        if not zip_path:
-            return
-        if not zip_path.lower().endswith('.zip'):
-            zip_path += '.zip'
+        os.makedirs(export_dir, exist_ok=True)
+        other_mask_dir = osp.join(export_dir, 'other_mask')
+        colored_dir = osp.join(export_dir, 'colored')
+        os.makedirs(other_mask_dir, exist_ok=True)
+        os.makedirs(colored_dir, exist_ok=True)
 
         self.save_all_edit_masks()
-        temp_path = ''
         missing_overlays = 0
         missing_masks = 0
         try:
-            target_dir = osp.dirname(osp.abspath(zip_path))
-            with tempfile.NamedTemporaryFile(
-                prefix='.solid-inpaint-refinement-',
-                suffix='.zip',
-                dir=target_dir,
-                delete=False,
-            ) as temp_file:
-                temp_path = temp_file.name
-
             total = len(self.imglist)
-            with zipfile.ZipFile(temp_path, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
-                for index, img_path in enumerate(self.imglist, start=1):
-                    self.status.showMessage(f'正在導出待精修：{index}/{total}')
-                    QApplication.processEvents()
+            for index, img_path in enumerate(self.imglist, start=1):
+                self.status.showMessage(f'正在導出待精修：{index}/{total}')
+                QApplication.processEvents()
 
-                    base = _optional_imread(img_path, cv2.IMREAD_UNCHANGED)
-                    if base is None:
-                        raise FileNotFoundError(f'無法讀取原圖：{osp.basename(img_path)}')
+                base = _optional_imread(img_path, cv2.IMREAD_UNCHANGED)
+                if base is None:
+                    raise FileNotFoundError(f'無法讀取原圖：{osp.basename(img_path)}')
 
-                    overlay = _optional_imread(_output_path(self.paths, img_path), cv2.IMREAD_UNCHANGED)
-                    if overlay is None:
-                        missing_overlays += 1
-                        clean = (
-                            base[:, :, :3].copy()
-                            if len(base.shape) == 3
-                            else cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
-                        )
-                    else:
-                        clean = _compose_overlay_preview(base, overlay)
-
-                    other_mask = _optional_imread(
-                        _other_mask_path(self.paths, img_path),
-                        cv2.IMREAD_GRAYSCALE,
+                overlay = _optional_imread(_output_path(self.paths, img_path), cv2.IMREAD_UNCHANGED)
+                if overlay is None:
+                    missing_overlays += 1
+                    clean = (
+                        base[:, :, :3].copy()
+                        if len(base.shape) == 3
+                        else cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
                     )
-                    if other_mask is None:
-                        missing_masks += 1
-                        other_mask = np.zeros(clean.shape[:2], dtype=np.uint8)
-                    elif other_mask.shape[:2] != clean.shape[:2]:
-                        raise ValueError(
-                            f'other_mask 尺寸與原圖不一致：{osp.basename(img_path)}'
-                        )
+                else:
+                    clean = _compose_overlay_preview(base, overlay)
 
-                    colored = _overlay_mask_on_bgr(
-                        clean,
-                        other_mask,
-                        self.other_mask_display_alpha,
-                        self.other_mask_display_color,
+                other_mask = _optional_imread(
+                    _other_mask_path(self.paths, img_path),
+                    cv2.IMREAD_GRAYSCALE,
+                )
+                if other_mask is None:
+                    missing_masks += 1
+                    other_mask = np.zeros(clean.shape[:2], dtype=np.uint8)
+                elif other_mask.shape[:2] != clean.shape[:2]:
+                    raise ValueError(
+                        f'other_mask 尺寸與原圖不一致：{osp.basename(img_path)}'
                     )
-                    filename = f'{Path(img_path).stem}.png'
-                    archive.writestr(filename, self._encode_png(clean))
-                    archive.writestr(f'other_mask/{filename}', self._encode_png(other_mask))
-                    archive.writestr(f'colored/{filename}', self._encode_png(colored))
 
-            os.replace(temp_path, zip_path)
-            temp_path = ''
+                colored = _overlay_mask_on_bgr(
+                    clean,
+                    other_mask,
+                    self.other_mask_display_alpha,
+                    self.other_mask_display_color,
+                )
+                filename = f'{Path(img_path).stem}.png'
+                imwrite(osp.join(export_dir, filename), clean)
+                imwrite(osp.join(other_mask_dir, filename), other_mask)
+                imwrite(osp.join(colored_dir, filename), colored)
         except Exception as exc:
-            if temp_path and osp.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except OSError:
-                    pass
             QMessageBox.critical(self, '導出失敗', str(exc))
             self.status.showMessage(f'導出待精修失敗：{exc}')
             return
@@ -4444,16 +4421,9 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             '導出完成',
-            f'已導出 {len(self.imglist)} 張待精修圖片：\n{zip_path}{detail}',
+            f'已導出 {len(self.imglist)} 張待精修圖片：\n{export_dir}{detail}',
         )
-        self.status.showMessage(f'已導出待精修壓縮包：{zip_path}')
-
-    @staticmethod
-    def _encode_png(image: np.ndarray) -> bytes:
-        ok, encoded = cv2.imencode('.png', image)
-        if not ok:
-            raise ValueError('無法編碼 PNG 圖片')
-        return encoded.tobytes()
+        self.status.showMessage(f'已導出待精修圖片：{export_dir}')
 
     def refresh_mask_preview(self, keep_view: bool = True) -> None:
         if self.is_mask_stroke_active or self.is_local_edit_active:

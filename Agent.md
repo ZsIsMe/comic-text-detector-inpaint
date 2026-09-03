@@ -120,6 +120,11 @@ solid_inpaint_report.json
 
 preview_report.pdf
   檢查用 PDF。
+
+export_pair/<name>.png
+export_pair/other_mask/<name>.png
+export_pair/colored/<name>.png
+  「導出待精修」產生的固定位置配對圖片，不壓縮。
 ```
 
 ## 核心處理邏輯

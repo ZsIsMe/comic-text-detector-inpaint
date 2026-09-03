@@ -131,7 +131,7 @@ Inpainted 合成預覽
 
 「取兩者交集」會讓你選擇傳入 Mask 文件夾。若裡面存在同名 PNG，會用 `目前 mask ∩ 傳入 mask` 覆蓋目前 mask，然後重新生成 `other_mask`、`inpainted` 和 `solid_inpaint_report.json`；缺少同名 PNG 的頁面會保留原 mask。
 
-「導出待精修」會導出全部頁面的 ZIP。壓縮包根目錄是原圖與 `inpainted` 的去字合成 PNG，`other_mask/` 放同名 mask，`colored/` 放與「導出右圖」一致的標記預覽。
+「導出待精修」會將全部頁面直接輸出到 `ctd_inpainted/export_pair/`，不生成壓縮包。該目錄根層是原圖與 `inpainted` 的去字合成 PNG，`other_mask/` 放同名 mask，`colored/` 放與「導出右圖」一致的標記預覽。
 
 快捷鍵：
 
@@ -184,6 +184,9 @@ ctd_inpainted/other_mask/<name>.png
 ctd_inpainted/inpainted/<name>.png
 ctd_inpainted/solid_inpaint_report.json
 ctd_inpainted/preview_report.pdf
+ctd_inpainted/export_pair/<name>.png
+ctd_inpainted/export_pair/other_mask/<name>.png
+ctd_inpainted/export_pair/colored/<name>.png
 ```
 
 說明：

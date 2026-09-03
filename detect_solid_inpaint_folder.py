@@ -36,6 +36,7 @@ INPAINTED_DIR = 'inpainted'
 MANUAL_SOLID_DIR = 'manual_solid'
 MANUAL_OTHER_DIR = 'manual_other'
 BACKGROUND_SAMPLE_CACHE_DIR = 'background_sample_cache'
+EXPORT_PAIR_DIR = 'export_pair'
 REPORT_JSON = 'solid_inpaint_report.json'
 PREVIEW_PDF = 'preview_report.pdf'
 MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'comictextdetector.pt'
@@ -126,6 +127,7 @@ def _ensure_dirs(img_dir: str) -> dict[str, str]:
         'manual_solid': osp.join(out_dir, MANUAL_SOLID_DIR),
         'manual_other': osp.join(out_dir, MANUAL_OTHER_DIR),
         'background_sample_cache': osp.join(out_dir, BACKGROUND_SAMPLE_CACHE_DIR),
+        'export_pair': osp.join(out_dir, EXPORT_PAIR_DIR),
     }
     for path in paths.values():
         os.makedirs(path, exist_ok=True)
