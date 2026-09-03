@@ -2028,6 +2028,12 @@ class LocalEditDialog(QDialog):
         if event.key() == Qt.Key.Key_Escape and self.view.tool == 'lasso' and self.view._lasso_points:
             self.view.cancel_lasso()
             return
+        if event.key() == Qt.Key.Key_BracketLeft:
+            self.change_brush_radius(-4)
+            return
+        if event.key() == Qt.Key.Key_BracketRight:
+            self.change_brush_radius(4)
+            return
         if event.matches(QKeySequence.StandardKey.Undo):
             self.undo()
             return
@@ -3028,6 +3034,7 @@ class MainWindow(QMainWindow):
         self.auto_fit_on_resize = False
         self.recent_folders = self._load_recent_folders()
         self.folder_progress = self._load_folder_progress()
+        self.workflow_compare_window = None
 
         self._build_ui()
         self._apply_style()
@@ -3084,13 +3091,13 @@ class MainWindow(QMainWindow):
 
         brush_down_action = QAction('縮小筆刷', self)
         brush_down_action.setShortcut(QKeySequence('['))
-        brush_down_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        brush_down_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
         brush_down_action.triggered.connect(lambda: self.change_brush_radius(-4))
         self.addAction(brush_down_action)
 
         brush_up_action = QAction('放大筆刷', self)
         brush_up_action.setShortcut(QKeySequence(']'))
-        brush_up_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        brush_up_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
         brush_up_action.triggered.connect(lambda: self.change_brush_radius(4))
         self.addAction(brush_up_action)
 
@@ -3152,6 +3159,11 @@ class MainWindow(QMainWindow):
         )
         self.export_refinement_btn.clicked.connect(self.export_refinement_package)
         toolbar.addWidget(self.export_refinement_btn)
+
+        self.workflow_compare_btn = QPushButton('工作流比較')
+        self.workflow_compare_btn.setToolTip('在獨立視窗比較多組修補結果，按 Mask 分區合成並輸出')
+        self.workflow_compare_btn.clicked.connect(self.open_workflow_compare)
+        toolbar.addWidget(self.workflow_compare_btn)
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -5454,6 +5466,19 @@ class MainWindow(QMainWindow):
         if not self.paths:
             return
         self._open_path(self.paths['output'])
+
+    def open_workflow_compare(self) -> None:
+        from workflow_compare_ui import WorkflowCompareWindow
+
+        if self.workflow_compare_window is not None:
+            self.workflow_compare_window.show()
+            self.workflow_compare_window.raise_()
+            self.workflow_compare_window.activateWindow()
+            return
+        window = WorkflowCompareWindow(parent=None)
+        window.destroyed.connect(lambda _object=None: setattr(self, 'workflow_compare_window', None))
+        self.workflow_compare_window = window
+        window.show()
 
     def open_pdf(self) -> None:
         if not self.paths:

@@ -27,6 +27,9 @@ bootstrap.py
 solid_inpaint_ui.py
   PySide6 圖形界面。提供資料夾選擇、偵測生成、mask 預覽與手動編輯、PDF 預覽等功能。
 
+workflow_compare_ui.py
+  獨立的多工作流比較與合成視窗。讀取 export_pair、other_mask 與 inpaint_workflows，以同步比較滑桿、矩形或筆刷指定 Mask 內來源，最左側顯示當頁成品並輸出 result。
+
 detect_solid_inpaint_folder.py
   核心批量處理腳本。負責偵測文字、生成 mask、生成 inpainted overlay、生成 other_mask、寫入報告。
 ```
@@ -173,6 +176,7 @@ other_mask 顯示
 自動重新生成當前頁 overlay
 生成 PDF 預覽
 打開輸出資料夾
+獨立工作流比較視窗：最左側當頁成品、同步比較、Mask 內矩形／筆刷選擇、result 輸出
 ```
 
 手動修改 mask 後，會基於新 mask 重新生成當前頁的 overlay 和 other_mask。

@@ -123,6 +123,7 @@ Inpainted 合成預覽
 打開輸出資料夾
 生成 PDF 預覽
 打開 PDF 預覽
+工作流比較與 Mask 分區合成
 ```
 
 紅色的「偵測並生成」會重新跑 detector，並覆蓋已有的 `mask`、`other_mask` 和 `inpainted` 輸出。如果輸出資料夾內已有 mask，UI 會要求確認。
@@ -132,6 +133,8 @@ Inpainted 合成預覽
 「取兩者交集」會讓你選擇傳入 Mask 文件夾。若裡面存在同名 PNG，會用 `目前 mask ∩ 傳入 mask` 覆蓋目前 mask，然後重新生成 `other_mask`、`inpainted` 和 `solid_inpaint_report.json`；缺少同名 PNG 的頁面會保留原 mask。
 
 「導出待精修」會將全部頁面直接輸出到 `ctd_inpainted/export_pair/`，不生成壓縮包。該目錄根層是原圖與 `inpainted` 的去字合成 PNG，`other_mask/` 放同名 mask，`colored/` 放與「導出右圖」一致的標記預覽。
+
+「工作流比較」會開啟獨立視窗。選擇一個 `export_pair` 文件夾後，工具會讀取根目錄底圖、`other_mask/`，並自動識別 `inpaint_workflows/` 內任意數量的工作流子文件夾。比較區最左側固定顯示當頁實際合成效果，右側可同步比較最多三組結果；所有圖片同步縮放和移動，每張工作流圖片頂部的原圖比較滑桿也會同步移動，初始值為 `0`，即完整顯示工作流結果。頂部「Mask 擴大」預設為 `5 px`，選擇、預覽與輸出統一使用擴大後的範圍。每個工作流名稱旁的色塊對應其選區顏色。首次載入的頁面預設採用第一組工作流；在工作流圖片上左鍵拖矩形或使用筆刷，可重新指定 Mask 內的局部來源，右鍵拖矩形則取消該範圍的工作流選擇並保留原圖，中鍵拖動用於平移。圖片下方按鈕可將整個 Mask 指定給該組。`M` 顯示或隱藏選區，`[`、`]` 調整筆刷大小。選擇狀態保存在 `.workflow_compare/`，最終圖片和來源摘要 `selection.json` 輸出到 `result/`。
 
 快捷鍵：
 
@@ -187,6 +190,8 @@ ctd_inpainted/raw/preview_report.pdf
 ctd_inpainted/export_pair/<name>.png
 ctd_inpainted/export_pair/other_mask/<name>.png
 ctd_inpainted/export_pair/colored/<name>.png
+ctd_inpainted/export_pair/inpaint_workflows/<workflow>/<name>.png
+ctd_inpainted/export_pair/result/<name>.png
 ```
 
 說明：
