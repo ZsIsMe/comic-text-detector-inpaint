@@ -42,7 +42,7 @@ def copy_missing_67_70_files() -> list[Path]:
     copied: list[Path] = []
     skip = {
         Path("imgtrans_67_70.json"),
-        Path("ctd_inpainted/solid_inpaint_report.json"),
+        Path("ctd_inpainted/raw/solid_inpaint_report.json"),
     }
     for src in SRC_67_70.rglob("*"):
         if not src.is_file() or src.name == ".DS_Store":
@@ -97,8 +97,8 @@ def merge_imgtrans() -> int:
 
 
 def merge_solid_report() -> int:
-    dst_json = DST / "ctd_inpainted" / "solid_inpaint_report.json"
-    src_json = SRC_67_70 / "ctd_inpainted" / "solid_inpaint_report.json"
+    dst_json = DST / "ctd_inpainted" / "raw" / "solid_inpaint_report.json"
+    src_json = SRC_67_70 / "ctd_inpainted" / "raw" / "solid_inpaint_report.json"
     dst_data = json.loads(dst_json.read_text(encoding="utf-8"))
     src_data = json.loads(src_json.read_text(encoding="utf-8"))
 
@@ -109,7 +109,7 @@ def merge_solid_report() -> int:
         dst_pages[key] = value
 
     dst_data["image_dir"] = str(DST)
-    dst_data["output_dir"] = str(DST / "ctd_inpainted")
+    dst_data["output_dir"] = str(DST / "ctd_inpainted" / "raw")
     dst_data["pages"] = {key: dst_pages[key] for key in sorted_page_keys(dst_pages)}
 
     summary = dict(dst_data.get("summary", {}))

@@ -119,7 +119,7 @@ Mask / 原圖疊加預覽
 Inpainted 合成預覽
 可顯示 other_mask
 導出右圖
-導出待精修 ZIP
+導出待精修配對圖片
 打開輸出資料夾
 生成 PDF 預覽
 打開 PDF 預覽
@@ -127,7 +127,7 @@ Inpainted 合成預覽
 
 紅色的「偵測並生成」會重新跑 detector，並覆蓋已有的 `mask`、`other_mask` 和 `inpainted` 輸出。如果輸出資料夾內已有 mask，UI 會要求確認。
 
-「使用傳入 Mask 運行」提供兩種方式。「取代目前 Mask」會讓你選擇傳入 Mask 文件夾；若裡面存在同名 PNG，會覆蓋 `ctd_inpainted/mask/<name>.png`，再重新運行。缺少同名 PNG 的頁面會保留原 mask。
+「使用傳入 Mask 運行」提供兩種方式。「取代目前 Mask」會讓你選擇傳入 Mask 文件夾；若裡面存在同名 PNG，會覆蓋 `ctd_inpainted/raw/mask/<name>.png`，再重新運行。缺少同名 PNG 的頁面會保留原 mask。
 
 「取兩者交集」會讓你選擇傳入 Mask 文件夾。若裡面存在同名 PNG，會用 `目前 mask ∩ 傳入 mask` 覆蓋目前 mask，然後重新生成 `other_mask`、`inpainted` 和 `solid_inpaint_report.json`；缺少同名 PNG 的頁面會保留原 mask。
 
@@ -179,11 +179,11 @@ Windows：
 主要輸出：
 
 ```text
-ctd_inpainted/mask/<name>.png
-ctd_inpainted/other_mask/<name>.png
-ctd_inpainted/inpainted/<name>.png
-ctd_inpainted/solid_inpaint_report.json
-ctd_inpainted/preview_report.pdf
+ctd_inpainted/raw/mask/<name>.png
+ctd_inpainted/raw/other_mask/<name>.png
+ctd_inpainted/raw/inpainted/<name>.png
+ctd_inpainted/raw/solid_inpaint_report.json
+ctd_inpainted/raw/preview_report.pdf
 ctd_inpainted/export_pair/<name>.png
 ctd_inpainted/export_pair/other_mask/<name>.png
 ctd_inpainted/export_pair/colored/<name>.png
@@ -227,15 +227,15 @@ File > Scripts > Browse...
 腳本會讀取：
 
 ```text
-<image folder>/ctd_inpainted/mask/<name>.png
-<image folder>/ctd_inpainted/other_mask/<name>.png
-<image folder>/ctd_inpainted/inpainted/<name>.png
+<image folder>/ctd_inpainted/raw/mask/<name>.png
+<image folder>/ctd_inpainted/raw/other_mask/<name>.png
+<image folder>/ctd_inpainted/raw/inpainted/<name>.png
 ```
 
 並生成：
 
 ```text
-<image folder>/ctd_inpainted/psd/<name>.psd
+<image folder>/ctd_inpainted/raw/psd/<name>.psd
 ```
 
 每個 PSD 包含：

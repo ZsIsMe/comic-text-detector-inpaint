@@ -124,7 +124,7 @@ preview_report.pdf
 export_pair/<name>.png
 export_pair/other_mask/<name>.png
 export_pair/colored/<name>.png
-  「導出待精修」產生的固定位置配對圖片，不壓縮。
+  「導出待精修」產生的固定位置配對圖片，它是 `raw/` 的同級目錄，不壓縮。
 ```
 
 ## 核心處理邏輯
@@ -216,11 +216,11 @@ other_mask 顯示
 檢查：
 
 ```text
-mask/
-inpainted/
-other_mask/
-solid_inpaint_report.json
-preview_report.pdf
+raw/mask/
+raw/inpainted/
+raw/other_mask/
+raw/solid_inpaint_report.json
+raw/preview_report.pdf
 ```
 
 ## 不應提交

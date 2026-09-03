@@ -5,11 +5,11 @@ Run in Photoshop:
 File > Scripts > Browse... > create_psds_from_outputs.jsx
 
 Expected input layout:
-<image folder>/ctd_inpainted/other_mask/<name>.png
-<image folder>/ctd_inpainted/inpainted/<name>.png
+<image folder>/ctd_inpainted/raw/other_mask/<name>.png
+<image folder>/ctd_inpainted/raw/inpainted/<name>.png
 
 Output:
-<image folder>/ctd_inpainted/psd/<name>.psd
+<image folder>/ctd_inpainted/raw/psd/<name>.psd
 
 Each PSD contains:
 - bg
@@ -187,7 +187,7 @@ Each PSD contains:
         var outputGroup = dialog.add("group");
         outputGroup.orientation = "row";
         outputGroup.alignChildren = ["fill", "center"];
-        outputGroup.add("statictext", undefined, "ctd_inpainted：");
+        outputGroup.add("statictext", undefined, "ctd_inpainted/raw：");
         var outputPathInput = outputGroup.add("edittext", undefined, "");
         outputPathInput.characters = 52;
         var outputBrowseButton = outputGroup.add("button", undefined, "选择");
@@ -304,12 +304,12 @@ Each PSD contains:
             var selected = Folder.selectDialog("选择原图文件夹");
             if (selected) {
                 imagePathInput.text = selected.fsName;
-                outputPathInput.text = selected.fsName + "/ctd_inpainted";
+                outputPathInput.text = selected.fsName + "/ctd_inpainted/raw";
             }
         };
 
         outputBrowseButton.onClick = function () {
-            var selected = Folder.selectDialog("选择 ctd_inpainted 文件夹");
+            var selected = Folder.selectDialog("选择 ctd_inpainted/raw 文件夹");
             if (selected) {
                 outputPathInput.text = selected.fsName;
             }
@@ -329,7 +329,7 @@ Each PSD contains:
                 return;
             }
             if (!trimString(outputPathInput.text)) {
-                alert("请选择 ctd_inpainted 文件夹。");
+                alert("请选择 ctd_inpainted/raw 文件夹。");
                 return;
             }
             if (actionCheckbox.value && (!setDropdown.selection || !actionDropdown.selection)) {
@@ -644,7 +644,7 @@ Each PSD contains:
         reportFile.writeln("Create solid_inpaint PSD report");
         reportFile.writeln("Generated at: " + formatDate(new Date()));
         reportFile.writeln("Image folder: " + imageFolder.fsName);
-        reportFile.writeln("ctd_inpainted folder: " + outputRoot.fsName);
+        reportFile.writeln("ctd_inpainted/raw folder: " + outputRoot.fsName);
         reportFile.writeln("Total image files: " + total);
         reportFile.writeln("Saved PSD files: " + made);
         reportFile.writeln("Restart: " + (settings.restart ? "yes" : "no"));

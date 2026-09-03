@@ -3959,7 +3959,7 @@ class MainWindow(QMainWindow):
                 self,
                 '找不到目前 Mask',
                 '當前文件夾沒有可用的 mask。\n\n'
-                '請先放入 ctd_inpainted/mask/<檔名>.png，或先執行「偵測並生成」。',
+                '請先放入 ctd_inpainted/raw/mask/<檔名>.png，或先執行「偵測並生成」。',
             )
             return
 
@@ -4267,7 +4267,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         if not self.paths:
             return
-        colored_dir = osp.join(self.paths['output'], 'colored')
+        colored_dir = osp.join(self.paths.get('raw', self.paths['output']), 'colored')
         os.makedirs(colored_dir, exist_ok=True)
         made = 0
         failed: list[str] = []
@@ -5458,7 +5458,10 @@ class MainWindow(QMainWindow):
     def open_pdf(self) -> None:
         if not self.paths:
             return
-        pdf_path = osp.join(self.paths['output'], 'preview_report.pdf')
+        pdf_path = osp.join(
+            self.paths.get('raw', self.paths['output']),
+            'preview_report.pdf',
+        )
         if osp.isfile(pdf_path):
             self._open_path(pdf_path)
 

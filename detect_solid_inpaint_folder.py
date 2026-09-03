@@ -30,6 +30,7 @@ from utils.textmask import REFINEMASK_ANNOTATION
 
 
 OUTPUT_DIR = 'ctd_inpainted'
+RAW_DIR = 'raw'
 MASK_DIR = 'mask'
 OTHER_MASK_DIR = 'other_mask'
 INPAINTED_DIR = 'inpainted'
@@ -117,16 +118,40 @@ class SolidQuality:
     mode: str
 
 
+def _move_legacy_output_entry(src: Path, dst: Path) -> None:
+    """Move an old root-level output into raw without overwriting conflicts."""
+    if not src.exists():
+        return
+    if not dst.exists():
+        src.replace(dst)
+        return
+    if not src.is_dir() or not dst.is_dir():
+        return
+    for child in src.iterdir():
+        _move_legacy_output_entry(child, dst / child.name)
+    try:
+        src.rmdir()
+    except OSError:
+        pass
+
+
 def _ensure_dirs(img_dir: str) -> dict[str, str]:
     out_dir = osp.join(img_dir, OUTPUT_DIR)
+    raw_dir = osp.join(out_dir, RAW_DIR)
+    os.makedirs(raw_dir, exist_ok=True)
+    for name in os.listdir(out_dir):
+        if name in (RAW_DIR, EXPORT_PAIR_DIR):
+            continue
+        _move_legacy_output_entry(Path(out_dir) / name, Path(raw_dir) / name)
     paths = {
         'output': out_dir,
-        'mask': osp.join(out_dir, MASK_DIR),
-        'other_mask': osp.join(out_dir, OTHER_MASK_DIR),
-        'inpainted': osp.join(out_dir, INPAINTED_DIR),
-        'manual_solid': osp.join(out_dir, MANUAL_SOLID_DIR),
-        'manual_other': osp.join(out_dir, MANUAL_OTHER_DIR),
-        'background_sample_cache': osp.join(out_dir, BACKGROUND_SAMPLE_CACHE_DIR),
+        'raw': raw_dir,
+        'mask': osp.join(raw_dir, MASK_DIR),
+        'other_mask': osp.join(raw_dir, OTHER_MASK_DIR),
+        'inpainted': osp.join(raw_dir, INPAINTED_DIR),
+        'manual_solid': osp.join(raw_dir, MANUAL_SOLID_DIR),
+        'manual_other': osp.join(raw_dir, MANUAL_OTHER_DIR),
+        'background_sample_cache': osp.join(raw_dir, BACKGROUND_SAMPLE_CACHE_DIR),
         'export_pair': osp.join(out_dir, EXPORT_PAIR_DIR),
     }
     for path in paths.values():
@@ -887,7 +912,7 @@ def _write_preview_pdf(
     if not pages:
         return None
 
-    pdf_path = osp.join(paths['output'], PREVIEW_PDF)
+    pdf_path = osp.join(paths.get('raw', paths['output']), PREVIEW_PDF)
     first, rest = pages[0], pages[1:]
     first.save(pdf_path, 'PDF', resolution=150.0, save_all=True, append_images=rest)
     return pdf_path
@@ -1119,7 +1144,7 @@ def build_report(
             summary['with_other_mask'] += 1
     return {
         'image_dir': osp.abspath(img_dir),
-        'output_dir': paths['output'],
+        'output_dir': paths.get('raw', paths['output']),
         'detector': detector_name,
         'detector_label': DETECTOR_LABELS.get(detector_name, detector_name),
         'model': osp.abspath(str(detector_model_path(detector_name))),
@@ -1130,14 +1155,14 @@ def build_report(
 
 
 def write_report(paths: dict[str, str], report: dict) -> str:
-    report_path = osp.join(paths['output'], REPORT_JSON)
+    report_path = osp.join(paths.get('raw', paths['output']), REPORT_JSON)
     with open(report_path, 'w', encoding='utf8') as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
     return report_path
 
 
 def load_report(paths: dict[str, str]) -> dict:
-    report_path = osp.join(paths['output'], REPORT_JSON)
+    report_path = osp.join(paths.get('raw', paths['output']), REPORT_JSON)
     if not osp.isfile(report_path):
         return {}
     with open(report_path, 'r', encoding='utf8') as f:

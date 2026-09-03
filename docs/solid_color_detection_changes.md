@@ -198,7 +198,7 @@ BackgroundSampleWorker.finished
 背景選區會保存為：
 
 ```text
-ctd_inpainted/background_sample_cache/<name>.npz
+ctd_inpainted/raw/background_sample_cache/<name>.npz
 ```
 
 cache 內包含：

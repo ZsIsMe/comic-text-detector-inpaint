@@ -59,7 +59,7 @@ def rewrite_imgtrans() -> tuple[int, int]:
 
 
 def rewrite_solid_report() -> tuple[int, int]:
-    path = DST / "ctd_inpainted" / "solid_inpaint_report.json"
+    path = DST / "ctd_inpainted" / "raw" / "solid_inpaint_report.json"
     data = json.loads(path.read_text(encoding="utf-8"))
     all_pages = data.get("pages", {})
     removed_with_other_mask = sum(
@@ -73,7 +73,7 @@ def rewrite_solid_report() -> tuple[int, int]:
     before = len(pages)
     pages = {key: value for key, value in pages.items() if not key.startswith("49_")}
     data["image_dir"] = str(DST)
-    data["output_dir"] = str(DST / "ctd_inpainted")
+    data["output_dir"] = str(DST / "ctd_inpainted" / "raw")
     data["pages"] = {key: pages[key] for key in sorted(pages, key=sort_page_key)}
 
     summary = dict(data.get("summary", {}))

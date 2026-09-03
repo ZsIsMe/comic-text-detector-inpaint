@@ -68,19 +68,19 @@ ctd_inpainted/
 主要輸出包括：
 
 ```text
-mask/<name>.png
+raw/mask/<name>.png
 ```
 
 文字偵測 mask。白色代表偵測到的文字區域。
 
 ```text
-inpainted/<name>.png
+raw/inpainted/<name>.png
 ```
 
 透明 BGRA overlay。它不是完整修好的原圖，而是一張和原圖同尺寸的透明圖層，只在可安全純色覆蓋的區域有內容。
 
 ```text
-other_mask/<name>.png
+raw/other_mask/<name>.png
 ```
 
 需要人工注意的區域。這些區域可能背景不夠純、取樣不足、色彩分布不穩定，或不適合用純色直接覆蓋。
@@ -94,13 +94,13 @@ export_pair/colored/<name>.png
 「導出待精修」產生的固定位置配對圖片，不壓縮。
 
 ```text
-solid_inpaint_report.json
+raw/solid_inpaint_report.json
 ```
 
 每頁處理統計和 debug 資訊。
 
 ```text
-preview_report.pdf
+raw/preview_report.pdf
 ```
 
 檢查用 PDF。每頁包含 original、preview、mask、other_mask 四個視圖。命令行批量處理會自動生成；圖形界面中可以手動生成。
