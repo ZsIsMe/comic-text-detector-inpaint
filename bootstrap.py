@@ -22,6 +22,9 @@ CTBD_MODEL_SHA256 = '065744e91c0594ad8663aa8b870ce3fb27222942eded5a3cc388ce23421
 YSG_MODEL_URL = 'https://huggingface.co/dreMaz/mit_models/resolve/main/ysgyolo_yolo26_2.0.pt'
 YSG_MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'ysgyolo_yolo26_2.0.pt'
 YSG_MODEL_SHA256 = '889347d65c8636dd188a8ed4f312b29658543faaa69016b5958ddf0559980e22'
+MANGALENS_MODEL_URL = 'https://www.modelscope.cn/models/hgmzhn/manga-translator-ui/resolve/master/mangalens.pt'
+MANGALENS_MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'mangalens.pt'
+MANGALENS_MODEL_SHA256 = '4028152940f7c910f40192f46ede3b3f6c7129e5c76849c324d3564f8ac50198'
 ROOT = Path(__file__).resolve().parent
 VENV_DIR = ROOT / '.venv'
 REQUIREMENTS = ROOT / 'requirements.txt'
@@ -176,6 +179,7 @@ def main() -> None:
     download_model(CTBD_MODEL_URL, CTBD_MODEL_PATH, CTBD_MODEL_SHA256)
     download_model(MODEL_URL, MODEL_PATH)
     download_model(YSG_MODEL_URL, YSG_MODEL_PATH, YSG_MODEL_SHA256)
+    download_model(MANGALENS_MODEL_URL, MANGALENS_MODEL_PATH, MANGALENS_MODEL_SHA256)
     launch_app(python)
 
 

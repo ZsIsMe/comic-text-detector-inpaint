@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -62,6 +63,7 @@ from detect_solid_inpaint_folder import (
     _compose_overlay_preview,
     _ensure_dirs,
     _background_sample_cache_path,
+    _background_cache_context,
     _mask_hash,
     _manual_other_path,
     _manual_solid_path,
@@ -72,6 +74,7 @@ from detect_solid_inpaint_folder import (
     _write_preview_pdf,
     add_detection_to_mask,
     build_report,
+    bubble_context,
     create_detector,
     DEFAULT_DETECTOR,
     DETECTOR_CTBD,
@@ -90,6 +93,7 @@ from detect_solid_inpaint_folder import (
 )
 from utils.io_utils import imread, imwrite
 from ysg_detector import YSG_DEFAULT_LABELS, YSG_LABEL_DESCRIPTIONS, YSG_UNSUPPORTED_LABELS
+from bubble_solid import fill_bubbles, load_settings as load_solid_settings, save_settings as save_solid_settings
 
 
 STATUS_OK = ''
@@ -246,10 +250,11 @@ def _load_background_sample_cache(paths: dict[str, str], img_path: str, mask: np
     if not osp.isfile(cache_path):
         return None
     try:
-        data = np.load(cache_path)
-        if int(data['mask_hash']) != _mask_hash(mask):
-            return None
-        sample = np.asarray(data['sample'], dtype=np.uint8)
+        with np.load(cache_path) as data:
+            if (int(data['mask_hash']) != _mask_hash(mask)
+                    or str(data['context']) != _background_cache_context(paths, img_path)):
+                return None
+            sample = np.asarray(data['sample'], dtype=np.uint8)
         if sample.shape != mask.shape:
             return None
         return np.where(sample > 0, 255, 0).astype(np.uint8)
@@ -2803,12 +2808,48 @@ class AddDetectionDialog(QDialog):
         return 'current'
 
 
+class SolidFillSettingsDialog(QDialog):
+    def __init__(self, values: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('純色填充設定')
+        layout = QVBoxLayout(self)
+        self.enabled = QCheckBox('使用 MangaLens，填滿可靠純色氣泡內部')
+        self.enabled.setChecked(values['enabled'])
+        layout.addWidget(self.enabled)
+        hint = QLabel('清除氣泡內漏檢的小筆畫；漸層、圖案或背景不足時保留待修改。\n'
+                      '「需要修改」標記會阻止所在氣泡整區填色。')
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        row = QHBoxLayout()
+        row.addWidget(QLabel('氣泡內縮（每個氣泡短邊）'))
+        self.shrink = QDoubleSpinBox()
+        self.shrink.setRange(0, 10)
+        self.shrink.setDecimals(1)
+        self.shrink.setSingleStep(0.5)
+        self.shrink.setSuffix(' %')
+        self.shrink.setValue(values['shrink_percent'])
+        self.shrink.setToolTip('預設 2%；這是邊框保留寬度，不是純色靈敏度。10% 會留下較寬的未填區域。')
+        self.shrink.setEnabled(self.enabled.isChecked())
+        self.enabled.toggled.connect(self.shrink.setEnabled)
+        row.addWidget(self.shrink)
+        layout.addLayout(row)
+        layout.addWidget(QLabel('套用到目前文件夾，使用已有 Mask 重算全部已處理頁面。'))
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Apply).setText('套用並重算')
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('取消')
+        buttons.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.resize(460, 230)
+
+
 class BackgroundSampleWorker(QObject):
     partial = Signal(int, str, object, object)
     finished = Signal(int, str, object, object)
     failed = Signal(int, str, object, str)
 
-    def __init__(self, request_id: int, img_path: str, image: np.ndarray, mask: np.ndarray) -> None:
+    def __init__(self, request_id: int, img_path: str, image: np.ndarray, mask: np.ndarray,
+                 paths: dict | None = None, protected: np.ndarray | None = None) -> None:
         super().__init__()
         self.request_id = request_id
         self.img_path = img_path
@@ -2816,6 +2857,8 @@ class BackgroundSampleWorker(QObject):
         self.mask = np.where(mask > 0, 255, 0).astype(np.uint8)
         self.mask_hash = _mask_hash(self.mask)
         self.cancelled = False
+        self.paths = paths
+        self.protected = None if protected is None else protected.copy()
 
     def cancel(self) -> None:
         self.cancelled = True
@@ -2830,6 +2873,14 @@ class BackgroundSampleWorker(QObject):
                 self.partial.emit(self.request_id, self.img_path, self.mask_hash, sample.copy())
                 if self.cancelled:
                     break
+            if self.paths and not self.cancelled:
+                polygons, settings, _ = bubble_context(self.image, self.mask, self.paths, self.img_path)
+                if polygons:
+                    _, veto, bubble_sample, _ = fill_bubbles(
+                        self.image, self.mask, polygons, settings['shrink_percent'] / 100,
+                        self.protected,
+                    )
+                    sample[veto > 0] = bubble_sample[veto > 0]
             self.finished.emit(self.request_id, self.img_path, self.mask_hash, sample)
         except Exception as exc:
             self.failed.emit(self.request_id, self.img_path, self.mask_hash, str(exc))
@@ -3265,6 +3316,10 @@ class MainWindow(QMainWindow):
         help_action = QAction('說明', self)
         help_action.triggered.connect(self.show_help)
         toolbar.addAction(help_action)
+
+        solid_settings_action = QAction('純色填充設定', self)
+        solid_settings_action.triggered.connect(self.show_solid_fill_settings)
+        toolbar.addAction(solid_settings_action)
 
         self.navigator_action = QAction('小地圖', self)
         self.navigator_action.setCheckable(True)
@@ -3915,6 +3970,35 @@ class MainWindow(QMainWindow):
         self.save_recent_folders()
         self.update_recent_menu()
 
+    def show_solid_fill_settings(self) -> None:
+        if not self.folder or not self.paths:
+            QMessageBox.information(self, '沒有文件夾', '請先選擇圖片文件夾。')
+            return
+        if self.worker_thread is not None or self.page_worker_thread is not None or self.render_timer.isActive():
+            QMessageBox.information(self, '正在執行', '請等待目前任務完成。')
+            return
+        raw_dir = self.paths.get('raw', self.paths['output'])
+        dialog = SolidFillSettingsDialog(load_solid_settings(raw_dir), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.save_all_edit_masks()
+        try:
+            save_solid_settings(raw_dir, dialog.enabled.isChecked(), dialog.shrink.value())
+        except OSError as exc:
+            QMessageBox.warning(self, '儲存失敗', str(exc))
+            return
+        self.background_sample_request_id += 1
+        self.background_sample_timer.stop()
+        self.pending_background_img_path = ''
+        self.pending_background_mask = None
+        if self.background_worker is not None:
+            self.background_worker.cancel()
+        pages = [p for p in self.imglist if osp.isfile(_mask_path(self.paths, p))]
+        if pages:
+            self.start_worker('regenerate', pages)
+        else:
+            self.status.showMessage('純色填充設定已儲存，下次生成時套用。')
+
     def show_convert_masks_dialog(self) -> None:
         if not self.folder or not self.paths or not self.imglist:
             QMessageBox.information(self, '沒有圖片', '請先選擇圖片文件夾。')
@@ -4229,7 +4313,12 @@ class MainWindow(QMainWindow):
         self.progress.setValue(100)
         self.refresh_list()
         self.reload_current()
-        self.status.showMessage('任務完成。')
+        unavailable = sum(p.get('bubble_detection', {}).get('status') == 'unavailable'
+                          for p in report.get('pages', {}).values())
+        self.status.showMessage(
+            f'任務完成；{unavailable} 頁氣泡分割不可用，已使用文字範圍填色，原因記錄於報告。'
+            if unavailable else '任務完成。'
+        )
 
     def on_convert_worker_finished(self, report: dict) -> None:
         self.report = report
@@ -5359,7 +5448,9 @@ class MainWindow(QMainWindow):
         self.background_sample_status.setText('背景選區計算中...')
 
         self.background_worker_thread = QThread()
-        self.background_worker = BackgroundSampleWorker(request_id, img_path, base, mask)
+        self.background_worker = BackgroundSampleWorker(
+            request_id, img_path, base, mask, dict(self.paths), self.current_manual_other,
+        )
         self.background_worker.moveToThread(self.background_worker_thread)
         self.background_worker_thread.started.connect(self.background_worker.run)
         self.background_worker.partial.connect(self.on_background_sample_partial)
