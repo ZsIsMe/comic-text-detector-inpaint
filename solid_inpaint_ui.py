@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
     QColorDialog,
     QProgressBar,
     QRadioButton,
+    QScrollArea,
     QSlider,
     QSizePolicy,
     QSpinBox,
@@ -77,6 +78,7 @@ from detect_solid_inpaint_folder import (
     DETECTOR_LABELS,
     DETECTOR_LEGACY_CTD,
     DETECTOR_RFDETR,
+    DETECTOR_YSGYOLO,
     image_files_in_folder,
     iter_background_samples_from_mask,
     load_report,
@@ -87,6 +89,7 @@ from detect_solid_inpaint_folder import (
     write_report,
 )
 from utils.io_utils import imread, imwrite
+from ysg_detector import YSG_DEFAULT_LABELS, YSG_LABEL_DESCRIPTIONS, YSG_UNSUPPORTED_LABELS
 
 
 STATUS_OK = ''
@@ -2346,16 +2349,21 @@ class DetectorSelectorWidget(QWidget):
         layout.setContentsMargins(20, 18, 20, 16)
         layout.setSpacing(12)
 
-        description = QLabel('選擇這次要使用的文字偵測模型。CTBD 與 RF-DETR 可在執行前調整 Mask 設定。')
+        description = QLabel('選擇這次要使用的文字偵測模型，並調整該模型的設定。')
         description.setWordWrap(True)
         layout.addWidget(description)
 
         self.group = QButtonGroup(self)
         self.buttons: dict[str, QRadioButton] = {}
         saved_detector = str(self.settings.value('detector/last_name', DETECTOR_CTBD))
-        if saved_detector not in {DETECTOR_CTBD, DETECTOR_LEGACY_CTD, DETECTOR_RFDETR}:
+        if saved_detector not in DETECTOR_LABELS:
             saved_detector = DETECTOR_CTBD
         options = (
+            (
+                DETECTOR_YSGYOLO,
+                DETECTOR_LABELS[DETECTOR_YSGYOLO],
+                'ysgyolo_yolo26_2.0.pt；按標籤篩選文字或框體，生成偵測框 Mask。',
+            ),
             (
                 DETECTOR_CTBD,
                 DETECTOR_LABELS[DETECTOR_CTBD],
@@ -2501,10 +2509,107 @@ class DetectorSelectorWidget(QWidget):
         rfdetr_config_layout.setColumnStretch(1, 1)
         layout.addWidget(self.rfdetr_config_frame)
 
+        self.ysg_config_frame = QFrame()
+        self.ysg_config_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        ysg_layout = QGridLayout(self.ysg_config_frame)
+        ysg_layout.setContentsMargins(14, 12, 14, 12)
+        ysg_layout.setHorizontalSpacing(14)
+        ysg_layout.setVerticalSpacing(10)
+        ysg_title = QLabel('YSGYOLO 2.0 設定')
+        ysg_font = ysg_title.font()
+        ysg_font.setBold(True)
+        ysg_title.setFont(ysg_font)
+        ysg_layout.addWidget(ysg_title, 0, 0, 1, 2)
+
+        ysg_layout.addWidget(QLabel('運算裝置'), 1, 0)
+        self.ysg_device_combo = QComboBox()
+        for label, value in (
+            ('自動（GPU 優先）', 'auto'), ('MPS (Apple Silicon)', 'mps'),
+            ('CPU', 'cpu'), ('CUDA (NVIDIA)', 'cuda'),
+        ):
+            self.ysg_device_combo.addItem(label, value)
+        saved_device = str(self.settings.value('detector/ysgyolo/device', 'auto'))
+        self.ysg_device_combo.setCurrentIndex(max(0, self.ysg_device_combo.findData(saved_device)))
+        ysg_layout.addWidget(self.ysg_device_combo, 1, 1)
+
+        ysg_layout.addWidget(QLabel('標籤'), 2, 0, alignment=Qt.AlignmentFlag.AlignTop)
+        labels_layout = QGridLayout()
+        self.ysg_label_checks: dict[str, QCheckBox] = {}
+        saved_labels = self.settings.value('detector/ysgyolo/labels', list(YSG_DEFAULT_LABELS))
+        if isinstance(saved_labels, str):
+            saved_labels = [saved_labels]
+        if not isinstance(saved_labels, (list, tuple)):
+            saved_labels = YSG_DEFAULT_LABELS
+        short_names = ('氣泡外', '氣泡內', '豎斜', '長方條', '橫斜', '框體')
+        for index, ((key, description), short_name) in enumerate(
+            zip(YSG_LABEL_DESCRIPTIONS.items(), short_names)
+        ):
+            suffix = '，此模型無效' if key in YSG_UNSUPPORTED_LABELS else ''
+            checkbox = QCheckBox(f'{key}（{short_name}{suffix}）')
+            checkbox.setToolTip(description + ('\n此權重沒有這個標籤，勾選不影響偵測。' if suffix else ''))
+            checkbox.setChecked(key in saved_labels)
+            self.ysg_label_checks[key] = checkbox
+            labels_layout.addWidget(checkbox, index // 2, index % 2)
+        ysg_layout.addLayout(labels_layout, 2, 1)
+
+        self.ysg_merge_check = QCheckBox('合併文本行')
+        self.ysg_merge_check.setChecked(self.settings.value(
+            'detector/ysgyolo/merge_text_lines', True, type=bool,
+        ))
+        self.ysg_merge_check.setToolTip('合併文字區塊資料；不會填滿行間空白，也不改變塗白 Mask。')
+        ysg_layout.addWidget(self.ysg_merge_check, 3, 1)
+        self.ysg_vertical_check = QCheckBox('豎排文本')
+        self.ysg_vertical_check.setChecked(self.settings.value(
+            'detector/ysgyolo/source_text_vertical', False, type=bool,
+        ))
+        self.ysg_vertical_check.setToolTip(
+            '勾選後以豎排方向整理文字區塊與行順序；未勾選時自動判斷。\n'
+            '不會篩掉橫排文字，也不改變 Mask。'
+        )
+        ysg_layout.addWidget(self.ysg_vertical_check, 4, 1)
+        ysg_layout.addWidget(QLabel('Mask 擴張尺寸'), 5, 0)
+        self.ysg_dilate_spin = QSpinBox()
+        self.ysg_dilate_spin.setRange(0, 64)
+        self.ysg_dilate_spin.setSuffix(' px')
+        self.ysg_dilate_spin.setToolTip('向外擴張的半徑；0 表示不擴張。使用與 BallonsTranslator 相同的橢圓核心。')
+        try:
+            saved_ysg_dilate = int(self.settings.value('detector/ysgyolo/mask_dilate_size', 0))
+        except (TypeError, ValueError):
+            saved_ysg_dilate = 0
+        self.ysg_dilate_spin.setValue(max(0, min(64, saved_ysg_dilate)))
+        ysg_layout.addWidget(self.ysg_dilate_spin, 5, 1)
+        ysg_layout.addWidget(QLabel('Mask 圓角半徑'), 6, 0)
+        self.ysg_corner_spin = QSpinBox()
+        self.ysg_corner_spin.setRange(0, 1000)
+        self.ysg_corner_spin.setSuffix(' px')
+        self.ysg_corner_spin.setSpecialValueText('關閉（0 px）')
+        self.ysg_corner_spin.setToolTip(
+            '在 Mask 擴張後，按每個連通區削掉四角，只縮減、不增加遮罩。\n'
+            '0 表示關閉；BallonsTranslator 圓角工具的預設半徑為 12 px。\n'
+            '添加偵測時只處理新偵測的 Mask，保留既有遮罩。'
+        )
+        try:
+            saved_corner_radius = int(self.settings.value('detector/ysgyolo/mask_corner_radius', 0))
+        except (TypeError, ValueError):
+            saved_corner_radius = 0
+        self.ysg_corner_spin.setValue(max(0, min(1000, saved_corner_radius)))
+        ysg_layout.addWidget(self.ysg_corner_spin, 6, 1)
+        label_hint = QLabel(
+            '滑鼠停留在標籤上可查看說明。other 包含氣泡與框體。\n'
+            '此權重的 fangkuai、kuangwai 依 BallonsTranslator 的篩選方式略過。'
+        )
+        label_hint.setWordWrap(True)
+        label_hint.setProperty('secondary', True)
+        ysg_layout.addWidget(label_hint, 7, 0, 1, 2)
+        ysg_layout.setColumnStretch(1, 1)
+        layout.addWidget(self.ysg_config_frame)
+
         self.buttons[DETECTOR_CTBD].toggled.connect(self.ctbd_config_frame.setVisible)
         self.ctbd_config_frame.setVisible(self.buttons[DETECTOR_CTBD].isChecked())
         self.buttons[DETECTOR_RFDETR].toggled.connect(self.rfdetr_config_frame.setVisible)
         self.rfdetr_config_frame.setVisible(self.buttons[DETECTOR_RFDETR].isChecked())
+        self.buttons[DETECTOR_YSGYOLO].toggled.connect(self.ysg_config_frame.setVisible)
+        self.ysg_config_frame.setVisible(self.buttons[DETECTOR_YSGYOLO].isChecked())
 
     def selected_detector(self) -> str:
         for detector_name, button in self.buttons.items():
@@ -2514,6 +2619,15 @@ class DetectorSelectorWidget(QWidget):
 
     def selected_detector_params(self) -> dict:
         selected = self.selected_detector()
+        if selected == DETECTOR_YSGYOLO:
+            return {
+                'device': self.ysg_device_combo.currentData(),
+                'labels': [key for key, checkbox in self.ysg_label_checks.items() if checkbox.isChecked()],
+                'merge_text_lines': self.ysg_merge_check.isChecked(),
+                'source_text_vertical': self.ysg_vertical_check.isChecked(),
+                'mask_dilate_size': self.ysg_dilate_spin.value(),
+                'mask_corner_radius': self.ysg_corner_spin.value(),
+            }
         if selected == DETECTOR_CTBD:
             return {
                 'inpaint_mask_dilate': self.dilate_spin.value(),
@@ -2560,7 +2674,13 @@ class DetectorSelectionDialog(QDialog):
         self.buttons = self.selector.buttons
         self.ctbd_config_frame = self.selector.ctbd_config_frame
         self.rfdetr_config_frame = self.selector.rfdetr_config_frame
-        layout.addWidget(self.selector)
+        self.ysg_config_frame = self.selector.ysg_config_frame
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(self.selector)
+        layout.addWidget(scroll, 1)
+        self.resize(620, min(800, int(self.screen().availableGeometry().height() * 0.9)))
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -2601,7 +2721,12 @@ class AddDetectionDialog(QDialog):
 
         self.selector = DetectorSelectorWidget(settings, self)
         self.buttons = self.selector.buttons
-        layout.addWidget(self.selector)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(self.selector)
+        layout.addWidget(scroll, 1)
+        self.resize(620, min(850, int(self.screen().availableGeometry().height() * 0.9)))
 
         add_frame = QFrame()
         add_frame.setFrameShape(QFrame.Shape.StyledPanel)

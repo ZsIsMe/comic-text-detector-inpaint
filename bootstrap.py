@@ -19,6 +19,9 @@ MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'comictextdetector.pt'
 CTBD_MODEL_URL = 'https://huggingface.co/ogkalu/comic-text-and-bubble-detector/resolve/main/detector.onnx'
 CTBD_MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'comic-text-and-bubble-detector.onnx'
 CTBD_MODEL_SHA256 = '065744e91c0594ad8663aa8b870ce3fb27222942eded5a3cc388ce23421bd195'
+YSG_MODEL_URL = 'https://huggingface.co/dreMaz/mit_models/resolve/main/ysgyolo_yolo26_2.0.pt'
+YSG_MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'ysgyolo_yolo26_2.0.pt'
+YSG_MODEL_SHA256 = '889347d65c8636dd188a8ed4f312b29658543faaa69016b5958ddf0559980e22'
 ROOT = Path(__file__).resolve().parent
 VENV_DIR = ROOT / '.venv'
 REQUIREMENTS = ROOT / 'requirements.txt'
@@ -168,10 +171,11 @@ def main() -> None:
     ensure_python_version()
     python = ensure_venv()
     ensure_dependencies(python)
-    # Download both choices so selecting either detector never starts an
+    # Download bundled choices so selecting a detector never starts an
     # unexpected network operation inside the UI worker thread.
     download_model(CTBD_MODEL_URL, CTBD_MODEL_PATH, CTBD_MODEL_SHA256)
     download_model(MODEL_URL, MODEL_PATH)
+    download_model(YSG_MODEL_URL, YSG_MODEL_PATH, YSG_MODEL_SHA256)
     launch_app(python)
 
 

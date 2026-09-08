@@ -55,11 +55,11 @@ Windows：
 ```text
 1. 建立 .venv
 2. 安裝 requirements.txt
-3. 下載 CTBD 與 CTD 模型
+3. 下載 CTBD、CTD 與 YSGYOLO 2.0 模型
 4. 啟動圖形界面
 ```
 
-本工具默認使用 CPU，不提供 CUDA/GPU 選項。
+CTBD 與 CTD 使用 CPU；YSGYOLO 可選自動、MPS、CPU 或 CUDA，RF-DETR 可選 MPS 或 CPU。
 
 ## 手動啟動
 
@@ -274,6 +274,7 @@ OTHER_CHANNEL
 ```text
 models/comic-text-and-bubble-detector.onnx
 models/comictextdetector.pt
+models/ysgyolo_yolo26_2.0.pt
 ```
 
 CTBD 模型來源：
@@ -293,12 +294,47 @@ https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.2.1/c
 點擊「偵測並生成」後可以選擇：
 
 ```text
-1. CTBD（文字＋氣泡偵測）
-2. CTD
+1. YSGYOLO 2.0
+2. CTBD（文字＋氣泡偵測）
+3. RF-DETR
+4. CTD
 ```
 
 選擇 CTBD 時，可以在執行前設定 Mask 膨脹尺寸、Mask 合併方式和文字區域篩選。
 選擇與 CTBD 設定會自動保存，下一次打開對話框時沿用。
+
+YSGYOLO 2.0 也支援「添加偵測」。它沿用 BallonsTranslator 的推理設定（信心閾值 0.3、IoU 0.5、偵測尺寸 1024），由偵測框生成 Mask，再交給現有純色塗白流程。
+模型與文本行合併程式已移入本專案，執行時不依賴 BallonsTranslator 的安裝目錄。啟動腳本會檢查模型 SHA-256，缺少時從 `dreMaz/mit_models` 下載。
+
+YSGYOLO 設定會自動保存：
+
+- 運算裝置預設自動，優先 GPU（本機 Apple Silicon 使用 MPS），無可用 GPU 時使用 CPU。
+- 合併文本行預設開啟。它只整理文字區塊資料，不會填滿行間空白，不影響塗白 Mask。
+- 豎排文本預設關閉（自動判斷方向）；開啟後以豎排方向整理區塊與行順序，不會篩掉橫排文字。
+- Mask 擴張尺寸預設 0。數值為擴張半徑，使用與 BallonsTranslator 相同的橢圓核心。
+- Mask 圓角半徑預設 0（關閉），可設為 1–1000 px；12 px 為 BallonsTranslator 圓角工具的預設值。先擴張，再按每個連通區的外接矩形削掉四角，只縮減遮罩。半徑會限制在區域寬、高的一半以內；已相連的偵測框視為同一區域。「添加偵測」只對新偵測的 Mask 做圓角，再加入所選層，保留既有遮罩。
+- 標籤預設勾選前五項，不勾選 `other`。全部取消時產生空白 Mask；添加偵測時不會加入新區域。
+
+| 標籤 | 說明 |
+| --- | --- |
+| `balloon` | 氣泡外的文字 |
+| `qipao` | 氣泡內的文字 |
+| `shuqing` | 豎斜：豎著的氣泡內和氣泡外的傾斜文字 |
+| `changfangtiao` | 長方條：全部橫向文字，不區分氣泡或矩形框內外 |
+| `hengxie` | 橫斜：長方條的上位版，所有橫著的傾斜文字 |
+| `other` | 框體：氣泡，以及任意包含文字的垂直、水平框體 |
+
+這份 `ysgyolo_yolo26_2.0.pt` 的實際類別為 `balloon/qipao/fangkuai/changfangtiao/kuangwai/other`。
+依使用者選擇，介面保留 BallonsTranslator 的六個選項：`shuqing`、`hengxie` 標明「此模型無效」；不將 `fangkuai`、`kuangwai` 擅自對應到它們，這兩個原始類別會被略過。
+滑鼠停在各標籤上可查看完整說明。
+
+命令行使用預設 YSGYOLO 設定：
+
+```bash
+.venv/bin/python detect_solid_inpaint_folder.py /path/to/image_folder --detector ysgyolo
+```
+
+新增依賴為 `ultralytics>=8.4.14` 與 `networkx`。Python 3.13 以上使用 NumPy 2，以兼容新 Python 的套件；較舊 Python 沿用 NumPy 1 的限制。
 
 如果缺少所選模型，命令行和圖形界面都會提示找不到模型文件。
 

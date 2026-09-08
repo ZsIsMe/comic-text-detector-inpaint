@@ -42,6 +42,7 @@ REPORT_JSON = 'solid_inpaint_report.json'
 PREVIEW_PDF = 'preview_report.pdf'
 MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'comictextdetector.pt'
 CTBD_MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'comic-text-and-bubble-detector.onnx'
+YSG_MODEL_PATH = SCRIPT_DIR / 'models' / 'ysgyolo_yolo26_2.0.pt'
 RF_DETR_MODEL_PATH = (
     Path(__file__).resolve().parent
     / 'models'
@@ -51,11 +52,13 @@ RF_DETR_MODEL_PATH = (
 DETECTOR_CTBD = 'ctbd'
 DETECTOR_LEGACY_CTD = 'legacy_ctd'
 DETECTOR_RFDETR = 'rfdetr'
+DETECTOR_YSGYOLO = 'ysgyolo'
 DEFAULT_DETECTOR = DETECTOR_LEGACY_CTD
 DETECTOR_LABELS = {
     DETECTOR_CTBD: 'CTBD',
     DETECTOR_LEGACY_CTD: 'CTD',
     DETECTOR_RFDETR: 'RF-DETR',
+    DETECTOR_YSGYOLO: 'YSGYOLO 2.0',
 }
 NATURAL_SORT_RE = re.compile(r'(\d+)')
 
@@ -937,6 +940,8 @@ def detector_model_path(detector_name: str) -> Path:
         return MODEL_PATH
     if detector_name == DETECTOR_RFDETR:
         return RF_DETR_MODEL_PATH
+    if detector_name == DETECTOR_YSGYOLO:
+        return YSG_MODEL_PATH
     raise ValueError(f'不支援的 detector：{detector_name}')
 
 
@@ -949,6 +954,9 @@ def create_detector(
         raise FileNotFoundError(f'找不到模型檔：{model_path}')
     if detector_name == DETECTOR_CTBD:
         return ComicTextAndBubbleDetector(model_path, **(detector_params or {}))
+    if detector_name == DETECTOR_YSGYOLO:
+        from ysg_detector import YSGYoloDetector
+        return YSGYoloDetector(model_path, **(detector_params or {}))
     if detector_name == DETECTOR_RFDETR:
         try:
             from rfdetr_detector import RfDetrSegDetector
@@ -1225,11 +1233,11 @@ def main() -> None:
     parser.add_argument('img_dir', help='輸入圖片資料夾路徑')
     parser.add_argument(
         '--detector',
-        choices=(DETECTOR_CTBD, DETECTOR_LEGACY_CTD, DETECTOR_RFDETR),
+        choices=(DETECTOR_CTBD, DETECTOR_LEGACY_CTD, DETECTOR_RFDETR, DETECTOR_YSGYOLO),
         default=DEFAULT_DETECTOR,
         help=(
             '文字偵測模型；ctbd 使用 RT-DETR-V2 ONNX 模型，'
-            'rfdetr 使用 RF-DETR 分割模型，legacy_ctd 使用 CTD 模型。'
+            'rfdetr 使用 RF-DETR 分割模型，ysgyolo 使用 YSGYOLO 2.0，legacy_ctd 使用 CTD 模型。'
         ),
     )
     args = parser.parse_args()
