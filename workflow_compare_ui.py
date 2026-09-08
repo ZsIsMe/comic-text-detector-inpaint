@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -119,7 +120,6 @@ def _qimage_from_bgra(image: np.ndarray) -> QImage:
 class WorkflowProject:
     root: Path
     pages: dict[str, Path]
-    masks: dict[str, Path]
     workflows: dict[str, dict[str, Path]]
 
     @property
@@ -130,7 +130,6 @@ class WorkflowProject:
 def discover_export_pair(folder: str | Path) -> WorkflowProject:
     root = Path(folder).expanduser().resolve()
     pages = _image_map(root)
-    masks = _image_map(root / 'other_mask')
     workflows_root = root / 'inpaint_workflows'
     workflows: dict[str, dict[str, Path]] = {}
     if workflows_root.is_dir():
@@ -141,21 +140,9 @@ def discover_export_pair(folder: str | Path) -> WorkflowProject:
                     workflows[child.name] = images
     if not pages:
         raise ValueError('所選文件夾根目錄沒有圖片。')
-    if not (root / 'other_mask').is_dir():
-        raise ValueError('所選文件夾內缺少 other_mask。')
     if not workflows:
         raise ValueError('inpaint_workflows 內沒有可用的工作流圖片文件夾。')
-    return WorkflowProject(root, pages, masks, workflows)
-
-
-def read_page_mask(project: WorkflowProject, stem: str, shape: tuple[int, int]) -> np.ndarray:
-    mask_path = project.masks.get(stem)
-    if mask_path is None:
-        return np.zeros(shape, dtype=np.uint8)
-    mask = _read_image(mask_path, cv2.IMREAD_GRAYSCALE)
-    if mask is None or mask.shape != shape:
-        return np.zeros(shape, dtype=np.uint8)
-    return np.where(mask > 127, 255, 0).astype(np.uint8)
+    return WorkflowProject(root, pages, workflows)
 
 
 def expand_mask(mask: np.ndarray, expand_px: int) -> np.ndarray:
@@ -166,6 +153,37 @@ def expand_mask(mask: np.ndarray, expand_px: int) -> np.ndarray:
     kernel_size = radius * 2 + 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     return cv2.dilate(binary, kernel, iterations=1)
+
+
+def calculate_difference_mask(
+    base: np.ndarray,
+    result: np.ndarray,
+    threshold: int = 12,
+    min_area: int = 16,
+) -> np.ndarray:
+    base_bgr = _as_bgr(base)
+    result_bgr = _as_bgr(result)
+    if base_bgr.shape != result_bgr.shape:
+        raise ValueError('底圖與工作流圖片尺寸不同。')
+    difference = cv2.absdiff(base_bgr, result_bgr).max(axis=2).astype(np.uint8)
+    effective_threshold = max(1, min(255, int(threshold)))
+    changed = np.where(difference >= effective_threshold, 255, 0).astype(np.uint8)
+    if not np.any(changed):
+        return changed
+    changed = cv2.morphologyEx(
+        changed,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    )
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        (changed > 0).astype(np.uint8), connectivity=8
+    )
+    filtered = np.zeros_like(changed)
+    minimum = max(1, int(min_area))
+    for label in range(1, component_count):
+        if int(stats[label, cv2.CC_STAT_AREA]) >= minimum:
+            filtered[labels == label] = 255
+    return filtered
 
 
 def build_region_labels(mask: np.ndarray) -> tuple[np.ndarray, int]:
@@ -530,7 +548,7 @@ class WorkflowPanel(QFrame):
         header = QHBoxLayout()
         self.color_swatch = QLabel()
         self.color_swatch.setFixedSize(18, 18)
-        self.color_swatch.setToolTip('此工作流在選區中的顏色')
+        self.color_swatch.setToolTip('此工作流的 Mask 顏色；深色代表已採用，淡色代表未採用')
         header.addWidget(self.color_swatch)
         self.workflow_combo = QComboBox()
         self.workflow_combo.currentIndexChanged.connect(self._workflow_index_changed)
@@ -762,10 +780,21 @@ class WorkflowCompareWindow(QMainWindow):
         except (TypeError, ValueError):
             saved_mask_expand = 5
         self.mask_expand_px = max(0, min(80, saved_mask_expand))
+        try:
+            saved_diff_threshold = int(self.settings.value('diff_threshold', 12))
+        except (TypeError, ValueError):
+            saved_diff_threshold = 12
+        try:
+            saved_diff_min_area = int(self.settings.value('diff_min_area', 16))
+        except (TypeError, ValueError):
+            saved_diff_min_area = 16
+        self.diff_threshold = max(1, min(255, saved_diff_threshold))
+        self.diff_min_area = max(1, min(10000, saved_diff_min_area))
         self.project: WorkflowProject | None = None
         self.current_stem = ''
         self.current_base: np.ndarray | None = None
-        self.current_mask: np.ndarray | None = None
+        self.current_workflow_masks: dict[str, np.ndarray] = {}
+        self._diff_mask_memory_cache: dict[tuple[str, str, int, int, str], np.ndarray] = {}
         self.assignment: np.ndarray | None = None
         self.workflow_codes: dict[str, int] = {}
         self.undo_stack: list[np.ndarray] = []
@@ -878,9 +907,29 @@ class WorkflowCompareWindow(QMainWindow):
         self.mask_expand_size.setRange(0, 80)
         self.mask_expand_size.setValue(self.mask_expand_px)
         self.mask_expand_size.setSuffix(' px')
-        self.mask_expand_size.setToolTip('向外擴大可採用工作流結果的 Mask 範圍')
+        self.mask_expand_size.setToolTip('向外擴大各工作流的差異 Mask 範圍')
         self.mask_expand_size.valueChanged.connect(self._mask_expand_changed)
         controls_layout.addWidget(self.mask_expand_size)
+        controls_layout.addSpacing(8)
+        controls_layout.addWidget(QLabel('差異閾值'))
+        self.diff_threshold_size = QSpinBox()
+        self.diff_threshold_size.setRange(1, 255)
+        self.diff_threshold_size.setValue(self.diff_threshold)
+        self.diff_threshold_size.setToolTip('忽略低於此 RGB 最大差值的細微變化')
+        self.diff_threshold_size.valueChanged.connect(self._difference_settings_changed)
+        controls_layout.addWidget(self.diff_threshold_size)
+        controls_layout.addSpacing(8)
+        controls_layout.addWidget(QLabel('最小區域'))
+        self.diff_min_area_size = QSpinBox()
+        self.diff_min_area_size.setRange(1, 10000)
+        self.diff_min_area_size.setValue(self.diff_min_area)
+        self.diff_min_area_size.setSuffix(' px')
+        self.diff_min_area_size.setToolTip('過濾小於此面積的差異噪點')
+        self.diff_min_area_size.valueChanged.connect(self._difference_settings_changed)
+        controls_layout.addWidget(self.diff_min_area_size)
+        self.recalculate_masks_button = QPushButton('重算 Mask')
+        self.recalculate_masks_button.clicked.connect(self.recalculate_difference_masks)
+        controls_layout.addWidget(self.recalculate_masks_button)
         controls_layout.addSpacing(8)
         controls_layout.addWidget(QLabel('邊緣羽化'))
         self.feather_size = QSpinBox()
@@ -997,7 +1046,8 @@ class WorkflowCompareWindow(QMainWindow):
         self.project = project
         self.current_stem = ''
         self.current_base = None
-        self.current_mask = None
+        self.current_workflow_masks = {}
+        self._diff_mask_memory_cache.clear()
         self.assignment = None
         saved_state = self._load_state()
         saved_expand = saved_state.get('mask_expand_px')
@@ -1006,6 +1056,18 @@ class WorkflowCompareWindow(QMainWindow):
             self.mask_expand_size.blockSignals(True)
             self.mask_expand_size.setValue(self.mask_expand_px)
             self.mask_expand_size.blockSignals(False)
+        saved_threshold = saved_state.get('diff_threshold')
+        if isinstance(saved_threshold, int):
+            self.diff_threshold = max(1, min(255, saved_threshold))
+            self.diff_threshold_size.blockSignals(True)
+            self.diff_threshold_size.setValue(self.diff_threshold)
+            self.diff_threshold_size.blockSignals(False)
+        saved_min_area = saved_state.get('diff_min_area')
+        if isinstance(saved_min_area, int):
+            self.diff_min_area = max(1, min(10000, saved_min_area))
+            self.diff_min_area_size.blockSignals(True)
+            self.diff_min_area_size.setValue(self.diff_min_area)
+            self.diff_min_area_size.blockSignals(False)
         self.workflow_codes = self._load_workflow_codes(project)
         initialized = saved_state.get('initialized_pages', [])
         self.initialized_pages = {
@@ -1051,11 +1113,14 @@ class WorkflowCompareWindow(QMainWindow):
             state_dir = self.project.root / STATE_DIR_NAME
             state_dir.mkdir(parents=True, exist_ok=True)
             state = {
-                'version': 2,
+                'version': 3,
+                'mask_source': 'workflow_difference',
                 'current_page': self.current_stem,
                 'workflow_codes': self.workflow_codes,
                 'initialized_pages': sorted(self.initialized_pages, key=_natural_key),
                 'mask_expand_px': self.mask_expand_px,
+                'diff_threshold': self.diff_threshold,
+                'diff_min_area': self.diff_min_area,
                 'feather_px': self.feather_size.value(),
             }
             temporary = state_dir / f'{STATE_FILE_NAME}.tmp'
@@ -1088,6 +1153,109 @@ class WorkflowCompareWindow(QMainWindow):
         assert self.project is not None
         return self.project.root / STATE_DIR_NAME / ASSIGNMENT_DIR_NAME / f'{stem}.png'
 
+    def _difference_signature(self, stem: str, workflow_name: str) -> str:
+        assert self.project is not None
+        base_path = self.project.pages[stem]
+        result_path = self.project.workflows[workflow_name][stem]
+        base_stat = base_path.stat()
+        result_stat = result_path.stat()
+        value = (
+            f'{base_path.name}:{base_stat.st_size}:{base_stat.st_mtime_ns}|'
+            f'{result_path.name}:{result_stat.st_size}:{result_stat.st_mtime_ns}|'
+            f'{self.diff_threshold}:{self.diff_min_area}'
+        )
+        return hashlib.sha1(value.encode('utf-8')).hexdigest()[:16]
+
+    def _workflow_effective_mask(
+        self,
+        stem: str,
+        workflow_name: str,
+        shape: tuple[int, int],
+        force: bool = False,
+    ) -> np.ndarray:
+        assert self.project is not None
+        result_path = self.project.workflows.get(workflow_name, {}).get(stem)
+        if result_path is None:
+            return np.zeros(shape, dtype=np.uint8)
+        try:
+            signature = self._difference_signature(stem, workflow_name)
+        except OSError:
+            return np.zeros(shape, dtype=np.uint8)
+        memory_key = (stem, workflow_name, self.diff_threshold, self.diff_min_area, signature)
+        raw_mask = None if force else self._diff_mask_memory_cache.get(memory_key)
+        cache_root = self.project.root / STATE_DIR_NAME / 'diff_masks' / workflow_name
+        mask_path = cache_root / f'{stem}.png'
+        metadata_path = cache_root / f'{stem}.json'
+        if raw_mask is None and not force:
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
+                if metadata.get('signature') == signature:
+                    cached = _read_image(mask_path, cv2.IMREAD_GRAYSCALE)
+                    if cached is not None and cached.shape == shape:
+                        raw_mask = np.where(cached > 0, 255, 0).astype(np.uint8)
+            except (OSError, json.JSONDecodeError, AttributeError):
+                pass
+        if raw_mask is None:
+            base = _read_image(self.project.pages[stem])
+            result = _read_image(result_path)
+            if base is None or result is None or _as_bgr(base).shape[:2] != shape:
+                return np.zeros(shape, dtype=np.uint8)
+            try:
+                raw_mask = calculate_difference_mask(
+                    base,
+                    result,
+                    threshold=self.diff_threshold,
+                    min_area=self.diff_min_area,
+                )
+            except ValueError:
+                return np.zeros(shape, dtype=np.uint8)
+            try:
+                _write_png(mask_path, raw_mask)
+                metadata_tmp = cache_root / f'{stem}.json.tmp'
+                metadata_tmp.write_text(
+                    json.dumps({'signature': signature}, ensure_ascii=False, indent=2),
+                    encoding='utf-8',
+                )
+                os.replace(metadata_tmp, metadata_path)
+            except OSError:
+                pass
+        self._diff_mask_memory_cache[memory_key] = raw_mask
+        return expand_mask(raw_mask, self.mask_expand_px)
+
+    def _current_workflow_mask(self, workflow_name: str) -> np.ndarray:
+        if self.current_base is None or not self.current_stem:
+            return np.zeros((1, 1), dtype=np.uint8)
+        cached = self.current_workflow_masks.get(workflow_name)
+        if cached is not None:
+            return cached
+        mask = self._workflow_effective_mask(
+            self.current_stem,
+            workflow_name,
+            self.current_base.shape[:2],
+        )
+        self.current_workflow_masks[workflow_name] = mask
+        return mask
+
+    def _reconcile_assignment(self) -> None:
+        if self.assignment is None or self.current_base is None or not self.current_stem:
+            return
+        shape = self.current_base.shape[:2]
+        for workflow_name, code in self.workflow_codes.items():
+            selected = self.assignment == code
+            if np.any(selected):
+                allowed = self._workflow_effective_mask(
+                    self.current_stem, workflow_name, shape
+                ) > 0
+                self.assignment[selected & ~allowed] = 0
+        default_workflow = self._default_workflow_name(self.current_stem)
+        if default_workflow:
+            default_mask = self._workflow_effective_mask(
+                self.current_stem, default_workflow, shape
+            ) > 0
+            self.assignment[default_mask & (self.assignment == 0)] = self.workflow_codes[
+                default_workflow
+            ]
+
     def _load_assignment(self, stem: str, shape: tuple[int, int]) -> np.ndarray:
         path = self._assignment_path(stem)
         saved = _read_image(path, cv2.IMREAD_UNCHANGED) if path.is_file() else None
@@ -1099,23 +1267,25 @@ class WorkflowCompareWindow(QMainWindow):
             assignment = np.zeros(shape, dtype=np.uint16)
         if self.project is None:
             return assignment
-        mask = self._page_effective_mask(stem, shape) > 0
-        default_code = self._default_workflow_code(stem)
-        assignment[~mask] = 0
-        assignment[mask & (assignment == 0)] = default_code
+        for workflow_name, code in self.workflow_codes.items():
+            selected = assignment == code
+            if np.any(selected):
+                workflow_mask = self._workflow_effective_mask(stem, workflow_name, shape) > 0
+                assignment[selected & ~workflow_mask] = 0
+        default_workflow = self._default_workflow_name(stem)
+        default_code = self.workflow_codes.get(default_workflow, BASE_CODE)
+        if default_workflow:
+            default_mask = self._workflow_effective_mask(stem, default_workflow, shape) > 0
+            assignment[default_mask & (assignment == 0)] = default_code
         return assignment
 
-    def _page_effective_mask(self, stem: str, shape: tuple[int, int]) -> np.ndarray:
-        assert self.project is not None
-        return expand_mask(read_page_mask(self.project, stem, shape), self.mask_expand_px)
+    def _default_workflow_name(self, stem: str) -> str:
+        if self.project is None:
+            return ''
+        return next((name for name, pages in self.project.workflows.items() if stem in pages), '')
 
     def _default_workflow_code(self, stem: str) -> int:
-        if self.project is None:
-            return BASE_CODE
-        for workflow_name, pages in self.project.workflows.items():
-            if stem in pages:
-                return self.workflow_codes[workflow_name]
-        return BASE_CODE
+        return self.workflow_codes.get(self._default_workflow_name(stem), BASE_CODE)
 
     def save_current_assignment(self) -> None:
         if self.project is None or not self.current_stem or self.assignment is None:
@@ -1141,23 +1311,6 @@ class WorkflowCompareWindow(QMainWindow):
         self.page_list.blockSignals(False)
         self._update_progress()
 
-    def _assignment_progress(self, stem: str) -> tuple[int, int]:
-        assert self.project is not None
-        base = _read_image(self.project.pages[stem])
-        if base is None:
-            return 0, 0
-        shape = base.shape[:2]
-        mask = self._page_effective_mask(stem, shape) > 0
-        total = int(np.count_nonzero(mask))
-        if total == 0:
-            return 0, 0
-        if stem == self.current_stem and self.assignment is not None:
-            assignment = self.assignment
-        else:
-            assignment = self._load_assignment(stem, shape)
-        assigned = int(np.count_nonzero((assignment > 0) & mask))
-        return assigned, total
-
     def _update_page_item(self, stem: str) -> None:
         if self.project is None:
             return
@@ -1166,32 +1319,20 @@ class WorkflowCompareWindow(QMainWindow):
         except ValueError:
             return
         item = self.page_list.item(row)
-        assigned, total = self._assignment_progress(stem)
         source_name = self.project.pages[stem].name
-        if total == 0:
-            item.setText(f'○  {source_name}  無 Mask')
-            item.setForeground(QColor('#8d99a3'))
-        elif assigned >= total:
-            item.setText(f'●  {source_name}  完成')
+        if stem in self.initialized_pages:
+            item.setText(f'●  {source_name}  已編輯')
             item.setForeground(QColor('#76d7b4'))
-        elif assigned:
-            percent = round(assigned * 100 / total)
-            item.setText(f'◐  {source_name}  {percent}%')
-            item.setForeground(QColor('#f0cf78'))
         else:
-            item.setText(f'○  {source_name}  未選擇')
+            item.setText(f'○  {source_name}  預設第一組')
             item.setForeground(QColor('#c1c8ce'))
 
     def _update_progress(self) -> None:
         if self.project is None:
             self.progress_label.setText('')
             return
-        completed = 0
-        for stem in self.project.page_stems:
-            assigned, total = self._assignment_progress(stem)
-            if total == 0 or assigned >= total:
-                completed += 1
-        self.progress_label.setText(f'完成 {completed}/{len(self.project.pages)}')
+        edited = sum(stem in self.initialized_pages for stem in self.project.page_stems)
+        self.progress_label.setText(f'已編輯 {edited}/{len(self.project.pages)}')
 
     def _page_row_changed(self, row: int) -> None:
         if self.project is None or row < 0:
@@ -1205,7 +1346,7 @@ class WorkflowCompareWindow(QMainWindow):
             return
         self.current_stem = stem
         self.current_base = _as_bgr(base_raw)
-        self.current_mask = self._page_effective_mask(stem, self.current_base.shape[:2])
+        self.current_workflow_masks = {}
         self.assignment = self._load_assignment(stem, self.current_base.shape[:2])
         valid_codes = {0, BASE_CODE, *self.workflow_codes.values()}
         self.assignment[~np.isin(self.assignment, list(valid_codes))] = 0
@@ -1215,8 +1356,10 @@ class WorkflowCompareWindow(QMainWindow):
         self.refresh_overlays()
         self._update_actions()
         self.update_result_preview()
+        workflow_name = self._default_workflow_name(stem)
+        mask_pixels = int(np.count_nonzero(self._current_workflow_mask(workflow_name))) if workflow_name else 0
         self.statusBar().showMessage(
-            f'{self.project.pages[stem].name}：Mask 範圍 {int(np.count_nonzero(self.current_mask))} 像素。'
+            f'{self.project.pages[stem].name}：預設工作流差異 Mask {mask_pixels} 像素。'
         )
 
     def _panel_workflow_changed(self, panel: WorkflowPanel) -> None:
@@ -1303,23 +1446,49 @@ class WorkflowCompareWindow(QMainWindow):
         if self.project is None:
             return
         if self.current_stem and self.current_base is not None and self.assignment is not None:
-            self.current_mask = self._page_effective_mask(
-                self.current_stem,
-                self.current_base.shape[:2],
-            )
-            effective = self.current_mask > 0
-            self.assignment[~effective] = 0
-            self.assignment[effective & (self.assignment == 0)] = self._default_workflow_code(
-                self.current_stem
-            )
+            self.current_workflow_masks.clear()
+            self._reconcile_assignment()
             self.refresh_overlays()
             self.save_current_assignment()
             self.update_result_preview()
-        for stem in self.project.page_stems:
-            self._update_page_item(stem)
-        self._update_progress()
         self._save_state()
         self.statusBar().showMessage(f'Mask 擴大：{self.mask_expand_px} px')
+
+    def _difference_settings_changed(self) -> None:
+        self.diff_threshold = self.diff_threshold_size.value()
+        self.diff_min_area = self.diff_min_area_size.value()
+        self.settings.setValue('diff_threshold', self.diff_threshold)
+        self.settings.setValue('diff_min_area', self.diff_min_area)
+        self._diff_mask_memory_cache.clear()
+        self.current_workflow_masks.clear()
+        self._reconcile_assignment()
+        self.refresh_overlays()
+        self.save_current_assignment()
+        self.update_result_preview()
+        self._save_state()
+        self.statusBar().showMessage(
+            f'差異 Mask：閾值 {self.diff_threshold}／最小區域 {self.diff_min_area} px'
+        )
+
+    def recalculate_difference_masks(self) -> None:
+        if self.project is None or self.current_base is None or not self.current_stem:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self.current_workflow_masks.clear()
+            shape = self.current_base.shape[:2]
+            for workflow_name in self.project.workflows:
+                mask = self._workflow_effective_mask(
+                    self.current_stem, workflow_name, shape, force=True
+                )
+                self.current_workflow_masks[workflow_name] = mask
+            self._reconcile_assignment()
+            self.refresh_overlays()
+            self.save_current_assignment()
+            self.update_result_preview()
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.statusBar().showMessage('已重算當頁所有工作流的差異 Mask。')
 
     def _feather_changed(self, value: int) -> None:
         self.settings.setValue('feather_px', value)
@@ -1342,17 +1511,18 @@ class WorkflowCompareWindow(QMainWindow):
         self._push_undo()
 
     def _assign_point(self, workflow: str, x: int, y: int) -> None:
-        if self.assignment is None or self.current_mask is None:
+        if self.assignment is None:
             return
+        workflow_mask = self._current_workflow_mask(workflow)
         height, width = self.assignment.shape
-        if not (0 <= x < width and 0 <= y < height) or self.current_mask[y, x] == 0:
+        if not (0 <= x < width and 0 <= y < height) or workflow_mask[y, x] == 0:
             return
         code = self._effective_code(workflow)
         if code is None:
             return
-        brush_mask = np.zeros_like(self.current_mask)
+        brush_mask = np.zeros_like(workflow_mask)
         cv2.circle(brush_mask, (x, y), self.brush_size.value(), 255, -1, lineType=cv2.LINE_AA)
-        selected = (brush_mask > 0) & (self.current_mask > 0)
+        selected = (brush_mask > 0) & (workflow_mask > 0)
         if np.any(selected):
             self.assignment[selected] = code
             self._stroke_changed = True
@@ -1367,7 +1537,7 @@ class WorkflowCompareWindow(QMainWindow):
         height: int,
         use_base: bool = False,
     ) -> None:
-        if self.assignment is None or self.current_mask is None:
+        if self.assignment is None:
             return
         code = self._effective_code(workflow, use_base=use_base)
         if code is None:
@@ -1377,15 +1547,21 @@ class WorkflowCompareWindow(QMainWindow):
         top = max(0, min(image_height, y))
         right = max(left, min(image_width, x + width))
         bottom = max(top, min(image_height, y + height))
-        selected = self.current_mask[top:bottom, left:right] > 0
+        if use_base:
+            selected = self.assignment[top:bottom, left:right] > BASE_CODE
+        else:
+            selected = self._current_workflow_mask(workflow)[top:bottom, left:right] > 0
         if not np.any(selected):
-            self.statusBar().showMessage('矩形沒有覆蓋任何 Mask。')
+            message = '矩形內沒有已選工作流區域。' if use_base else (
+                '矩形沒有覆蓋此工作流的差異 Mask。'
+            )
+            self.statusBar().showMessage(message)
             return
         region = self.assignment[top:bottom, left:right]
         region[selected] = code
         self._stroke_changed = True
         if code == BASE_CODE:
-            self.statusBar().showMessage('右鍵矩形內的 Mask 已取消工作流選擇，保留原圖。')
+            self.statusBar().showMessage('右鍵矩形內已保留原圖。')
         else:
             self.statusBar().showMessage(f'矩形內的 Mask 已指定為 {workflow}。')
 
@@ -1429,33 +1605,34 @@ class WorkflowCompareWindow(QMainWindow):
             )
 
     def apply_whole(self, workflow: str) -> None:
-        if self.assignment is None or self.current_mask is None:
+        if self.assignment is None:
             return
         code = BASE_CODE if not workflow else self.workflow_codes.get(workflow)
         if code is None:
             return
         self._push_undo()
-        self.assignment[self.current_mask > 0] = code
+        if code == BASE_CODE:
+            self.assignment[self.assignment > 0] = BASE_CODE
+        else:
+            self.assignment[self._current_workflow_mask(workflow) > 0] = code
         self._finish_assignment_change()
         source = '底圖' if code == BASE_CODE else workflow
         self.statusBar().showMessage(f'整個 Mask 已指定為 {source}。')
 
     def reset_page_assignment(self) -> None:
-        if self.assignment is None or self.current_mask is None or not self.current_stem:
+        if self.assignment is None or not self.current_stem:
             return
-        default_code = self._default_workflow_code(self.current_stem)
+        default_name = self._default_workflow_name(self.current_stem)
+        default_code = self.workflow_codes.get(default_name, BASE_CODE)
         reset = np.zeros_like(self.assignment)
-        reset[self.current_mask > 0] = default_code
+        if default_name:
+            reset[self._current_workflow_mask(default_name) > 0] = default_code
         if np.array_equal(reset, self.assignment):
             return
         self._push_undo()
         self.assignment = reset
         self._finish_assignment_change()
-        default_name = next(
-            (name for name, code in self.workflow_codes.items() if code == default_code),
-            '底圖',
-        )
-        self.statusBar().showMessage(f'已將此頁重設為 {default_name}。')
+        self.statusBar().showMessage(f'已將此頁重設為 {default_name or "底圖"}。')
 
     def undo(self) -> None:
         if self.assignment is None or not self.undo_stack:
@@ -1478,70 +1655,44 @@ class WorkflowCompareWindow(QMainWindow):
         self.clear_button.setEnabled(enabled)
         self.base_whole_button.setEnabled(enabled)
 
-    def _assignment_overlay(self) -> QImage | None:
+    def _workflow_color(self, workflow_name: str) -> tuple[int, int, int]:
+        try:
+            index = list(self.workflow_codes).index(workflow_name)
+        except ValueError:
+            index = 0
+        return WORKFLOW_COLORS[index % len(WORKFLOW_COLORS)]
+
+    def _assignment_overlay(self, workflow_name: str) -> QImage | None:
         if (
             not self.show_regions_checkbox.isChecked()
             or self.assignment is None
-            or self.current_mask is None
         ):
             return None
         height, width = self.assignment.shape
         overlay = np.zeros((height, width, 4), dtype=np.uint8)
-        unassigned = (self.current_mask > 0) & (self.assignment == 0)
-        base_selected = self.assignment == BASE_CODE
-        overlay[base_selected] = (135, 145, 155, 72)
-        for index, (name, code) in enumerate(self.workflow_codes.items()):
-            color = WORKFLOW_COLORS[index % len(WORKFLOW_COLORS)]
-            selected = self.assignment == code
-            overlay[selected] = (*color, 82)
+        mask = self._current_workflow_mask(workflow_name) > 0
+        color = self._workflow_color(workflow_name)
+        workflow_code = self.workflow_codes.get(workflow_name, -1)
+        selected = mask & (self.assignment == workflow_code)
+        overlay[mask] = (*color, 28)
+        overlay[selected] = (*color, 108)
         contours, _ = cv2.findContours(
-            (self.current_mask > 0).astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
+            mask.astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
         )
-        cv2.drawContours(overlay, contours, -1, (255, 229, 130, 210), 1, cv2.LINE_AA)
-        if np.any(unassigned):
-            overlay[unassigned, 3] = np.maximum(overlay[unassigned, 3], 22)
+        cv2.drawContours(overlay, contours, -1, (*color, 190), 1, cv2.LINE_AA)
         return _qimage_from_bgra(overlay)
 
     def refresh_overlays(self) -> None:
-        overlay = self._assignment_overlay()
         for panel in self.panels:
-            panel.view.set_overlay(overlay)
+            panel.view.set_overlay(self._assignment_overlay(panel.current_workflow()))
 
     def export_results(self) -> None:
         if self.project is None:
             QMessageBox.information(self, '尚未載入', '請先選擇 export_pair 文件夾。')
             return
         self.save_current_assignment()
-        incomplete: list[str] = []
-        missing_masks: list[str] = []
-        for stem in self.project.page_stems:
-            base = _read_image(self.project.pages[stem])
-            if base is None:
-                continue
-            shape = base.shape[:2]
-            mask = self._page_effective_mask(stem, shape) > 0
-            if not np.any(mask):
-                missing_masks.append(self.project.pages[stem].name)
-                continue
-            assignment = self._load_assignment(stem, shape)
-            if np.any((assignment == 0) & mask):
-                incomplete.append(self.project.pages[stem].name)
-        if incomplete:
-            preview = '、'.join(incomplete[:8])
-            if len(incomplete) > 8:
-                preview += f' 等 {len(incomplete)} 張'
-            answer = QMessageBox.question(
-                self,
-                '仍有未選擇區域',
-                f'{preview} 尚有 Mask 區域未指定來源。\n未指定部分將保留底圖，是否繼續輸出？',
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
-
         result_dir = self.project.root / RESULT_DIR_NAME
-        errors: list[str] = [f'{name}：沒有可用 Mask，已輸出底圖' for name in missing_masks]
+        errors: list[str] = []
         manifest_pages: dict[str, dict[str, object]] = {}
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
@@ -1561,13 +1712,11 @@ class WorkflowCompareWindow(QMainWindow):
                         feather_px=self.feather_size.value(),
                     )
                     _write_png(result_dir / f'{stem}.png', output)
-                    mask_for_counts = self._page_effective_mask(stem, assignment.shape) > 0
                     counts: dict[str, int] = {
-                        '未指定': int(np.count_nonzero((assignment == 0) & mask_for_counts)),
-                        '底圖': int(np.count_nonzero((assignment == BASE_CODE) & mask_for_counts)),
+                        '底圖': int(np.count_nonzero(assignment == BASE_CODE)),
                     }
                     for workflow_name, code in self.workflow_codes.items():
-                        count = int(np.count_nonzero((assignment == code) & mask_for_counts))
+                        count = int(np.count_nonzero(assignment == code))
                         if count:
                             counts[workflow_name] = count
                     manifest_pages[f'{stem}.png'] = {
@@ -1580,9 +1729,12 @@ class WorkflowCompareWindow(QMainWindow):
                 except (OSError, ValueError) as exc:
                     errors.append(str(exc))
             manifest = {
-                'version': 1,
+                'version': 2,
                 'export_pair': str(self.project.root),
+                'mask_source': 'workflow_difference',
                 'mask_expand_px': self.mask_expand_px,
+                'diff_threshold': self.diff_threshold,
+                'diff_min_area': self.diff_min_area,
                 'feather_px': self.feather_size.value(),
                 'workflow_codes': self.workflow_codes,
                 'pages': manifest_pages,

@@ -7,14 +7,19 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from workflow_compare_ui import build_region_labels, compose_result, discover_export_pair, expand_mask
+from workflow_compare_ui import (
+    build_region_labels,
+    calculate_difference_mask,
+    compose_result,
+    discover_export_pair,
+    expand_mask,
+)
 
 
 class WorkflowCompareTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name) / 'export_pair'
-        (self.root / 'other_mask').mkdir(parents=True)
         for name in ('alpha', 'beta'):
             (self.root / 'inpaint_workflows' / name).mkdir(parents=True)
 
@@ -25,7 +30,6 @@ class WorkflowCompareTests(unittest.TestCase):
         alpha = np.full_like(self.base, (0, 0, 255))
         beta = np.full_like(self.base, (0, 255, 0))
         cv2.imwrite(str(self.root / '01.png'), self.base)
-        cv2.imwrite(str(self.root / 'other_mask' / '01.png'), self.mask)
         cv2.imwrite(str(self.root / 'inpaint_workflows' / 'alpha' / '01.png'), alpha)
         cv2.imwrite(str(self.root / 'inpaint_workflows' / 'beta' / '01.png'), beta)
 
@@ -39,6 +43,29 @@ class WorkflowCompareTests(unittest.TestCase):
         self.assertEqual(list(project.workflows), ['alpha', 'beta'])
         self.assertEqual(count, 2)
         self.assertNotEqual(int(labels[4, 5]), int(labels[14, 16]))
+
+    def test_calculates_difference_mask_and_filters_tiny_noise(self) -> None:
+        result = self.base.copy()
+        result[3:9, 4:11] = (30, 40, 50)
+        result[15, 20] = (255, 255, 255)
+
+        difference_mask = calculate_difference_mask(
+            self.base, result, threshold=12, min_area=8
+        )
+
+        self.assertEqual(int(difference_mask[5, 6]), 255)
+        self.assertEqual(int(difference_mask[15, 20]), 0)
+        self.assertEqual(int(difference_mask[0, 0]), 0)
+
+    def test_difference_threshold_ignores_small_color_change(self) -> None:
+        result = self.base.copy()
+        result[2:12, 2:12] = (8, 8, 8)
+
+        difference_mask = calculate_difference_mask(
+            self.base, result, threshold=12, min_area=1
+        )
+
+        self.assertFalse(np.any(difference_mask))
 
     def test_composes_different_workflows_inside_mask_only(self) -> None:
         project = discover_export_pair(self.root)
