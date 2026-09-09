@@ -102,7 +102,7 @@ STATUS_TODO = '未處理'
 MAX_RECENT_FOLDERS = 12
 MAX_FOLDER_PROGRESS = 200
 MAX_UNDO_STEPS = 30
-DEFAULT_MASK_ALPHA_PERCENT = 28
+DEFAULT_MASK_ALPHA_PERCENT = 70
 DEFAULT_OTHER_MASK_PREVIEW_EXPAND_PX = 5
 MAX_OTHER_MASK_PREVIEW_EXPAND_PX = 80
 DEFAULT_OTHER_MASK_DISPLAY_ALPHA = 0.38
@@ -121,7 +121,6 @@ MIN_LOCAL_INTERSECT_OFFSET_PX = -80
 MAX_LOCAL_INTERSECT_OFFSET_PX = 80
 CTD_SELECTION_PADDING_PX = 16
 MASK_DISPLAY_COLORS: dict[str, tuple[int, int, int]] = {
-    '淡黃色': (70, 235, 255),
     '白色': (255, 255, 255),
     '紅色': (60, 80, 255),
     '青色': (255, 245, 70),
@@ -144,7 +143,7 @@ SELECTION_COMBINE_LABELS = {
 }
 EDIT_MODE_COLORS = {
     'mask': (255, 255, 255),
-    'manual_solid': (70, 235, 255),
+    'manual_solid': (255, 255, 255),
     'manual_other': (165, 110, 255),
 }
 VIEW_ZOOM_STEP = 1.15
@@ -316,24 +315,34 @@ def _overlay_transparent_mask_on_bgr(
     return output
 
 
-def _editor_mask_preview(base, solid, other, alpha, sample=None, solid_color=None):
-    """線性混合原圖與純 Mask；透明效果由滑桿直接控制。"""
+def _editor_mask_preview(
+    base, solid, other, alpha, sample=None, solid_color=None,
+    *, detected_text=None, manual_edits=None,
+):
+    """文字與背景取樣分開顯示，不能把整區填色 overlay 當成文字。"""
     alpha = max(0.0, min(1.0, alpha))
-    base_bgr = base[:, :, :3] if base.ndim == 3 else cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
-    mask_image = np.zeros_like(base_bgr)
+    text = np.zeros(base.shape[:2], dtype=np.uint8)
+    if solid is not None:
+        if detected_text is not None:
+            text[(detected_text > 0) & (solid > 0)] = 255
+        # 人工添加的範圍也要可見；擦除、轉入圖像修補的部分不再顯示白色。
+        if manual_edits is not None:
+            text[(manual_edits > 0) & (solid > 0)] = 255
+    preview = _mask_overlay_image(
+        base, text, alpha,
+        solid_color if solid_color is not None else EDIT_MODE_COLORS['manual_solid'],
+    )
+    preview = _overlay_transparent_mask_on_bgr(
+        preview, other, alpha, EDIT_MODE_COLORS['manual_other'],
+    )
     if sample is not None:
-        mask_image = _overlay_mask_on_bgr(
-            mask_image, sample, SAMPLE_RING_DISPLAY_ALPHA, SAMPLE_RING_DISPLAY_COLOR_BGR,
-        )
-    # 正式選區最後繪製，背景取樣提示不在重疊處重複染色。
-    for mask, color in (
-        (solid, solid_color if solid_color is not None else EDIT_MODE_COLORS['manual_solid']),
-        (other, EDIT_MODE_COLORS['manual_other']),
-    ):
-        if mask is not None:
-            mask_image[mask > 0] = color
-    return (base_bgr.astype(np.float32) * (1.0 - alpha)
-            + mask_image.astype(np.float32) * alpha).astype(np.uint8)
+        sample = sample.copy()
+        sample[text > 0] = 0
+        if other is not None:
+            sample[other > 0] = 0
+    return _overlay_mask_on_bgr(
+        preview, sample, SAMPLE_RING_DISPLAY_ALPHA, SAMPLE_RING_DISPLAY_COLOR_BGR,
+    )
 
 
 class ImageView(QGraphicsView):
@@ -1680,6 +1689,7 @@ class LocalEditDialog(QDialog):
         mask_color_bgr: tuple[int, int, int],
         alpha: float,
         parent: QWidget | None = None,
+        preview_context: dict | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle('局部編輯')
@@ -1690,6 +1700,7 @@ class LocalEditDialog(QDialog):
         self.source_bgr = self.page_bgr
         self.mask_color_bgr = mask_color_bgr
         self.alpha = alpha
+        self.preview_context = preview_context
         self.undo_stack: list[np.ndarray] = []
         self.redo_stack: list[np.ndarray] = []
         self._updating_roi_controls = False
@@ -1909,13 +1920,28 @@ class LocalEditDialog(QDialog):
         inset = min(inset, max_inset)
         self.set_roi_box((x1 + inset, y1 + inset, x2 - inset, y2 - inset))
 
-    def refresh_preview(self, keep_view: bool = True) -> None:
-        preview = _mask_overlay_image(
-            self.source_bgr,
-            self.current_mask,
-            self.alpha,
-            self.mask_color_bgr,
+    def render_preview(self, mask, rect=None):
+        if rect is None:
+            rect = (0, 0, self.source_bgr.shape[1], self.source_bgr.shape[0])
+        x1, y1, x2, y2 = rect
+        crop = lambda value: None if value is None else value[y1:y2, x1:x2]
+        context = self.preview_context
+        if context is None:
+            return _mask_overlay_image(crop(self.source_bgr), crop(mask), self.alpha, self.mask_color_bgr)
+        solid = crop(mask if context['mode'] == 'manual_solid' else context['solid']).copy()
+        other = crop(mask if context['mode'] == 'manual_other' else context['other']).copy()
+        if context['mode'] == 'manual_solid':
+            other[solid > 0] = 0
+        else:
+            solid[other > 0] = 0
+        edited = (crop(context['edited']) > 0) | (solid != crop(context['solid']))
+        return _editor_mask_preview(
+            crop(self.source_bgr), solid, other, self.alpha, crop(context['sample']),
+            context['solid_color'], detected_text=crop(context['text']), manual_edits=edited,
         )
+
+    def refresh_preview(self, keep_view: bool = True) -> None:
+        preview = self.render_preview(self.current_mask)
         self.view.set_qimage(_qimage_from_bgr(preview), keep_view=keep_view)
         self.view.set_mask(self.current_mask, self.source_bgr.shape[:2], reset_brush_line=True)
         self.view.set_source_image(self.source_bgr)
@@ -1929,13 +1955,7 @@ class LocalEditDialog(QDialog):
         self.redo_stack = []
         if self.view.tool != 'brush':
             return
-        empty = np.zeros_like(self.current_mask)
-        preview = _mask_overlay_image(
-            self.source_bgr,
-            empty,
-            self.alpha,
-            self.mask_color_bgr,
-        )
+        preview = self.render_preview(self.current_mask)
         self.view.set_qimage(_qimage_from_bgr(preview), keep_view=True)
         self.view.start_live_mask_preview(self.render_live_patch)
 
@@ -1945,9 +1965,7 @@ class LocalEditDialog(QDialog):
             return np.zeros((y2 - y1, x2 - x1, 4), dtype=np.uint8)
         crop = live_mask[y1:y2, x1:x2]
         patch = np.zeros((*crop.shape, 4), dtype=np.uint8)
-        patch[:, :, :3] = _mask_overlay_image(
-            self.source_bgr[y1:y2, x1:x2], crop, self.alpha, self.mask_color_bgr,
-        )
+        patch[:, :, :3] = self.render_preview(live_mask, (x1, y1, x2, y2))
         patch[:, :, 3] = 255
         return patch
 
@@ -3136,7 +3154,7 @@ class MainWindow(QMainWindow):
         self.navigator_position = self._load_navigator_position()
         self.alpha = self.mask_alpha_percent / 100.0
         self.other_mask_display_alpha = self.other_mask_display_alpha_percent / 100.0
-        self.mask_display_color = MASK_DISPLAY_COLORS['淡黃色']
+        self.mask_display_color = MASK_DISPLAY_COLORS['白色']
         self.show_other_mask = True
         self.show_background_sample = True
         self.undo_stack: list[dict[str, np.ndarray]] = []
@@ -3546,8 +3564,8 @@ class MainWindow(QMainWindow):
         self.alpha_slider = QSlider(Qt.Orientation.Horizontal)
         self.alpha_slider.setRange(0, 100)
         self.alpha_slider.setToolTip(
-            '0%：原圖；100%：黑底純 Mask。\n'
-            '預設 28%：淡黃色透明疊加；可調整完整的 0–100% 範圍。'
+            '100%：黑底文字 Mask；0%：原圖；中間值：原圖與文字 Mask 混合。\n'
+            '黃色背景取樣區固定 28% 透明度；取消「顯示背景選區」可查看無標記原圖。'
         )
         self.alpha_slider.setInvertedAppearance(True)
         self.alpha_slider.setValue(self.mask_alpha_percent)
@@ -3557,11 +3575,11 @@ class MainWindow(QMainWindow):
         view_options.addWidget(self.alpha_slider, 1)
         view_options.addWidget(QLabel('0%'))
         view_options.addWidget(self.alpha_label)
-        view_options.addWidget(QLabel('純色選區顏色'))
+        view_options.addWidget(QLabel('文字 Mask 顏色'))
         self.mask_color_combo = QComboBox()
         self.mask_color_combo.addItems(list(MASK_DISPLAY_COLORS))
-        self.mask_color_combo.setCurrentText('淡黃色')
-        self.mask_color_combo.setToolTip('只改變純色填充選區的顯示顏色，不影響實際填色。')
+        self.mask_color_combo.setCurrentText('白色')
+        self.mask_color_combo.setToolTip('只改變純色填充類文字及人工選區的顯示顏色；黃色背景取樣區獨立顯示。')
         self.mask_color_combo.currentTextChanged.connect(self.on_mask_display_color_changed)
         view_options.addWidget(self.mask_color_combo)
         self.background_sample_checkbox = QCheckBox('顯示背景選區')
@@ -3782,7 +3800,7 @@ class MainWindow(QMainWindow):
         return result[:MAX_RECENT_FOLDERS]
 
     def _load_mask_alpha_percent(self) -> int:
-        value = self.settings.value('mask_original_mix_percent', DEFAULT_MASK_ALPHA_PERCENT)
+        value = self.settings.value('mask_alpha_percent', DEFAULT_MASK_ALPHA_PERCENT)
         try:
             percent = int(value)
         except (TypeError, ValueError):
@@ -3790,7 +3808,7 @@ class MainWindow(QMainWindow):
         return max(0, min(100, percent))
 
     def save_mask_alpha_percent(self) -> None:
-        self.settings.setValue('mask_original_mix_percent', self.mask_alpha_percent)
+        self.settings.setValue('mask_alpha_percent', self.mask_alpha_percent)
 
     def _load_other_mask_display_color(self) -> tuple[int, int, int]:
         color = QColor(str(self.settings.value('other_mask_display_color', '#FF6EA5')))
@@ -4656,6 +4674,12 @@ class MainWindow(QMainWindow):
             return
         self.status.showMessage(f'PSD 素材已導出：{folder}；可執行 create_psds_from_outputs.jsx。')
 
+    def preview_manual_edits(self, solid=None):
+        solid = self.current_manual_solid if solid is None else solid
+        if self.current_page is None or solid is None:
+            return None
+        return (self.current_page['edited'] > 0) | (solid != self.current_page['overlay'][:, :, 3])
+
     def refresh_mask_preview(self, keep_view: bool = True) -> None:
         if self.is_mask_stroke_active or self.is_local_edit_active:
             return
@@ -4668,6 +4692,7 @@ class MainWindow(QMainWindow):
             self.current_base, self.current_manual_solid, self.current_manual_other,
             self.alpha, self.current_background_sample if self.show_background_sample else None,
             solid_color=self.mask_display_color,
+            detected_text=self.detected_text_mask, manual_edits=self.preview_manual_edits(),
         )
         mask_qimage = _qimage_from_bgr(mask_preview)
         self.mask_view.set_qimage(mask_qimage, keep_view=keep_view)
@@ -4687,7 +4712,7 @@ class MainWindow(QMainWindow):
         self.refresh_mask_preview(keep_view=True)
 
     def on_mask_display_color_changed(self, color_name: str) -> None:
-        self.mask_display_color = MASK_DISPLAY_COLORS.get(color_name, MASK_DISPLAY_COLORS['淡黃色'])
+        self.mask_display_color = MASK_DISPLAY_COLORS.get(color_name, MASK_DISPLAY_COLORS['白色'])
         self.refresh_mask_preview(keep_view=True)
 
     def on_show_background_sample_changed(self, state: int) -> None:
@@ -5053,6 +5078,7 @@ class MainWindow(QMainWindow):
             self.current_base, self.current_manual_solid, self.current_manual_other,
             self.alpha, self.current_background_sample if self.show_background_sample else None,
             solid_color=self.mask_display_color,
+            detected_text=self.detected_text_mask, manual_edits=self.preview_manual_edits(),
         )
         self.mask_view.set_qimage(_qimage_from_bgr(preview), keep_view=True)
         self.mask_view.start_live_mask_preview(self.render_brush_live_patch)
@@ -5068,6 +5094,7 @@ class MainWindow(QMainWindow):
         preview = _editor_mask_preview(
             self.current_base[y1:y2, x1:x2], crop(solid), crop(other), self.alpha, crop(sample),
             solid_color=self.mask_display_color,
+            detected_text=crop(self.detected_text_mask), manual_edits=crop(self.preview_manual_edits(solid)),
         )
         # 完整合成 dirty region，避免在已淡出的底圖上再次混合透明度。
         patch = np.empty((*preview.shape[:2], 4), dtype=np.uint8)
@@ -5124,6 +5151,12 @@ class MainWindow(QMainWindow):
             self.current_edit_color(),
             self.alpha,
             self,
+            preview_context={
+                'mode': self.edit_mode, 'solid': self.current_manual_solid.copy(),
+                'other': self.current_manual_other.copy(), 'text': self.detected_text_mask,
+                'edited': self.preview_manual_edits(), 'solid_color': self.mask_display_color,
+                'sample': self.current_background_sample if self.show_background_sample else None,
+            },
         )
         self.is_local_edit_active = True
         try:

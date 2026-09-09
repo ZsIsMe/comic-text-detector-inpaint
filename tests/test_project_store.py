@@ -302,7 +302,7 @@ class EditorTests(unittest.TestCase):
         mask_canvas = canvas_bgr()
         np.testing.assert_array_equal(mask_canvas[20, 20], [0, 0, 0])
         np.testing.assert_array_equal(mask_canvas[12, 12], EDIT_MODE_COLORS['manual_other'])
-        self.assertEqual(w.mask_color_combo.currentText(), '淡黃色')
+        self.assertEqual(w.mask_color_combo.currentText(), '白色')
         np.testing.assert_array_equal(mask_canvas[70, 90], EDIT_MODE_COLORS['manual_solid'])
         from solid_inpaint_ui import MASK_DISPLAY_COLORS
         w.mask_color_combo.setCurrentText('青色')
@@ -322,27 +322,51 @@ class EditorTests(unittest.TestCase):
         for key in before:
             np.testing.assert_array_equal(after[key], before[key])
 
-    def test_mask_mix_endpoints_midpoint_and_readable_default(self):
-        from solid_inpaint_ui import _editor_mask_preview, EDIT_MODE_COLORS
-        base = np.full((4, 4, 3), 255, np.uint8)
-        base[1, 1] = 0
-        solid = np.zeros((4, 4), np.uint8)
-        solid[:3, :3] = 255
-        sample = solid.copy()
-        for alpha in (0.0, 0.28, 0.5, 0.8, 1.0):
-            plain = _editor_mask_preview(base, solid, None, alpha)
-            overlapping = _editor_mask_preview(base, solid, None, alpha, sample)
-            np.testing.assert_array_equal(plain, overlapping)
-        mask = _editor_mask_preview(base, solid, None, 1.0)
-        np.testing.assert_array_equal(mask[0, 0], EDIT_MODE_COLORS['manual_solid'])
-        np.testing.assert_array_equal(mask[1, 1], mask[0, 0])
-        np.testing.assert_array_equal(mask[3, 3], [0, 0, 0])
-        np.testing.assert_array_equal(_editor_mask_preview(base, solid, None, 0, sample), base)
-        midpoint = _editor_mask_preview(base, solid, None, 0.5)
-        np.testing.assert_array_equal(midpoint, ((base.astype(float) + mask) / 2).astype(np.uint8))
-        self.assertEqual(self.window.alpha_slider.value(), 28)
-        preview = _editor_mask_preview(base, solid, None, 0.28)
-        np.testing.assert_array_equal(preview[0, 0], [203, 249, 255])
-        self.assertTrue(np.all(preview[0, 0].astype(int) - preview[1, 1] >= 180))
+    def test_preview_separates_text_from_fill_and_matches_old_sample_opacity(self):
+        from solid_inpaint_ui import _editor_mask_preview
+        base = np.full((8, 8, 3), 200, np.uint8)
+        base[3, 3] = 0
+        text = np.zeros((8, 8), np.uint8); text[3, 3] = 255
+        solid = np.zeros_like(text); solid[1:7, 1:7] = 255
+        sample = solid.copy(); sample[text > 0] = 0
+        for alpha in (0, 0.5, 0.8, 1):
+            actual = _editor_mask_preview(base, solid, None, alpha, sample, detected_text=text)
+            # 舊版先混合原圖與白色文字，再用固定 28% 疊加黃色取樣區。
+            expected = (base.astype(np.float32) * (1-alpha)).astype(np.uint8)
+            expected[text > 0] = (base[text > 0] * (1-alpha) + 255*alpha).astype(np.uint8)
+            expected[sample > 0] = (expected[sample > 0] * .72 + np.array([70, 235, 255]) * .28).astype(np.uint8)
+            np.testing.assert_array_equal(actual, expected)
+        pure = _editor_mask_preview(base, solid, None, 1, sample, detected_text=text)
+        np.testing.assert_array_equal(pure[3, 3], [255, 255, 255])
+        np.testing.assert_array_equal(pure[2, 2], [19, 65, 71])
+        np.testing.assert_array_equal(pure[0, 0], [0, 0, 0])
+        self.assertEqual(self.window.alpha_slider.value(), 70)
         self.window.alpha_slider.setValue(63)
         self.assertEqual(self.window._load_mask_alpha_percent(), 63)
+
+    def test_manual_addition_and_erasure_change_display_without_detector_changes(self):
+        from solid_inpaint_ui import _editor_mask_preview, LocalEditDialog
+        w = self.window
+        w.show_background_sample = False
+        w.alpha_slider.setValue(100)
+        original_text = w.detected_text_mask.copy()
+        solid = w.current_manual_solid.copy()
+        solid[20:25, 20:25] = 255
+        solid[70:75, 85:90] = 0
+        w.set_current_edit_mask(solid)
+        expected = _editor_mask_preview(
+            w.current_base, solid, w.current_manual_other, 1,
+            detected_text=w.detected_text_mask, manual_edits=w.preview_manual_edits(),
+        )
+        np.testing.assert_array_equal(expected[22, 22], [255]*3)
+        np.testing.assert_array_equal(expected[72, 87], [0]*3)
+        w.mask_view.set_mask(solid, solid.shape)
+        np.testing.assert_array_equal(w.render_brush_live_patch(0, 0, 100, 100)[:, :, :3], expected[:100, :100])
+        dialog = LocalEditDialog(w.current_base, solid, (0, 0, 100, 100), (255, 255, 255), 1,
+            preview_context={'mode': 'manual_solid', 'solid': solid.copy(), 'other': w.current_manual_other.copy(),
+                             'text': w.detected_text_mask, 'edited': w.preview_manual_edits(),
+                             'solid_color': (255, 255, 255), 'sample': None})
+        np.testing.assert_array_equal(dialog.render_preview(solid), expected)
+        np.testing.assert_array_equal(dialog.render_live_patch(0, 0, 100, 100)[:, :, :3], expected[:100, :100])
+        dialog.close()
+        np.testing.assert_array_equal(w.detected_text_mask, original_text)
