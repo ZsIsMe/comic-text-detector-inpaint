@@ -5,11 +5,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import os.path as osp
 import re
 import sys
-import tempfile
 import zlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -18,7 +16,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
-from bubble_solid import detect_bubbles, fill_bubbles, load_settings, spatial_spread, MODEL_PATH as BUBBLE_MODEL_PATH
+from bubble_solid import detect_bubbles, fill_bubbles, load_settings, spatial_spread
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 VENDOR_DIR = SCRIPT_DIR / 'vendor'
@@ -31,16 +29,11 @@ from utils.io_utils import find_all_imgs, imread, imwrite
 from utils.textmask import REFINEMASK_ANNOTATION
 
 
+import project_store as store
+
 OUTPUT_DIR = 'ctd_inpainted'
 RAW_DIR = 'raw'
-MASK_DIR = 'mask'
-OTHER_MASK_DIR = 'other_mask'
-INPAINTED_DIR = 'inpainted'
-MANUAL_SOLID_DIR = 'manual_solid'
-MANUAL_OTHER_DIR = 'manual_other'
-BACKGROUND_SAMPLE_CACHE_DIR = 'background_sample_cache'
 EXPORT_PAIR_DIR = 'export_pair'
-REPORT_JSON = 'solid_inpaint_report.json'
 PREVIEW_PDF = 'preview_report.pdf'
 MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'comictextdetector.pt'
 CTBD_MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'comic-text-and-bubble-detector.onnx'
@@ -125,69 +118,42 @@ class SolidQuality:
     sampled_cells: int = 0
 
 
-def _move_legacy_output_entry(src: Path, dst: Path) -> None:
-    """Move an old root-level output into raw without overwriting conflicts."""
-    if not src.exists():
-        return
-    if not dst.exists():
-        src.replace(dst)
-        return
-    if not src.is_dir() or not dst.is_dir():
-        return
-    for child in src.iterdir():
-        _move_legacy_output_entry(child, dst / child.name)
-    try:
-        src.rmdir()
-    except OSError:
-        pass
-
-
 def _ensure_dirs(img_dir: str) -> dict[str, str]:
-    out_dir = osp.join(img_dir, OUTPUT_DIR)
-    raw_dir = osp.join(out_dir, RAW_DIR)
-    os.makedirs(raw_dir, exist_ok=True)
-    for name in os.listdir(out_dir):
-        if name in (RAW_DIR, EXPORT_PAIR_DIR):
-            continue
-        _move_legacy_output_entry(Path(out_dir) / name, Path(raw_dir) / name)
-    paths = {
-        'output': out_dir,
-        'raw': raw_dir,
-        'mask': osp.join(raw_dir, MASK_DIR),
-        'other_mask': osp.join(raw_dir, OTHER_MASK_DIR),
-        'inpainted': osp.join(raw_dir, INPAINTED_DIR),
-        'manual_solid': osp.join(raw_dir, MANUAL_SOLID_DIR),
-        'manual_other': osp.join(raw_dir, MANUAL_OTHER_DIR),
-        'background_sample_cache': osp.join(raw_dir, BACKGROUND_SAMPLE_CACHE_DIR),
-        'export_pair': osp.join(out_dir, EXPORT_PAIR_DIR),
-    }
-    for path in paths.values():
-        os.makedirs(path, exist_ok=True)
-    return paths
+    out_dir = Path(img_dir) / OUTPUT_DIR
+    raw = out_dir / RAW_DIR
+    if raw.exists() and not (raw / 'project.json').exists():
+        legacy = ('mask', 'manual_solid', 'manual_other', 'solid_inpaint_report.json')
+        if any((raw / name).exists() for name in legacy):
+            raise ValueError('此資料夾是舊格式專案。請先將 ctd_inpainted 改名保留，再重新偵測建立新版專案。')
+    raw.mkdir(parents=True, exist_ok=True)
+    store.update_project(raw, image_dir=str(Path(img_dir).resolve()),
+                         images=[Path(p).name for p in image_files_in_folder(img_dir)])
+    return {'output': str(out_dir), 'raw': str(raw),
+            'export_pair': str(out_dir / EXPORT_PAIR_DIR)}
 
 
-def _output_path(paths: dict[str, str], img_path: str) -> str:
-    return osp.join(paths['inpainted'], f'{Path(img_path).stem}.png')
+def read_page_state(paths, img_path, shape=None):
+    if shape is None:
+        image = imread(img_path, cv2.IMREAD_UNCHANGED)
+        if image is None:
+            raise FileNotFoundError(f'無法讀取原圖：{img_path}')
+        shape = image.shape[:2]
+    return store.load_page(paths, img_path, shape)
 
 
-def _mask_path(paths: dict[str, str], img_path: str) -> str:
-    return osp.join(paths['mask'], f'{Path(img_path).stem}.png')
-
-
-def _other_mask_path(paths: dict[str, str], img_path: str) -> str:
-    return osp.join(paths['other_mask'], f'{Path(img_path).stem}.png')
-
-
-def _manual_solid_path(paths: dict[str, str], img_path: str) -> str:
-    manual_dir = paths.get('manual_solid') or osp.join(paths['output'], MANUAL_SOLID_DIR)
-    os.makedirs(manual_dir, exist_ok=True)
-    return osp.join(manual_dir, f'{Path(img_path).stem}.png')
-
-
-def _manual_other_path(paths: dict[str, str], img_path: str) -> str:
-    manual_dir = paths.get('manual_other') or osp.join(paths['output'], MANUAL_OTHER_DIR)
-    os.makedirs(manual_dir, exist_ok=True)
-    return osp.join(manual_dir, f'{Path(img_path).stem}.png')
+def export_psd_assets(images, paths):
+    """Export Photoshop-readable PNGs only on request, outside raw."""
+    stems = [Path(image).stem for image in images]
+    if len(stems) != len(set(stems)):
+        raise ValueError('原圖有去除副檔名後同名的檔案，無法導出同名 PNG。')
+    root = Path(paths['output']) / 'psd_assets'
+    for name in ('solid', 'other_mask'):
+        (root/name).mkdir(parents=True, exist_ok=True)
+    for image, stem in zip(images, stems):
+        state = read_page_state(paths, image)
+        imwrite(str(root/'solid'/f'{stem}.png'), state['overlay'])
+        imwrite(str(root/'other_mask'/f'{stem}.png'), state['other'])
+    return str(root)
 
 
 def _mask_hash(mask: np.ndarray | None) -> int:
@@ -198,45 +164,21 @@ def _mask_hash(mask: np.ndarray | None) -> int:
     return zlib.crc32(mask_bin.tobytes(), shape_hash)
 
 
-def _background_sample_cache_path(paths: dict[str, str], img_path: str) -> str:
-    cache_dir = paths.get('background_sample_cache') or osp.join(paths['output'], BACKGROUND_SAMPLE_CACHE_DIR)
-    return osp.join(cache_dir, f'{Path(img_path).stem}.npz')
+def _background_sample_cache_path(paths, img_path):
+    return str(store.cache_path(paths, img_path))
 
 
-def _background_cache_context(paths: dict[str, str], img_path: str) -> str:
-    stat = os.stat(img_path)
-    settings = load_settings(paths.get('raw', paths['output']))
-    versions = []
-    for path in (BUBBLE_MODEL_PATH, _manual_other_path(paths, img_path)):
-        try:
-            dependency = os.stat(path)
-            versions.append([dependency.st_mtime_ns, dependency.st_size])
-        except OSError:
-            versions.append(None)
-    return json.dumps([5, stat.st_mtime_ns, stat.st_size, settings, versions], sort_keys=True)
+def _background_cache_context(paths, img_path):
+    return json.dumps([6, store.source_signature(img_path)], sort_keys=True)
 
 
-def _save_background_sample_cache(
-    paths: dict[str, str],
-    img_path: str,
-    mask_hash: int,
-    sample: np.ndarray,
-) -> None:
-    cache_path = _background_sample_cache_path(paths, img_path)
-    os.makedirs(osp.dirname(cache_path), exist_ok=True)
-    fd, temporary = tempfile.mkstemp(dir=osp.dirname(cache_path), suffix='.npz')
-    try:
-        with os.fdopen(fd, 'wb') as handle:
-            np.savez_compressed(
-                handle,
-                mask_hash=np.array(mask_hash, dtype=np.uint32),
-                sample=np.where(sample > 0, 255, 0).astype(np.uint8),
-                context=np.array(_background_cache_context(paths, img_path)),
-            )
-        os.replace(temporary, cache_path)
-    finally:
-        if osp.exists(temporary):
-            os.unlink(temporary)
+def _save_background_sample_cache(paths, img_path, mask_hash, sample):
+    if not np.any(sample) and not store.cache_path(paths, img_path).exists():
+        return
+    store.update_cache_file(store.cache_path(paths, img_path),
+        mask_hash=np.array(mask_hash, dtype=np.uint32),
+        sample=np.where(sample > 0, 255, 0).astype(np.uint8),
+        context=np.array(_background_cache_context(paths, img_path)))
 
 
 def _clip_box(box: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:
@@ -870,19 +812,6 @@ def _manual_solid_overlay(
     return overlay, filled_regions, int(np.count_nonzero(overlay[:, :, 3] > 0))
 
 
-def _read_optional_mask(path: str, shape: tuple[int, int]) -> np.ndarray:
-    if not osp.isfile(path):
-        return np.zeros(shape, dtype=np.uint8)
-    mask = imread(path, cv2.IMREAD_UNCHANGED)
-    if mask is None or mask.shape[:2] != shape:
-        return np.zeros(shape, dtype=np.uint8)
-    if len(mask.shape) == 3 and mask.shape[2] >= 4:
-        mask = mask[:, :, 3]
-    elif len(mask.shape) == 3:
-        mask = cv2.cvtColor(mask[:, :, :3], cv2.COLOR_BGR2GRAY)
-    return np.where(mask > 0, 255, 0).astype(np.uint8)
-
-
 def _bgr_to_pil_rgb(img: np.ndarray) -> Image.Image:
     if len(img.shape) == 2:
         return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_GRAY2RGB))
@@ -939,9 +868,10 @@ def _preview_page(
     page_width: int = PREVIEW_PAGE_WIDTH,
 ) -> Image.Image | None:
     base_img = imread(img_path, cv2.IMREAD_UNCHANGED)
-    overlay = imread(_output_path(paths, img_path), cv2.IMREAD_UNCHANGED)
-    mask = imread(_mask_path(paths, img_path), cv2.IMREAD_GRAYSCALE)
-    other_mask = imread(_other_mask_path(paths, img_path), cv2.IMREAD_GRAYSCALE)
+    state = read_page_state(paths, img_path, base_img.shape[:2]) if base_img is not None else None
+    overlay = state['overlay'] if state is not None else None
+    mask = overlay[:, :, 3] if overlay is not None else None
+    other_mask = state['other'] if state is not None else None
     if base_img is None or overlay is None or mask is None or other_mask is None:
         return None
 
@@ -955,7 +885,7 @@ def _preview_page(
     title = (
         f'{osp.basename(img_path)}    '
         f'blocks={page_summary.get("blocks", 0)}    '
-        f'auto={page_summary.get("auto_blocks", 0)}    '
+        f'solid_pixels={page_summary.get("filled_pixels", 0)}    '
         f'other={page_summary.get("other_blocks", 0)}    '
         f'other_pixels={page_summary.get("other_pixels", 0)}'
     )
@@ -970,7 +900,7 @@ def _preview_page(
     panels = [
         ('original', _bgr_to_pil_rgb(base_img)),
         ('preview', _bgr_to_pil_rgb(preview)),
-        ('mask', _mask_to_pil_rgb(mask)),
+        ('solid', _mask_to_pil_rgb(mask)),
         ('other_mask', _mask_to_pil_rgb(other_mask)),
     ]
     top = PREVIEW_MARGIN + PREVIEW_HEADER_HEIGHT
@@ -1004,7 +934,7 @@ def _write_preview_pdf(
     if not pages:
         return None
 
-    pdf_path = osp.join(paths.get('raw', paths['output']), PREVIEW_PDF)
+    pdf_path = osp.join(paths['output'], PREVIEW_PDF)
     first, rest = pages[0], pages[1:]
     first.save(pdf_path, 'PDF', resolution=150.0, save_all=True, append_images=rest)
     return pdf_path
@@ -1075,168 +1005,169 @@ def process_image_with_detector(
     return regenerate_image_from_mask(img_path, paths, mask_refined)
 
 
-ADD_DETECTION_TARGET_MODES = ('mask', 'manual_solid', 'manual_other')
+ADD_DETECTION_TARGET_MODES = ('manual_solid', 'manual_other')
 
 
-def add_detection_to_mask(
-    img_path: str,
-    paths: dict[str, str],
-    detector,
-    target_mode: str = 'mask',
-) -> dict:
-    """Run detector and union the new text mask into the chosen layer, then regenerate.
+def _extend_saved_colors(overlay, added, retained):
+    """Use adjacent saved colours when extending a fill, without merging colours.
 
-    target_mode:
-        'mask'         -> merge into the auto text mask
-        'manual_solid' -> merge into the forced-solid layer
-        'manual_other' -> merge into the needs-editing (OTHER) layer
-
-    The chosen layer keeps its existing content (union, not replace); the other
-    layers are untouched. If no auto mask exists yet, an empty one is created so
-    the page can still be regenerated.
+    Multiple adjacent colours propagate from their closest contact pixels.
+    Independent additions still need background sampling or an explicit colour.
     """
+    remaining = added.copy()
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(added.astype(np.uint8), connectivity=8)
+    for idx in range(1, n):
+        x, y, w, h, _ = stats[idx]
+        x1, y1 = max(0, x-1), max(0, y-1)
+        x2, y2 = min(added.shape[1], x+w+1), min(added.shape[0], y+h+1)
+        active = labels[y1:y2, x1:x2] == idx
+        contacts = retained[y1:y2, x1:x2] & (cv2.dilate(active.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0)
+        if not np.any(contacts):
+            continue
+        _, nearest = cv2.distanceTransformWithLabels((~contacts).astype(np.uint8),
+            cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL)
+        view = overlay[y1:y2, x1:x2]
+        colors = np.zeros((int(nearest.max())+1, 3), np.uint8)
+        colors[nearest[contacts]] = view[contacts, :3]
+        view[active, :3] = colors[nearest[active]]
+        view[active, 3] = 255
+        remaining[y1:y2, x1:x2][active] = False
+    return remaining
+
+
+def save_page_edits(img_path, paths, solid, other, *, state=None, edited=None, fill_color=None):
+    image = imread(img_path, cv2.IMREAD_COLOR)
+    if image is None:
+        raise FileNotFoundError(f'無法讀取原圖：{img_path}')
+    old = read_page_state(paths, img_path, image.shape[:2]) if state is None else state
+    solid, other = np.asarray(solid) > 0, np.asarray(other) > 0
+    if solid.shape != image.shape[:2] or other.shape != solid.shape:
+        raise ValueError('選區尺寸與原圖不一致。')
+    if np.any(solid & other):
+        raise ValueError('兩類選區不能重疊。')
+    overlay = old['overlay'].copy()
+    was_solid = overlay[:, :, 3] > 0
+    added = solid & ~was_solid
+    if np.any(added):
+        if fill_color is not None:
+            overlay[added, :3] = np.asarray(fill_color, dtype=np.uint8)
+            overlay[added, 3] = 255
+        else:
+            remaining = _extend_saved_colors(overlay, added, was_solid & solid)
+            cached = store.read_cache_file(store.cache_path(paths, img_path))
+            text = cached.get('text_mask', np.zeros(solid.shape, np.uint8))
+            if text.shape != solid.shape:
+                text = np.zeros(solid.shape, np.uint8)
+            exclude = np.where((text > 0) | solid | other, 255, 0).astype(np.uint8)
+            new_overlay, _, _ = _manual_solid_overlay(image, remaining.astype(np.uint8)*255, exclude)
+            if not np.all(new_overlay[:, :, 3][remaining] > 0):
+                raise ValueError('新增純色選區沒有足夠背景可取色，請指定填色顏色。')
+            overlay[remaining] = new_overlay[remaining]
+    overlay[~solid] = 0
+    changed = (solid != was_solid) | (other != (old['other'] > 0))
+    locks = old['edited'].copy() if edited is None else edited.copy()
+    locks[changed] = 255
+    page = {'overlay': overlay, 'other': other.astype(np.uint8)*255, 'edited': locks}
+    summary = store.save_page(paths, img_path, page)
+    return page, summary
+
+
+def add_detection_to_mask(img_path, paths, detector, target_mode='manual_other'):
     if target_mode not in ADD_DETECTION_TARGET_MODES:
         raise ValueError(f'不支援的添加目標層：{target_mode}')
-    img = imread(img_path, cv2.IMREAD_UNCHANGED)
-    if img is None:
+    image = imread(img_path, cv2.IMREAD_COLOR)
+    if image is None:
         raise FileNotFoundError(f'無法讀取原圖：{img_path}')
-    detect_img = img[:, :, :3] if len(img.shape) == 3 else cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    height, width = detect_img.shape[:2]
-
-    _, mask_refined, _ = detector(
-        detect_img,
-        refine_mode=REFINEMASK_ANNOTATION,
-        keep_undetected_mask=True,
-    )
-    new_mask = np.where(mask_refined > 0, 255, 0).astype(np.uint8)
-
-    auto_mask_path = _mask_path(paths, img_path)
-    if not osp.isfile(auto_mask_path):
-        imwrite(auto_mask_path, np.zeros((height, width), dtype=np.uint8))
-
-    layer_path = {
-        'mask': auto_mask_path,
-        'manual_solid': _manual_solid_path(paths, img_path),
-        'manual_other': _manual_other_path(paths, img_path),
-    }[target_mode]
-    current = _read_optional_mask(layer_path, (height, width))
-    merged = np.logical_or(current > 0, new_mask > 0).astype(np.uint8) * 255
-    imwrite(layer_path, merged)
-    return regenerate_image_from_mask(img_path, paths)
+    _, detected, _ = detector(image, refine_mode=REFINEMASK_ANNOTATION, keep_undetected_mask=True)
+    state = read_page_state(paths, img_path, image.shape[:2])
+    solid, other = state['overlay'][:, :, 3].copy(), state['other'].copy()
+    target, opposite = (solid, other) if target_mode == 'manual_solid' else (other, solid)
+    target[detected > 0], opposite[detected > 0] = 255, 0
+    _, summary = save_page_edits(img_path, paths, solid, other, state=state)
+    return summary
 
 
-def regenerate_image_from_mask(
-    img_path: str,
-    paths: dict[str, str],
-    mask: np.ndarray | None = None,
-) -> dict:
-    img = imread(img_path, cv2.IMREAD_UNCHANGED)
-    if img is None:
+def regenerate_image_from_mask(img_path, paths, mask=None, *, reclassify=False):
+    image = imread(img_path, cv2.IMREAD_COLOR)
+    if image is None:
         raise FileNotFoundError(f'無法讀取原圖：{img_path}')
-    detect_img = img[:, :, :3] if len(img.shape) == 3 else cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-
-    if mask is None:
-        mask_path = _mask_path(paths, img_path)
-        if not osp.isfile(mask_path):
-            raise FileNotFoundError(f'找不到 mask：{mask_path}')
-        mask = imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    try:
+        old = read_page_state(paths, img_path, image.shape[:2])
+    except ValueError:
         if mask is None:
-            raise FileNotFoundError(f'無法讀取 mask：{mask_path}')
+            raise
+        # Explicit detection on a changed source starts a fresh page.
+        old = store.empty_page(image.shape[:2])
+    if mask is None and not reclassify:
+        if not store.has_page(paths, img_path):
+            return {'processed': False, 'skipped': True}
+        return store.save_page(paths, img_path, old)
+    cache_path = store.cache_path(paths, img_path)
+    cache = store.read_cache_file(cache_path)
+    if mask is None:
+        if str(cache.get('source_signature', '')) == store.source_signature(img_path):
+            mask = cache.get('text_mask')
+        if mask is None:
+            report = load_report(paths)
+            detector = create_detector(report.get('detector', DEFAULT_DETECTOR), report.get('detector_params'))
+            _, mask, _ = detector(image, refine_mode=REFINEMASK_ANNOTATION, keep_undetected_mask=True)
     mask = np.where(mask > 0, 255, 0).astype(np.uint8)
-
-    manual_solid = _read_optional_mask(_manual_solid_path(paths, img_path), mask.shape[:2])
-    manual_other = _read_optional_mask(_manual_other_path(paths, img_path), mask.shape[:2])
-    polygons, settings, bubble_status = bubble_context(detect_img, mask, paths, img_path)
-    overlay, other_mask, background_sample, page_summary = _solid_overlay_from_mask(
-        detect_img, mask, polygons, settings['shrink_percent'] / 100, manual_other,
-    )
-    page_summary['bubble_detection'] = bubble_status
-    page_summary['solid_fill_settings'] = settings
-    manual_solid_overlay, manual_solid_regions, manual_solid_pixels = _manual_solid_overlay(
-        detect_img,
-        manual_solid,
-        cv2.bitwise_or(mask, manual_solid),
-    )
-    manual_active = manual_solid_overlay[:, :, 3] > 0
-    overlay[manual_active] = manual_solid_overlay[manual_active]
-    other_mask = cv2.bitwise_or(other_mask, manual_other)
-    other_mask[manual_solid > 0] = 0
-
-    imwrite(_mask_path(paths, img_path), mask)
-    imwrite(_other_mask_path(paths, img_path), other_mask)
-    imwrite(_output_path(paths, img_path), overlay)
-    _save_background_sample_cache(paths, img_path, _mask_hash(mask), background_sample)
-    page_summary['filled_pixels'] = int(np.count_nonzero(overlay[:, :, 3]))
-    page_summary['manual_solid_requested_pixels'] = int(np.count_nonzero(manual_solid))
-    page_summary['manual_solid_pixels'] = manual_solid_pixels
-    page_summary['manual_solid_regions'] = manual_solid_regions
-    page_summary['manual_other_pixels'] = int(np.count_nonzero(manual_other))
-    page_summary['other_pixels'] = int(np.count_nonzero(other_mask))
-    return page_summary
+    if mask.shape != image.shape[:2]:
+        raise ValueError('偵測 Mask 尺寸與原圖不一致。')
+    polygons, settings, bubble_status = bubble_context(image, mask, paths, img_path)
+    overlay, other, sample, diagnostics = _solid_overlay_from_mask(
+        image, mask, polygons, settings['shrink_percent']/100)
+    locked = old['edited'] > 0
+    overlay[locked] = old['overlay'][locked]
+    other[locked] = old['other'][locked]
+    # A manual OTHER region protects its entire detected bubble from automatic
+    # expansion, while retaining previously accepted colours elsewhere.
+    if np.any(old['other'][locked]):
+        protected = np.where(locked & (old['other'] > 0), 255, 0).astype(np.uint8)
+        overlay, other, sample, diagnostics = _solid_overlay_from_mask(
+            image, mask, polygons, settings['shrink_percent']/100, protected)
+        overlay[locked] = old['overlay'][locked]
+        other[locked] = old['other'][locked]
+    page = {'overlay': overlay, 'other': other, 'edited': old['edited']}
+    diagnostics['bubble_detection'] = bubble_status
+    if np.any(mask) or cache_path.exists():
+        store.update_cache_file(cache_path, text_mask=mask,
+            source_signature=np.array(store.source_signature(img_path)),
+            diagnostics=np.array(json.dumps(diagnostics, ensure_ascii=False)))
+    _save_background_sample_cache(paths, img_path, _mask_hash(mask), sample)
+    return store.save_page(paths, img_path, page, diagnostics)
 
 
 def bubble_context(detect_img, mask, paths, img_path):
-    settings = load_settings(paths.get('raw', paths['output']))
+    settings = load_settings(paths['raw'])
     polygons = []
-    bubble_status = {'status': 'disabled' if not settings['enabled'] else 'no_text'}
+    status = {'status': 'disabled' if not settings['enabled'] else 'no_text'}
     if settings['enabled'] and np.any(mask):
         try:
-            cache = Path(paths.get('raw', paths['output'])) / 'bubble_cache' / (Path(img_path).name + '.json')
-            polygons, status = detect_bubbles(detect_img, cache)
-            bubble_status = {'status': status, 'instances': len(polygons)}
+            polygons, source = detect_bubbles(detect_img, store.cache_path(paths, img_path))
+            status = {'status': source, 'instances': len(polygons)}
         except Exception as exc:
-            # Existing text-only behaviour remains usable offline or if a model
-            # cannot load. Report the reason instead of pretending it ran.
-            bubble_status = {'status': 'unavailable', 'error': str(exc)}
-    return polygons, settings, bubble_status
+            status = {'status': 'unavailable', 'error': str(exc)}
+    return polygons, settings, status
 
 
-def regenerate_image_from_imported_mask(
-    img_path: str,
-    paths: dict[str, str],
-    imported_mask_dir: str,
-    mode: str,
-) -> dict:
+def regenerate_image_from_imported_mask(img_path, paths, imported_mask_dir, mode):
     imported_path = osp.join(imported_mask_dir, f'{Path(img_path).stem}.png')
     if not osp.isfile(imported_path):
         return regenerate_image_from_mask(img_path, paths)
-
-    imported_mask = imread(imported_path, cv2.IMREAD_GRAYSCALE)
-    if imported_mask is None:
-        raise FileNotFoundError(f'無法讀取傳入 Mask：{imported_path}')
-    imported_mask = np.where(imported_mask > 0, 255, 0).astype(np.uint8)
-
+    imported = imread(imported_path, cv2.IMREAD_GRAYSCALE)
+    image = imread(img_path, cv2.IMREAD_COLOR)
+    if imported is None or image is None or imported.shape != image.shape[:2]:
+        raise ValueError(f'傳入 Mask 尺寸不一致或無法讀取：{imported_path}')
     if mode == 'replace':
-        source_image = imread(img_path, cv2.IMREAD_COLOR)
-        if source_image is None:
-            raise FileNotFoundError(f'無法讀取圖片：{img_path}')
-        if imported_mask.shape[:2] != source_image.shape[:2]:
-            raise ValueError(
-                f'傳入 Mask 尺寸不一致：{imported_path} '
-                f'{imported_mask.shape[1]}x{imported_mask.shape[0]}，'
-                f'原圖 {source_image.shape[1]}x{source_image.shape[0]}'
-            )
-        return regenerate_image_from_mask(img_path, paths, imported_mask)
-
+        return regenerate_image_from_mask(img_path, paths, imported)
     if mode != 'intersect':
         raise ValueError(f'不支援的傳入 Mask 處理方式：{mode}')
-
-    mask_path = _mask_path(paths, img_path)
-    if not osp.isfile(mask_path):
-        raise FileNotFoundError(f'找不到目前 Mask：{mask_path}')
-    mask = imread(mask_path, cv2.IMREAD_GRAYSCALE)
-    if mask is None:
-        raise FileNotFoundError(f'無法讀取目前 Mask：{mask_path}')
-    if imported_mask.shape[:2] != mask.shape[:2]:
-        raise ValueError(
-            f'傳入 Mask 尺寸不一致：{imported_path} '
-            f'{imported_mask.shape[1]}x{imported_mask.shape[0]}，'
-            f'目前 Mask {mask.shape[1]}x{mask.shape[0]}'
-        )
-
-    mask_bin = np.where(mask > 0, 255, 0).astype(np.uint8)
-    merged_mask = cv2.bitwise_and(mask_bin, imported_mask)
-    return regenerate_image_from_mask(img_path, paths, merged_mask)
+    old = read_page_state(paths, img_path, imported.shape)
+    solid = np.where(imported > 0, old['overlay'][:, :, 3], 0)
+    other = np.where(imported > 0, old['other'], 0)
+    _, summary = save_page_edits(img_path, paths, solid, other, state=old)
+    return summary
 
 
 def build_report(
@@ -1273,19 +1204,13 @@ def build_report(
     }
 
 
-def write_report(paths: dict[str, str], report: dict) -> str:
-    report_path = osp.join(paths.get('raw', paths['output']), REPORT_JSON)
-    with open(report_path, 'w', encoding='utf8') as f:
-        json.dump(report, f, ensure_ascii=False, indent=2)
-    return report_path
+def write_report(paths, report):
+    store.merge_report(paths['raw'], report)
+    return str(store.project_path(paths['raw']))
 
 
-def load_report(paths: dict[str, str]) -> dict:
-    report_path = osp.join(paths.get('raw', paths['output']), REPORT_JSON)
-    if not osp.isfile(report_path):
-        return {}
-    with open(report_path, 'r', encoding='utf8') as f:
-        return json.load(f)
+def load_report(paths):
+    return store.load_project(paths['raw'])
 
 
 def run(img_dir: str, detector_name: str = DEFAULT_DETECTOR) -> int:
@@ -1322,15 +1247,10 @@ def run(img_dir: str, detector_name: str = DEFAULT_DETECTOR) -> int:
 
     report = build_report(img_dir, paths, imglist, pages, detector_name, device=device)
     report_path = write_report(paths, report)
-    preview_pdf_path = _write_preview_pdf(imglist, paths, report)
-
-    print('完成。輸出：')
-    print(f'  - {paths["mask"]}/<檔名>.png')
-    print(f'  - {paths["other_mask"]}/<檔名>.png')
-    print(f'  - {paths["inpainted"]}/<檔名>.png')
+    print('完成。正式資料與快取：')
     print(f'  - {report_path}')
-    if preview_pdf_path is not None:
-        print(f'  - {preview_pdf_path}')
+    print(f'  - {paths["raw"]}/pages/<原圖檔名>.npz')
+    print(f'  - {paths["raw"]}/cache/<原圖檔名>.npz')
     print(f'含 other_mask 頁數：{report["summary"]["with_other_mask"]}')
     if report['summary']['failed']:
         print(f'失敗頁數：{report["summary"]["failed"]}')
@@ -1339,7 +1259,7 @@ def run(img_dir: str, detector_name: str = DEFAULT_DETECTOR) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description='偵測文字 mask，生成純色背景 inpainted overlay 和 other_mask。',
+        description='偵測文字並分類為純色填充與圖像修補，保存新版專案。',
     )
     parser.add_argument('img_dir', help='輸入圖片資料夾路徑')
     parser.add_argument(

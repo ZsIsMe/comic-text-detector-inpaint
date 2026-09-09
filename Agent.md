@@ -106,29 +106,17 @@ https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.2.1/c
 <image_folder>/ctd_inpainted/
 ```
 
-主要輸出：
+主要資料（v2，不讀取舊格式）：
 
 ```text
-mask/<name>.png
-  文字偵測 mask。
-
-inpainted/<name>.png
-  與原圖同尺寸的透明 BGRA overlay。這不是完整修好的成品圖。
-
-other_mask/<name>.png
-  不適合自動純色塗白的區域。
-
-solid_inpaint_report.json
-  每頁統計與 debug 資訊。
-
-preview_report.pdf
-  檢查用 PDF。
-
-export_pair/<name>.png
-export_pair/other_mask/<name>.png
-export_pair/colored/<name>.png
-  「導出待精修」產生的固定位置配對圖片，它是 `raw/` 的同級目錄，不壓縮。
+ctd_inpainted/raw/project.json
+ctd_inpainted/raw/pages/<原圖檔名>.npz
+ctd_inpainted/raw/cache/<原圖檔名>.npz
 ```
+
+`project_store.py` 管理唯一正式頁面資料（填色 overlay、OTHER、人工修改保護範圍）與原子保存。編輯只有純色填充和圖像修補兩類；偵測 Mask 是內部快取，普通編輯不重新分類。重新偵測保留人工修改與擦除。
+
+`export_pair`、`psd_assets`、`preview_report.pdf` 按需生成在 `raw` 外。格式和行為見 `docs/two_class_project.md`。
 
 ## 核心處理邏輯
 
@@ -179,11 +167,11 @@ other_mask 顯示
 獨立工作流比較視窗：最左側當頁成品、同步比較、Mask 內矩形／筆刷選擇、result 輸出
 ```
 
-手動修改 mask 後，會基於新 mask 重新生成當前頁的 overlay 和 other_mask。
+手動編輯只更新正式的兩類選區、顏色與修改記錄，預覽不重新分類。
 
-若要用另一個文件夾的 mask 取代目前 mask，可在 GUI 的「使用傳入 Mask 運行」中選「取代目前 Mask」，再選擇傳入 Mask 文件夾。同名 PNG 會覆蓋目前 mask，並重新運行；缺少同名 PNG 的頁面會保留原 mask。
+若要用另一個文件夾的 mask 取代目前 mask，可在 GUI 的「使用傳入 Mask 運行」中選「取代目前 Mask」，再選擇傳入 Mask 文件夾。同名 PNG 用於重新分類，保留人工修改與擦除；缺少同名 PNG 的頁面保持原狀。
 
-若需要用另一組 mask 收窄目前 mask，可在「使用傳入 Mask 運行」中選「取兩者交集」，再選擇傳入 Mask 文件夾。它會將同名 PNG 與目前 mask 取交集後覆蓋目前 mask，缺少同名 PNG 時保留原 mask，然後重新生成後續輸出。
+若需要用另一組 mask 收窄目前 mask，可在「使用傳入 Mask 運行」中選「取兩者交集」，再選擇傳入 Mask 文件夾。它會將同名 PNG 與兩類選區取交集，保存原色及擦除記錄；缺少同名 PNG 的頁面保持原狀。
 
 ## 開發原則
 
@@ -220,11 +208,11 @@ other_mask 顯示
 檢查：
 
 ```text
-raw/mask/
-raw/inpainted/
-raw/other_mask/
-raw/solid_inpaint_report.json
-raw/preview_report.pdf
+raw/project.json
+raw/pages/
+raw/cache/
+export_pair/
+preview_report.pdf（按需生成）
 ```
 
 ## 不應提交

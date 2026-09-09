@@ -10,9 +10,10 @@ import cv2
 import numpy as np
 
 import bubble_solid as bubble
+import project_store as store
 from detect_solid_inpaint_folder import (
     _solid_overlay_from_mask, _quality_from_sample, _ensure_dirs,
-    regenerate_image_from_mask, _output_path, _manual_other_path,
+    regenerate_image_from_mask, read_page_state, save_page_edits,
 )
 
 
@@ -345,7 +346,7 @@ class BubbleIntegrationTests(unittest.TestCase):
             self.assertEqual(bubble.load_settings(directory), {'enabled': True, 'shrink_percent': 2.0})
             bubble.save_settings(directory, False, 3.5)
             self.assertEqual(bubble.load_settings(directory), {'enabled': False, 'shrink_percent': 3.5})
-            (Path(directory)/bubble.SETTINGS_FILE).write_text('{"enabled":"false","shrink_percent":"NaN"}')
+            store.update_project(directory, settings={'solid_fill': {'enabled':'false', 'shrink_percent':'NaN'}})
             self.assertEqual(bubble.load_settings(directory), {'enabled': True, 'shrink_percent': 2.0})
 
     def test_regeneration_keeps_text_mask_and_protects_manual_other(self):
@@ -358,13 +359,16 @@ class BubbleIntegrationTests(unittest.TestCase):
             with patch('detect_solid_inpaint_folder.detect_bubbles', return_value=(polys, 'detected')):
                 report = regenerate_image_from_mask(path, paths, mask)
                 self.assertEqual(report['solid_bubbles'], 1)
-                np.testing.assert_array_equal(cv2.imread(str(Path(paths['mask'])/'page.png'), 0), mask)
+                np.testing.assert_array_equal(store.read_cache_file(store.cache_path(paths, path))['text_mask'], mask)
                 protected = np.zeros_like(mask)
                 protected[80:84, 111:115] = 255
-                cv2.imwrite(_manual_other_path(paths, path), protected)
+                state = read_page_state(paths, path)
+                solid = state['overlay'][:, :, 3].copy()
+                solid[protected > 0] = 0
+                save_page_edits(path, paths, solid, protected)
                 report = regenerate_image_from_mask(path, paths, mask)
                 self.assertEqual(report['solid_bubbles'], 0)
-                result = cv2.imread(_output_path(paths, path), -1)
+                result = read_page_state(paths, path)['overlay']
                 self.assertFalse(np.any(result[80:84, 111:115, 3]))
 
     def test_disabled_or_missing_model_falls_back_and_reports_reason(self):
@@ -385,7 +389,7 @@ class BubbleIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = Path(directory)/'model.pt'
             checkpoint.write_bytes(b'model')
-            cache = Path(directory)/'cache.json'
+            cache = Path(directory)/'cache.npz'
             image = np.full((64, 64, 3), 255, np.uint8)
             polygon = np.array([[5, 5], [50, 5], [50, 50], [5, 50]], np.float32)
             import torch

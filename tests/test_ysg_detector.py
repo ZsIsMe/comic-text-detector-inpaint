@@ -16,7 +16,7 @@ from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 
 from detect_solid_inpaint_folder import (
-    _ensure_dirs, _mask_path, add_detection_to_mask, create_detector, DETECTOR_YSGYOLO,
+    _ensure_dirs, save_page_edits, read_page_state, add_detection_to_mask, create_detector, DETECTOR_YSGYOLO,
 )
 from solid_inpaint_ui import AddDetectionDialog, DetectorSelectionDialog, DetectorSelectorWidget
 from ysg_detector import YSGYoloDetector, YSG_DEFAULT_LABELS, YSG_LABEL_DESCRIPTIONS, round_mask_components
@@ -174,12 +174,12 @@ class YSGDetectorTests(unittest.TestCase):
         current = np.zeros((100, 200), np.uint8)
         current[10, 10] = 255  # This corner would be trimmed if the old mask were rounded.
         current[80:85, 150:155] = 255
-        cv2.imwrite(_mask_path(paths, page), current)
+        save_page_edits(page, paths, np.zeros_like(current), current)
         self.detector.mask_corner_radius = 12
         result = result_with_boxes([[10, 10, 60, 50]], [0])
         rounded, _, _ = self.infer(result)
         add_detection_to_mask(page, paths, self.detector)
-        merged = cv2.imread(_mask_path(paths, page), cv2.IMREAD_GRAYSCALE)
+        merged = read_page_state(paths, page)['other']
         np.testing.assert_array_equal(merged, cv2.bitwise_or(current, rounded))
         self.assertEqual(merged[10, 10], 255)
 

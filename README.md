@@ -1,6 +1,6 @@
 # Solid Inpaint
 
-日文漫畫批量去字 PSD 生成工具。
+漫畫文字偵測、純色填充與精修輔助工具。
 
 網站：[https://zsisme.github.io/comic-text-detector-inpaint/](https://zsisme.github.io/comic-text-detector-inpaint/)
 
@@ -18,7 +18,7 @@ Solid Inpaint 會先偵測漫畫圖片中的文字，對純色背景文字生成
 3. 生成可疊加的透明去字 overlay
 4. 標記非純色背景文字為 other_mask
 5. 用項目內 Photoshop JSX 生成 PSD
-6. 在 PSD 中保存 TEXT_CHANNEL 和 OTHER_CHANNEL
+6. 在 PSD 中保存 OTHER_CHANNEL
 7. 可綁定 Photoshop 動作，對 OTHER_CHANNEL 批量執行生成式移去
 ```
 
@@ -55,7 +55,7 @@ Windows：
 ```text
 1. 建立 .venv
 2. 安裝 requirements.txt
-3. 下載 CTBD、CTD 與 YSGYOLO 2.0 模型
+3. 下載 CTBD、CTD、YSGYOLO 2.0 與 MangaLens 模型
 4. 啟動圖形界面
 ```
 
@@ -126,13 +126,13 @@ Inpainted 合成預覽
 工作流比較與 Mask 分區合成
 ```
 
-紅色的「偵測並生成」會重新跑 detector，並覆蓋已有的 `mask`、`other_mask` 和 `inpainted` 輸出。如果輸出資料夾內已有 mask，UI 會要求確認。
+介面只保留 **F1 純色填充**、**F2 圖像修補**。首次偵測自動分配兩類；人工編輯後直接保存顏色與範圍，不會反覆重新分類。加入一類會移除另一類，擦除後保留原圖。重新偵測與重新分類會保留人工修改，包括擦除。
 
-「使用傳入 Mask 運行」提供兩種方式。「取代目前 Mask」會讓你選擇傳入 Mask 文件夾；若裡面存在同名 PNG，會覆蓋 `ctd_inpainted/raw/mask/<name>.png`，再重新運行。缺少同名 PNG 的頁面會保留原 mask。
+「使用傳入 Mask 運行」的取代模式以傳入 Mask 重新分類並保留人工決定；交集模式同時收窄兩類並保留填色顏色。沒有同名 PNG 的頁面保持原狀。
 
-「取兩者交集」會讓你選擇傳入 Mask 文件夾。若裡面存在同名 PNG，會用 `目前 mask ∩ 傳入 mask` 覆蓋目前 mask，然後重新生成 `other_mask`、`inpainted` 和 `solid_inpaint_report.json`；缺少同名 PNG 的頁面會保留原 mask。
+「導出待精修」按需生成 `ctd_inpainted/export_pair/` 的合成 PNG、`other_mask/` 與 `colored/`。「導出右圖」共用其中的 `colored/`。
 
-「導出待精修」會將全部頁面直接輸出到 `ctd_inpainted/export_pair/`，不生成壓縮包。該目錄根層是原圖與 `inpainted` 的去字合成 PNG，`other_mask/` 放同名 mask，`colored/` 放與「導出右圖」一致的標記預覽。
+完整操作和儲存格式見 [兩類專案說明](docs/two_class_project.md)。
 
 「工作流比較」會開啟獨立視窗。選擇一個 `export_pair` 文件夾後，工具會讀取根目錄底圖，並自動識別 `inpaint_workflows/` 內任意數量的工作流子文件夾；它會逐組比較工作流圖片與底圖來生成各自的差異 Mask，不再依賴 `other_mask/`。頂部可調整「差異閾值」、「最小區域」及「Mask 擴大」（預設 `5 px`），差異 Mask 會緩存在 `.workflow_compare/diff_masks/`，也可按「重算 Mask」刷新當頁。比較區最左側固定顯示當頁實際合成效果，右側可同步比較最多三組結果；所有圖片同步縮放和移動，每張工作流圖片頂部的原圖比較滑桿也會同步移動，初始值為 `0`，即完整顯示工作流結果。每個工作流名稱旁的色塊代表該工作流的 Mask 顏色；在對應面板中，已採用區域使用較高不透明度，未採用區域以相同顏色淡化顯示。首次載入的頁面預設採用第一組工作流；在工作流圖片上左鍵拖矩形或使用筆刷，可重新指定該工作流差異 Mask 內的局部來源，右鍵拖矩形則直接指定該範圍保留原圖，中鍵拖動用於平移。圖片下方按鈕可將該工作流的整個差異 Mask 指定給該組。`M` 顯示或隱藏選區，`[`、`]` 調整筆刷大小。選擇狀態保存在 `.workflow_compare/`，最終圖片和來源摘要 `selection.json` 輸出到 `result/`。
 
@@ -179,45 +179,22 @@ Windows：
 /path/to/image_folder/ctd_inpainted
 ```
 
-主要輸出：
+正式資料與可重建快取：
 
 ```text
-ctd_inpainted/raw/mask/<name>.png
-ctd_inpainted/raw/other_mask/<name>.png
-ctd_inpainted/raw/inpainted/<name>.png
-ctd_inpainted/raw/solid_inpaint_report.json
-ctd_inpainted/raw/preview_report.pdf
-ctd_inpainted/export_pair/<name>.png
-ctd_inpainted/export_pair/other_mask/<name>.png
-ctd_inpainted/export_pair/colored/<name>.png
-ctd_inpainted/export_pair/inpaint_workflows/<workflow>/<name>.png
-ctd_inpainted/export_pair/result/<name>.png
+ctd_inpainted/raw/project.json
+ctd_inpainted/raw/pages/<原圖檔名>.npz
+ctd_inpainted/raw/cache/<原圖檔名>.npz
 ```
 
-說明：
+每頁正式檔保存兩類選區、純色顏色和人工修改記錄；快取合併偵測結果、氣泡輪廓、背景取樣與診斷。空白頁不產生空白 NPZ。
+PDF、PNG 和 PSD 素材按需導出到 `raw` 之外，日常保存不產生多組重複 PNG。
 
-```text
-mask
-  偵測後的文字 mask。
-
-inpainted
-  與原圖同尺寸的透明 BGRA overlay。
-  只包含自動判斷為可純色覆蓋的區域。
-
-other_mask
-  非純色背景、框外字、取樣不足或不適合自動覆蓋的區域。
-  這些區域可在 Photoshop 中進一步生成式消除。
-
-solid_inpaint_report.json
-  每頁統計和 debug 資訊。
-
-preview_report.pdf
-  檢查用 PDF。每頁包含 original / preview / mask / other_mask。
-```
+新版不相容舊格式。請將舊 `ctd_inpainted` 改名保留，再重新偵測建立新版專案；程式不會自動刪除旧成果。
 
 ## Photoshop PSD 配套
 
-Python 輸出完成後，可在 Photoshop 中執行：
+先在程式按「導出 PSD 素材」，再在 Photoshop 中執行：
 
 ```text
 create_psds_from_outputs.jsx
@@ -232,15 +209,14 @@ File > Scripts > Browse...
 腳本會讀取：
 
 ```text
-<image folder>/ctd_inpainted/raw/mask/<name>.png
-<image folder>/ctd_inpainted/raw/other_mask/<name>.png
-<image folder>/ctd_inpainted/raw/inpainted/<name>.png
+<image folder>/ctd_inpainted/psd_assets/other_mask/<name>.png
+<image folder>/ctd_inpainted/psd_assets/solid/<name>.png
 ```
 
 並生成：
 
 ```text
-<image folder>/ctd_inpainted/raw/psd/<name>.psd
+<image folder>/ctd_inpainted/psd/<name>.psd
 ```
 
 每個 PSD 包含：
@@ -251,11 +227,10 @@ bg
 overlay-manual
 
 通道：
-TEXT_CHANNEL
 OTHER_CHANNEL
 ```
 
-`overlay-manual` 是已自動去字的透明覆蓋圖層。
+`overlay-manual` 是純色填充類保存的透明填色圖層。
 
 `OTHER_CHANNEL` 保存識別到的非純色背景文字，可用 Photoshop 動作轉成選區並批量執行「生成式移去」。
 

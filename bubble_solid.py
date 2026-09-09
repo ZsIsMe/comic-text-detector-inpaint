@@ -9,18 +9,16 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import tempfile
 import threading
 from pathlib import Path
 
 import cv2
 import numpy as np
+import project_store as store
 
 MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'mangalens.pt'
 MODEL_URL = 'https://www.modelscope.cn/models/hgmzhn/manga-translator-ui/resolve/master/mangalens.pt'
 MODEL_SHA256 = '4028152940f7c910f40192f46ede3b3f6c7129e5c76849c324d3564f8ac50198'
-SETTINGS_FILE = 'solid_fill_settings.json'
 CACHE_VERSION = 1
 _model = None
 _model_signature = None
@@ -30,7 +28,7 @@ _model_lock = threading.Lock()
 def load_settings(raw_dir: str | Path) -> dict:
     defaults = {'enabled': True, 'shrink_percent': 2.0}
     try:
-        data = json.loads((Path(raw_dir) / SETTINGS_FILE).read_text(encoding='utf-8'))
+        data = store.load_project(raw_dir).get('settings', {}).get('solid_fill', {})
         enabled = data.get('enabled', True)
         defaults['enabled'] = enabled if isinstance(enabled, bool) else True
         percent = float(data.get('shrink_percent', 2.0))
@@ -41,23 +39,12 @@ def load_settings(raw_dir: str | Path) -> dict:
     return defaults
 
 
-def _atomic_json(path: Path, value) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(dir=path.parent, suffix='.tmp')
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
-            json.dump(value, handle, ensure_ascii=False)
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-
-
 def save_settings(raw_dir: str | Path, enabled: bool, shrink_percent: float) -> None:
     if not np.isfinite(shrink_percent) or not 0 <= shrink_percent <= 10:
         raise ValueError('氣泡內縮比例必須介於 0–10%。')
-    _atomic_json(Path(raw_dir) / SETTINGS_FILE,
-                 {'enabled': bool(enabled), 'shrink_percent': float(shrink_percent)})
+    settings = store.load_project(raw_dir).get('settings', {})
+    settings['solid_fill'] = {'enabled': bool(enabled), 'shrink_percent': float(shrink_percent)}
+    store.update_project(raw_dir, settings=settings)
 
 
 def _tiles(shape):
@@ -89,7 +76,7 @@ def detect_bubbles(image: np.ndarray, cache_path: Path) -> tuple[list[np.ndarray
     digest = hashlib.sha256(np.ascontiguousarray(image).tobytes()).hexdigest()
     key = [CACHE_VERSION, list(image.shape), digest, list(signature)]
     try:
-        cached = json.loads(cache_path.read_text(encoding='utf-8'))
+        cached = json.loads(str(store.read_cache_file(cache_path)['bubble_json']))
         if cached['key'] == key:
             polygons = [np.asarray(p, dtype=np.float32) for p in cached['polygons']]
             if all(p.ndim == 2 and p.shape[1] == 2 and len(p) >= 3
@@ -124,7 +111,8 @@ def detect_bubbles(image: np.ndarray, cache_path: Path) -> tuple[list[np.ndarray
                     continue
                 polygons.append(pts + np.array([x1, y1], dtype=np.float32))
     polygons = _deduplicate(polygons, image.shape[:2])
-    _atomic_json(cache_path, {'key': key, 'polygons': [p.tolist() for p in polygons]})
+    store.update_cache_file(cache_path, bubble_json=np.array(json.dumps(
+        {'key': key, 'polygons': [p.tolist() for p in polygons]})))
     return polygons, 'detected'
 
 

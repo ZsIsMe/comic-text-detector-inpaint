@@ -5,11 +5,11 @@ Run in Photoshop:
 File > Scripts > Browse... > create_psds_from_outputs.jsx
 
 Expected input layout:
-<image folder>/ctd_inpainted/raw/other_mask/<name>.png
-<image folder>/ctd_inpainted/raw/inpainted/<name>.png
+<image folder>/ctd_inpainted/psd_assets/other_mask/<name>.png
+<image folder>/ctd_inpainted/psd_assets/solid/<name>.png
 
 Output:
-<image folder>/ctd_inpainted/raw/psd/<name>.psd
+<image folder>/ctd_inpainted/psd/<name>.psd
 
 Each PSD contains:
 - bg
@@ -32,8 +32,8 @@ Each PSD contains:
         var imageFolder = new Folder(settings.imageFolder);
         var outputRoot = new Folder(settings.outputRoot);
         var otherMaskFolder = new Folder(outputRoot.fsName + "/other_mask");
-        var overlayFolder = new Folder(outputRoot.fsName + "/inpainted");
-        var psdFolder = new Folder(outputRoot.fsName + "/psd");
+        var overlayFolder = new Folder(outputRoot.fsName + "/solid");
+        var psdFolder = new Folder(outputRoot.parent.fsName + "/psd");
 
         if (!imageFolder.exists) {
             alert("原图文件夹不存在：\n" + imageFolder.fsName);
@@ -44,7 +44,7 @@ Each PSD contains:
             return;
         }
         if (!overlayFolder.exists) {
-            alert("inpainted 文件夹不存在：\n" + overlayFolder.fsName);
+            alert("solid 文件夹不存在：\n" + overlayFolder.fsName);
             return;
         }
         if (!psdFolder.exists) {
@@ -82,7 +82,7 @@ Each PSD contains:
                 continue;
             }
             if (!overlayFile) {
-                skipped.push(imageFile.name + "：缺少 inpainted overlay");
+                skipped.push(imageFile.name + "：缺少 solid overlay");
                 continue;
             }
 
@@ -187,7 +187,7 @@ Each PSD contains:
         var outputGroup = dialog.add("group");
         outputGroup.orientation = "row";
         outputGroup.alignChildren = ["fill", "center"];
-        outputGroup.add("statictext", undefined, "ctd_inpainted/raw：");
+        outputGroup.add("statictext", undefined, "ctd_inpainted/psd_assets：");
         var outputPathInput = outputGroup.add("edittext", undefined, "");
         outputPathInput.characters = 52;
         var outputBrowseButton = outputGroup.add("button", undefined, "选择");
@@ -304,12 +304,12 @@ Each PSD contains:
             var selected = Folder.selectDialog("选择原图文件夹");
             if (selected) {
                 imagePathInput.text = selected.fsName;
-                outputPathInput.text = selected.fsName + "/ctd_inpainted/raw";
+                outputPathInput.text = selected.fsName + "/ctd_inpainted/psd_assets";
             }
         };
 
         outputBrowseButton.onClick = function () {
-            var selected = Folder.selectDialog("选择 ctd_inpainted/raw 文件夹");
+            var selected = Folder.selectDialog("选择 ctd_inpainted/psd_assets 文件夹");
             if (selected) {
                 outputPathInput.text = selected.fsName;
             }
@@ -329,7 +329,7 @@ Each PSD contains:
                 return;
             }
             if (!trimString(outputPathInput.text)) {
-                alert("请选择 ctd_inpainted/raw 文件夹。");
+                alert("请选择 ctd_inpainted/psd_assets 文件夹。");
                 return;
             }
             if (actionCheckbox.value && (!setDropdown.selection || !actionDropdown.selection)) {
@@ -644,7 +644,7 @@ Each PSD contains:
         reportFile.writeln("Create solid_inpaint PSD report");
         reportFile.writeln("Generated at: " + formatDate(new Date()));
         reportFile.writeln("Image folder: " + imageFolder.fsName);
-        reportFile.writeln("ctd_inpainted/raw folder: " + outputRoot.fsName);
+        reportFile.writeln("ctd_inpainted/psd_assets folder: " + outputRoot.fsName);
         reportFile.writeln("Total image files: " + total);
         reportFile.writeln("Saved PSD files: " + made);
         reportFile.writeln("Restart: " + (settings.restart ? "yes" : "no"));
