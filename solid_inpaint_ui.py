@@ -82,6 +82,7 @@ from detect_solid_inpaint_folder import (
     load_report,
     process_image_with_detector,
     REFINEMASK_ANNOTATION,
+    REPAIR_EXPAND_PX,
     regenerate_image_from_mask,
     regenerate_image_from_imported_mask,
     write_report,
@@ -92,7 +93,7 @@ from detect_solid_inpaint_folder import (
 from utils.io_utils import imread, imwrite
 from ysg_detector import YSG_DEFAULT_LABELS, YSG_LABEL_DESCRIPTIONS, YSG_UNSUPPORTED_LABELS
 import project_store as store
-from bubble_solid import fill_bubbles, load_settings as load_solid_settings, save_settings as save_solid_settings
+from bubble_solid import load_settings as load_solid_settings, save_settings as save_solid_settings
 
 
 STATUS_OK = ''
@@ -207,11 +208,28 @@ def _read_edit_masks_for_image(paths, img_path):
                    'manual_other': state['other'].copy()}
 
 
+def _solid_repair_transfer(solid, selection, text, edited=None):
+    """Remove selected solid coverage, but transfer only text/manual repair pixels."""
+    removed = (solid > 0) & (selection > 0)
+    if text is None or text.shape != solid.shape or not np.any(text):
+        return removed, removed.copy()
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * REPAIR_EXPAND_PX + 1,) * 2)
+    repair = cv2.dilate((text > 0).astype(np.uint8), kernel) > 0
+    if edited is not None:
+        repair |= edited > 0
+    return removed, removed & repair
+
+
 def _convert_image_edit_masks(paths, img_path, target_mode):
     if target_mode not in EDIT_MODE_LABELS:
         raise ValueError('請選擇純色填充或圖像修補。')
     shape, masks = _read_edit_masks_for_image(paths, img_path)
     combined = masks['manual_solid'] | masks['manual_other']
+    if target_mode == 'manual_other':
+        state = read_page_state(paths, img_path, shape)
+        _, transfer = _solid_repair_transfer(masks['manual_solid'],
+            np.ones(shape, np.uint8), masks['mask'], state['edited'])
+        combined = masks['manual_other'] | (transfer.astype(np.uint8) * 255)
     empty = np.zeros(shape, np.uint8)
     save_page_edits(img_path, paths,
         combined if target_mode == 'manual_solid' else empty,
@@ -2798,10 +2816,11 @@ class SolidFillSettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle('純色填充設定')
         layout = QVBoxLayout(self)
-        self.enabled = QCheckBox('使用 MangaLens，填滿可靠純色氣泡內部')
+        self.enabled = QCheckBox('使用 MangaLens 區分氣泡內外，擴展純色氣泡填充')
         self.enabled.setChecked(values['enabled'])
         layout.addWidget(self.enabled)
-        hint = QLabel('清除氣泡內漏檢的小筆畫；漸層、圖案或背景不足時保留待修改。\n'
+        hint = QLabel('氣泡內可局部取樣，氣泡外須四周通過；停用時全用四周判斷。\n'
+                      '氣泡擴展失敗時保留原有局部填充。\n'
                       '「圖像修補」標記會阻止所在氣泡整區填色。')
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -2851,21 +2870,16 @@ class BackgroundSampleWorker(QObject):
     def run(self) -> None:
         try:
             sample = np.zeros(self.mask.shape, dtype=np.uint8)
-            for block_sample in iter_background_samples_from_mask(self.image, self.mask):
+            polygons = []
+            if self.paths and not self.cancelled:
+                polygons, _, _ = bubble_context(self.image, self.mask, self.paths, self.img_path)
+            for block_sample in iter_background_samples_from_mask(self.image, self.mask, polygons):
                 if self.cancelled:
                     break
                 sample = cv2.bitwise_or(sample, block_sample)
                 self.partial.emit(self.request_id, self.img_path, self.mask_hash, sample.copy())
                 if self.cancelled:
                     break
-            if self.paths and not self.cancelled:
-                polygons, settings, _ = bubble_context(self.image, self.mask, self.paths, self.img_path)
-                if polygons:
-                    _, veto, bubble_sample, _ = fill_bubbles(
-                        self.image, self.mask, polygons, settings['shrink_percent'] / 100,
-                        self.protected,
-                    )
-                    sample[veto > 0] = bubble_sample[veto > 0]
             self.finished.emit(self.request_id, self.img_path, self.mask_hash, sample)
         except Exception as exc:
             self.failed.emit(self.request_id, self.img_path, self.mask_hash, str(exc))
@@ -3455,7 +3469,7 @@ class MainWindow(QMainWindow):
         self.selection_add_inner_btn.setToolTip('魔法棒專用：同時添加選區與內部孔洞')
         self.selection_transfer_btn = QPushButton('F12 從其他轉入')
         self.selection_transfer_btn.setCheckable(True)
-        self.selection_transfer_btn.setToolTip('把本次選區內其他 mask 的重疊部分移到目前 mask，並從原 mask 移除')
+        self.selection_transfer_btn.setToolTip('把選區內另一類轉入；轉成圖像修補時只保留文字範圍，移除氣泡擴展填色')
         self.selection_ctd_btn = QPushButton('添加CTD檢測選區')
         self.selection_ctd_btn.setCheckable(True)
         self.selection_ctd_btn.setToolTip('只對本次矩形選區跑 CTD，並把檢測結果添加到目前 mask')
@@ -5299,6 +5313,13 @@ class MainWindow(QMainWindow):
             transfer |= (other > 0) & selection
         if not np.any(transfer):
             return False
+        removed = transfer.copy()
+        if self.edit_mode == 'manual_other':
+            edited = None
+            if self.paths and self.current_img_path:
+                edited = read_page_state(self.paths, self.current_img_path, current.shape)['edited']
+            removed, transfer = _solid_repair_transfer(
+                self.current_manual_solid, selection, self.detected_text_mask, edited)
         self.push_undo_snapshot()
         current[transfer] = 255
         for mode in EDIT_MODE_LABELS:
@@ -5306,7 +5327,7 @@ class MainWindow(QMainWindow):
                 continue
             other = self.mask_for_mode(mode)
             if other is not None:
-                other[transfer] = 0
+                other[removed] = 0
         return True
 
     def undo_mask(self) -> None:

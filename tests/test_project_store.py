@@ -227,6 +227,38 @@ class EditorTests(unittest.TestCase):
         self.sample_patch.stop();self.settings_patch.stop()
         ProjectTests.tearDown(self)
 
+    def test_solid_bubble_transfer_only_moves_text_and_undo_restores_fill(self):
+        w = self.window
+        state = read_page_state(self.paths, self.path)
+        state['overlay'][25:150, 30:180] = [240,240,240,255]
+        store.save_page(self.paths, self.path, state)
+        w.current_manual_solid = state['overlay'][:,:,3].copy()
+        w.set_edit_mode('manual_other')
+        before = w.current_manual_solid.copy()
+        self.assertTrue(w.transfer_selection_from_other_masks(np.ones(self.mask.shape, bool)))
+        self.assertFalse(np.any(w.current_manual_solid))
+        self.assertTrue(np.all(w.current_manual_other[self.mask > 0] == 255))
+        self.assertEqual(w.current_manual_other[30, 35], 0)
+        self.assertTrue(w.save_all_edit_masks())
+        w.undo_mask()
+        np.testing.assert_array_equal(w.current_manual_solid, before)
+        self.assertFalse(np.any(w.current_manual_other))
+
+    def test_batch_other_conversion_preserves_manual_areas_without_bubble_background(self):
+        from solid_inpaint_ui import _convert_image_edit_masks
+        state = read_page_state(self.paths, self.path)
+        state['overlay'][25:150,30:180] = [240,240,240,255]
+        state['edited'][30:35,35:40] = 255
+        state['other'][155:160,35:40] = 255
+        store.save_page(self.paths, self.path, state)
+        _convert_image_edit_masks(self.paths, self.path, 'manual_other')
+        result = read_page_state(self.paths, self.path)
+        self.assertFalse(np.any(result['overlay']))
+        self.assertTrue(np.all(result['other'][self.mask > 0] == 255))
+        self.assertEqual(result['other'][40,50], 0)
+        self.assertTrue(np.all(result['other'][30:35,35:40] == 255))
+        self.assertTrue(np.all(result['other'][155:160,35:40] == 255))
+
     def test_two_classes_mutually_exclusive_and_undo_restores_original_color(self):
         from solid_inpaint_ui import EDIT_MODE_LABELS, ConvertMasksDialog, AddDetectionDialog
         self.assertEqual(set(EDIT_MODE_LABELS), {'manual_solid', 'manual_other'})
