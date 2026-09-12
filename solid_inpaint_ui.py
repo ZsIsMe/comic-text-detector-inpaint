@@ -3415,7 +3415,7 @@ class MainWindow(QMainWindow):
         self.convert_masks_btn.clicked.connect(self.show_convert_masks_dialog)
         self.selection_local_edit_btn = QPushButton('局部視窗')
         self.selection_local_edit_btn.setCheckable(True)
-        self.selection_local_edit_btn.setToolTip('用矩形框選一部分，在獨立放大視窗中編輯副本')
+        self.selection_local_edit_btn.setToolTip('點擊後框選區域，在獨立放大視窗中編輯副本；無需先切換工具')
         mode_toolbar.addWidget(self.edit_manual_solid_btn)
         mode_toolbar.addWidget(self.edit_manual_other_btn)
         mode_toolbar.addWidget(self.convert_masks_btn)
@@ -4846,6 +4846,8 @@ class MainWindow(QMainWindow):
     def set_selection_combine_mode(self, mode: str) -> None:
         if mode not in SELECTION_COMBINE_LABELS:
             return
+        if mode == 'local_edit_selection' and self.mask_view.tool != 'rect':
+            self.set_edit_tool('rect')
         if not self.selection_mode_allowed_for_tool(mode, self.mask_view.tool):
             return
         self.selection_combine_mode = mode
@@ -4887,7 +4889,7 @@ class MainWindow(QMainWindow):
         self.selection_add_inner_btn.setVisible(tool == 'magic')
         self.selection_transfer_btn.setVisible(selection_tool)
         self.selection_ctd_btn.setVisible(selection_tool)
-        self.selection_local_edit_btn.setVisible(tool == 'rect')
+        self.selection_local_edit_btn.setVisible(True)
 
     def update_local_intersect_controls_visibility(self) -> None:
         if getattr(self, 'local_intersect_controls', None) is None:
