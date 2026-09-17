@@ -1712,7 +1712,10 @@ class LocalEditDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle('局部編輯')
         self.resize(1000, 760)
-        self.page_bgr = source_bgr[:, :, :3].copy()
+        if len(source_bgr.shape) == 2:
+            self.page_bgr = cv2.cvtColor(source_bgr, cv2.COLOR_GRAY2BGR)
+        else:
+            self.page_bgr = source_bgr[:, :, :3].copy()
         self.current_mask = np.where(mask > 0, 255, 0).astype(np.uint8)
         self.roi_box = self._clamp_roi_box(roi_box)
         self.source_bgr = self.page_bgr

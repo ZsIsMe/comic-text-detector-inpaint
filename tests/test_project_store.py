@@ -402,3 +402,14 @@ class EditorTests(unittest.TestCase):
         np.testing.assert_array_equal(dialog.render_live_patch(0, 0, 100, 100)[:, :, :3], expected[:100, :100])
         dialog.close()
         np.testing.assert_array_equal(w.detected_text_mask, original_text)
+
+    def test_local_edit_dialog_accepts_grayscale_source(self):
+        from solid_inpaint_ui import LocalEditDialog
+        grayscale = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
+        dialog = LocalEditDialog(
+            grayscale, self.mask, (0, 0, 100, 100), (255, 255, 255), 0,
+        )
+        self.assertEqual(dialog.page_bgr.shape, (*grayscale.shape, 3))
+        np.testing.assert_array_equal(dialog.page_bgr[:, :, 0], grayscale)
+        np.testing.assert_array_equal(dialog.render_preview(self.mask)[:, :, 0], grayscale)
+        dialog.close()
