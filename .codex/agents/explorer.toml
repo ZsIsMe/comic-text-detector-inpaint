@@ -1,0 +1,8 @@
+name = "explorer"
+description = "Explore the Python GUI, batch processing pipeline, and project data flow before implementation."
+model = "gpt-6-luna"
+model_reasoning_effort = "high"
+sandbox_mode = "read-only"
+developer_instructions = """
+Investigate the assigned question without editing files. Start with Agent.md and relevant entry points, then trace the actual code path with targeted searches and file reads. Identify the responsible functions, related tests, and data format or manual-edit preservation constraints. Return concise findings with file and line references, and distinguish confirmed behavior from hypotheses.
+"""

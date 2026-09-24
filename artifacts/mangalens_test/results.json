@@ -1,0 +1,102 @@
+{
+  "12-19.jpg": {
+    "count": 5,
+    "instances": [
+      {
+        "id": 1,
+        "confidence": 0.976,
+        "box": [
+          64,
+          1212,
+          259,
+          1485
+        ],
+        "polygon_points": 266
+      },
+      {
+        "id": 2,
+        "confidence": 0.9743,
+        "box": [
+          394,
+          210,
+          653,
+          536
+        ],
+        "polygon_points": 380
+      },
+      {
+        "id": 3,
+        "confidence": 0.9714,
+        "box": [
+          277,
+          514,
+          459,
+          765
+        ],
+        "polygon_points": 268
+      },
+      {
+        "id": 4,
+        "confidence": 0.9687,
+        "box": [
+          253,
+          807,
+          570,
+          1128
+        ],
+        "polygon_points": 366
+      },
+      {
+        "id": 5,
+        "confidence": 0.9684,
+        "box": [
+          732,
+          1172,
+          955,
+          1456
+        ],
+        "polygon_points": 272
+      }
+    ],
+    "output": "/Users/zhongsheng/Documents/comic-text-detector-inpaint/artifacts/mangalens_test/12-19_mangalens_instances.jpg"
+  },
+  "12-20.jpg": {
+    "count": 3,
+    "instances": [
+      {
+        "id": 1,
+        "confidence": 0.9746,
+        "box": [
+          273,
+          99,
+          506,
+          395
+        ],
+        "polygon_points": 326
+      },
+      {
+        "id": 2,
+        "confidence": 0.962,
+        "box": [
+          815,
+          786,
+          1016,
+          1135
+        ],
+        "polygon_points": 318
+      },
+      {
+        "id": 3,
+        "confidence": 0.8887,
+        "box": [
+          592,
+          60,
+          1006,
+          409
+        ],
+        "polygon_points": 564
+      }
+    ],
+    "output": "/Users/zhongsheng/Documents/comic-text-detector-inpaint/artifacts/mangalens_test/12-20_mangalens_instances.jpg"
+  }
+}

@@ -1,0 +1,1144 @@
+{
+  "experimental": true,
+  "pages": {
+    "12-19.jpg": [
+      {
+        "items": [
+          1,
+          2
+        ],
+        "cuts": [
+          {
+            "a": [
+              518,
+              244
+            ],
+            "b": [
+              584,
+              453
+            ],
+            "length": 219.17344729688404,
+            "score": 134.40539080802938,
+            "owners": [
+              1,
+              2
+            ]
+          }
+        ],
+        "centers": [
+          {
+            "index": 1,
+            "straight_fraction": 0.18484848484848485,
+            "shape": "ellipse",
+            "ellipse": [
+              [
+                564.8054809570312,
+                342.7504577636719
+              ],
+              [
+                172.65188598632812,
+                266.8831481933594
+              ],
+              9.833853721618652
+            ],
+            "fit_error": 0.0045422125475558794,
+            "added_fraction": 0.7277241906217171,
+            "status": "excessive_completion",
+            "before": {
+              "center": [
+                587.5,
+                330.0
+              ],
+              "center_normalized": [
+                0.544,
+                0.2148
+              ],
+              "candidate_xyxy_pixel": [
+                538,
+                232,
+                637,
+                428
+              ],
+              "outer_rect": {
+                "left": 522,
+                "top": 211,
+                "width": 131,
+                "height": 239,
+                "area": 31309
+              },
+              "inner_rect": {
+                "left": 571,
+                "top": 251,
+                "width": 67,
+                "height": 153,
+                "area": 10251
+              },
+              "center_mode": "outer",
+              "method": "outer_center",
+              "split_mask_area": 20911
+            },
+            "after": {
+              "center": [
+                587.5,
+                330.0
+              ],
+              "center_normalized": [
+                0.544,
+                0.2148
+              ],
+              "candidate_xyxy_pixel": [
+                538,
+                232,
+                637,
+                428
+              ],
+              "outer_rect": {
+                "left": 522,
+                "top": 211,
+                "width": 131,
+                "height": 239,
+                "area": 31309
+              },
+              "inner_rect": {
+                "left": 571,
+                "top": 251,
+                "width": 67,
+                "height": 153,
+                "area": 10251
+              },
+              "center_mode": "outer",
+              "method": "outer_center",
+              "split_mask_area": 20911
+            },
+            "displacement": [
+              0.0,
+              0.0
+            ],
+            "inside_layout_region": true,
+            "completion_accepted": false
+          },
+          {
+            "index": 2,
+            "straight_fraction": 0.18125,
+            "shape": "ellipse",
+            "ellipse": [
+              [
+                492.6820373535156,
+                389.5138244628906
+              ],
+              [
+                196.09027099609375,
+                292.1885070800781
+              ],
+              176.8599090576172
+            ],
+            "fit_error": 0.004931524596821835,
+            "added_fraction": 0.1391010391886816,
+            "status": "completed",
+            "before": {
+              "center": [
+                489.0,
+                390.0
+              ],
+              "center_normalized": [
+                0.4528,
+                0.2539
+              ],
+              "candidate_xyxy_pixel": [
+                416,
+                265,
+                562,
+                515
+              ],
+              "outer_rect": {
+                "left": 395,
+                "top": 244,
+                "width": 187,
+                "height": 292,
+                "area": 54604
+              },
+              "inner_rect": {
+                "left": 423,
+                "top": 282,
+                "width": 105,
+                "height": 209,
+                "area": 21945
+              },
+              "center_mode": "outer",
+              "method": "outer_center",
+              "split_mask_area": 39904
+            },
+            "after": {
+              "center": [
+                493.5,
+                390.0
+              ],
+              "center_normalized": [
+                0.4569,
+                0.2539
+              ],
+              "candidate_xyxy_pixel": [
+                409,
+                268,
+                578,
+                512
+              ],
+              "outer_rect": {
+                "left": 395,
+                "top": 244,
+                "width": 197,
+                "height": 292,
+                "area": 57524
+              },
+              "inner_rect": {
+                "left": 420,
+                "top": 289,
+                "width": 142,
+                "height": 198,
+                "area": 28116
+              },
+              "center_mode": "outer",
+              "method": "outer_center",
+              "split_mask_area": 45462
+            },
+            "displacement": [
+              4.5,
+              0.0
+            ],
+            "inside_layout_region": true,
+            "completion_accepted": true
+          }
+        ]
+      },
+      {
+        "items": [
+          4,
+          5
+        ],
+        "cuts": [
+          {
+            "a": [
+              410,
+              1081
+            ],
+            "b": [
+              369,
+              890
+            ],
+            "length": 195.35096621209735,
+            "score": 100.72251711331003,
+            "owners": [
+              1,
+              2
+            ]
+          }
+        ],
+        "centers": [
+          {
+            "index": 4,
+            "straight_fraction": 0.29744525547445255,
+            "shape": "ellipse",
+            "ellipse": [
+              [
+                464.7398681640625,
+                945.4722290039062
+              ],
+              [
+                212.0877227783203,
+                306.4099426269531
+              ],
+              0.5066676735877991
+            ],
+            "fit_error": 0.01637068206485115,
+            "added_fraction": 0.08996919895750317,
+            "status": "completed",
+            "before": {
+              "center": [
+                470.0,
+                953.0
+              ],
+              "center_normalized": [
+                0.4352,
+                0.6204
+              ],
+              "candidate_xyxy_pixel": [
+                388,
+                823,
+                552,
+                1083
+              ],
+              "outer_rect": {
+                "left": 371,
+                "top": 808,
+                "width": 198,
+                "height": 290,
+                "area": 57420
+              },
+              "inner_rect": {
+                "left": 408,
+                "top": 832,
+                "width": 132,
+                "height": 229,
+                "area": 30228
+              },
+              "center_mode": "outer",
+              "method": "outer_center",
+              "split_mask_area": 46401
+            },
+            "after": {
+              "center": [
+                464.0,
+                953.0
+              ],
+              "center_normalized": [
+                0.4296,
+                0.6204
+              ],
+              "candidate_xyxy_pixel": [
+                371,
+                828,
+                557,
+                1078
+              ],
+              "outer_rect": {
+                "left": 359,
+                "top": 808,
+                "width": 210,
+                "height": 290,
+                "area": 60900
+              },
+              "inner_rect": {
+                "left": 386,
+                "top": 841,
+                "width": 161,
+                "height": 210,
+                "area": 33810
+              },
+              "center_mode": "outer",
+              "method": "outer_center",
+              "split_mask_area": 50575
+            },
+            "displacement": [
+              -6.0,
+              0.0
+            ],
+            "inside_layout_region": true,
+            "completion_accepted": true
+          },
+          {
+            "index": 5,
+            "straight_fraction": 0.31630170316301703,
+            "shape": "ellipse",
+            "ellipse": [
+              [
+                336.4435119628906,
+                1010.648681640625
+              ],
+              [
+                169.28736877441406,
+                253.8948516845703
+              ],
+              178.68264770507812
+            ],
+            "fit_error": 0.019424858689983004,
+            "added_fraction": 0.14844818156959255,
+            "status": "completed",
+            "before": {
+              "center": [
+                331.0,
+                1006.0
+              ],
+              "center_normalized": [
+                0.3065,
+                0.6549
+              ],
+              "candidate_xyxy_pixel": [
+                269,
+                897,
+                393,
+                1115
+              ],
+              "outer_rect": {
+                "left": 254,
+                "top": 886,
+                "width": 154,
+                "height": 240,
+                "area": 36960
+              },
+              "inner_rect": {
+                "left": 279,
+                "top": 911,
+                "width": 93,
+                "height": 196,
+                "area": 18228
+              },
+              "center_mode": "outer",
+              "method": "outer_center",
+              "split_mask_area": 29228
+            },
+            "after": {
+              "center": [
+                338.0,
+                1006.0
+              ],
+              "center_normalized": [
+                0.313,
+                0.6549
+              ],
+              "candidate_xyxy_pixel": [
+                266,
+                901,
+                410,
+                1111
+              ],
+              "outer_rect": {
+                "left": 254,
+                "top": 886,
+                "width": 168,
+                "height": 240,
+                "area": 40320
+              },
+              "inner_rect": {
+                "left": 274,
+                "top": 920,
+                "width": 122,
+                "height": 181,
+                "area": 22082
+              },
+              "center_mode": "outer",
+              "method": "outer_center",
+              "split_mask_area": 33577
+            },
+            "displacement": [
+              7.0,
+              0.0
+            ],
+            "inside_layout_region": true,
+            "completion_accepted": true
+          }
+        ]
+      }
+    ],
+    "12-20.jpg": [
+      {
+        "items": [
+          1,
+          2,
+          3
+        ],
+        "cuts": [
+          {
+            "a": [
+              768,
+              290
+            ],
+            "b": [
+              760,
+              197
+            ],
+            "length": 93.34345183246653,
+            "score": 42.29422554151858,
+            "owners": [
+              1,
+              1,
+              2
+            ]
+          },
+          {
+            "a": [
+              928,
+              75
+            ],
+            "b": [
+              973,
+              231
+            ],
+            "length": 162.3607095328177,
+            "score": 94.99729860284255,
+            "owners": [
+              1,
+              2,
+              2
+            ]
+          }
+        ],
+        "centers": [
+          {
+            "index": 1,
+            "straight_fraction": 0.24413145539906103,
+            "shape": "ellipse",
+            "ellipse": [
+              [
+                951.9981689453125,
+                153.94476318359375
+              ],
+              [
+                107.70447540283203,
+                199.8322296142578
+              ],
+              7.669540882110596
+            ],
+            "fit_error": 0.0047430728025164015,
+            "added_fraction": 1.060881142580489,
+            "status": "excessive_completion",
+            "before": {
+              "center": [
+                972.5,
+                138.0
+              ],
+              "center_normalized": [
+                0.9005,
+                0.0898
+              ],
+              "candidate_xyxy_pixel": [
+                946,
+                72,
+                999,
+                204
+              ],
+              "outer_rect": {
+                "left": 938,
+                "top": 56,
+                "width": 69,
+                "height": 164,
+                "area": 11316
+              },
+              "inner_rect": {
+                "left": 964,
+                "top": 90,
+                "width": 37,
+                "height": 100,
+                "area": 3700
+              },
+              "center_mode": "outer",
+              "method": "outer_center",
+              "split_mask_area": 8224
+            },
+            "after": {
+              "center": [
+                972.5,
+                138.0
+              ],
+              "center_normalized": [
+                0.9005,
+                0.0898
+              ],
+              "candidate_xyxy_pixel": [
+                946,
+                72,
+                999,
+                204
+              ],
+              "outer_rect": {
+                "left": 938,
+                "top": 56,
+                "width": 69,
+                "height": 164,
+                "area": 11316
+              },
+              "inner_rect": {
+                "left": 964,
+                "top": 90,
+                "width": 37,
+                "height": 100,
+                "area": 3700
+              },
+              "center_mode": "outer",
+              "method": "outer_center",
+              "split_mask_area": 8224
+            },
+            "displacement": [
+              0.0,
+              0.0
+            ],
+            "inside_layout_region": true,
+            "completion_accepted": false
+          },
+          {
+            "index": 2,
+            "straight_fraction": 0.27479338842975204,
+            "shape": "ellipse",
+            "ellipse": [
+              [
+                865.5484619140625,
+                202.70870971679688
+              ],
+              [
+                239.4462890625,
+                282.91412353515625
+              ],
+              178.7310333251953
+            ],
+            "fit_error": 0.022627242786885993,
+            "added_fraction": 0.09914124716694737,
+            "status": "completed",
+            "before": {
+              "center": [
+                867.0,
+                201.5
+              ],
+              "center_normalized": [
+                0.8028,
+                0.1312
+              ],
+              "candidate_xyxy_pixel": [
+                778,
+                77,
+                956,
+                326
+              ],
+              "outer_rect": {
+                "left": 762,
+                "top": 63,
+                "width": 210,
+                "height": 277,
+                "area": 58170
+              },
+              "inner_rect": {
+                "left": 785,
+                "top": 92,
+                "width": 146,
+                "height": 220,
+                "area": 32120
+              },
+              "center_mode": "outer",
+              "method": "outer_center",
+              "split_mask_area": 48055
+            },
+            "after": {
+              "center": [
+                866.0,
+                202.0
+              ],
+              "center_normalized": [
+                0.8019,
+                0.1315
+              ],
+              "candidate_xyxy_pixel": [
+                763,
+                82,
+                969,
+                322
+              ],
+              "outer_rect": {
+                "left": 746,
+                "top": 63,
+                "width": 240,
+                "height": 277,
+                "area": 66480
+              },
+              "inner_rect": {
+                "left": 781,
+                "top": 105,
+                "width": 172,
+                "height": 203,
+                "area": 34916
+              },
+              "center_mode": "outer",
+              "method": "outer_center",
+              "split_mask_area": 52795
+            },
+            "displacement": [
+              -1.0,
+              0.5
+            ],
+            "inside_layout_region": true,
+            "completion_accepted": true
+          },
+          {
+            "index": 3,
+            "straight_fraction": 0.21291448516579406,
+            "shape": "ellipse",
+            "ellipse": [
+              [
+                682.939697265625,
+                274.61187744140625
+              ],
+              [
+                184.23411560058594,
+                277.2959899902344
+              ],
+              179.97801208496094
+            ],
+            "fit_error": 0.014429927486588334,
+            "added_fraction": 0.02364744729489459,
+            "status": "completed",
+            "before": {
+              "center": [
+                680.0,
+                275.0
+              ],
+              "center_normalized": [
+                0.6296,
+                0.179
+              ],
+              "candidate_xyxy_pixel": [
+                603,
+                156,
+                757,
+                394
+              ],
+              "outer_rect": {
+                "left": 593,
+                "top": 138,
+                "width": 174,
+                "height": 273,
+                "area": 47502
+              },
+              "inner_rect": {
+                "left": 616,
+                "top": 174,
+                "width": 133,
+                "height": 203,
+                "area": 26999
+              },
+              "center_mode": "outer",
+              "method": "outer_center",
+              "split_mask_area": 39332
+            },
+            "after": {
+              "center": [
+                685.0,
+                275.0
+              ],
+              "center_normalized": [
+                0.6343,
+                0.179
+              ],
+              "candidate_xyxy_pixel": [
+                606,
+                156,
+                764,
+                394
+              ],
+              "outer_rect": {
+                "left": 593,
+                "top": 138,
+                "width": 183,
+                "height": 273,
+                "area": 49959
+              },
+              "inner_rect": {
+                "left": 616,
+                "top": 174,
+                "width": 133,
+                "height": 203,
+                "area": 26999
+              },
+              "center_mode": "outer",
+              "method": "outer_center",
+              "split_mask_area": 40245
+            },
+            "displacement": [
+              5.0,
+              0.0
+            ],
+            "inside_layout_region": true,
+            "completion_accepted": true
+          }
+        ]
+      },
+      {
+        "items": [
+          4,
+          5
+        ],
+        "cuts": [
+          {
+            "a": [
+              394,
+              184
+            ],
+            "b": [
+              425,
+              282
+            ],
+            "length": 102.7861858422619,
+            "score": 53.70635615504118,
+            "owners": [
+              1,
+              2
+            ]
+          }
+        ],
+        "centers": [
+          {
+            "index": 4,
+            "straight_fraction": 0.25663716814159293,
+            "shape": "ellipse",
+            "ellipse": [
+              [
+                449.1810302734375,
+                193.2438201904297
+              ],
+              [
+                114.31727600097656,
+                191.67965698242188
+              ],
+              178.37747192382812
+            ],
+            "fit_error": 0.01698058031273031,
+            "added_fraction": 0.0650500855118495,
+            "status": "completed",
+            "before": {
+              "center": [
+                451.0,
+                194.5
+              ],
+              "center_normalized": [
+                0.4176,
+                0.1266
+              ],
+              "candidate_xyxy_pixel": [
+                405,
+                114,
+                497,
+                275
+              ],
+              "outer_rect": {
+                "left": 396,
+                "top": 100,
+                "width": 110,
+                "height": 189,
+                "area": 20790
+              },
+              "inner_rect": {
+                "left": 421,
+                "top": 127,
+                "width": 73,
+                "height": 134,
+                "area": 9782
+              },
+              "center_mode": "outer",
+              "method": "outer_center",
+              "split_mask_area": 16342
+            },
+            "after": {
+              "center": [
+                449.0,
+                194.5
+              ],
+              "center_normalized": [
+                0.4157,
+                0.1266
+              ],
+              "candidate_xyxy_pixel": [
+                399,
+                115,
+                499,
+                274
+              ],
+              "outer_rect": {
+                "left": 392,
+                "top": 100,
+                "width": 114,
+                "height": 189,
+                "area": 21546
+              },
+              "inner_rect": {
+                "left": 407,
+                "top": 127,
+                "width": 87,
+                "height": 130,
+                "area": 11310
+              },
+              "center_mode": "outer",
+              "method": "outer_center",
+              "split_mask_area": 17405
+            },
+            "displacement": [
+              -2.0,
+              0.0
+            ],
+            "inside_layout_region": true,
+            "completion_accepted": true
+          },
+          {
+            "index": 5,
+            "straight_fraction": 0.20620842572062084,
+            "shape": "ellipse",
+            "ellipse": [
+              [
+                348.03460693359375,
+                282.6050109863281
+              ],
+              [
+                151.52487182617188,
+                227.721923828125
+              ],
+              177.5508270263672
+            ],
+            "fit_error": 0.018093381438138656,
+            "added_fraction": 0.021263984589167964,
+            "status": "completed",
+            "before": {
+              "center": [
+                349.0,
+                282.5
+              ],
+              "center_normalized": [
+                0.3231,
+                0.1839
+              ],
+              "candidate_xyxy_pixel": [
+                287,
+                183,
+                411,
+                382
+              ],
+              "outer_rect": {
+                "left": 274,
+                "top": 171,
+                "width": 150,
+                "height": 223,
+                "area": 33450
+              },
+              "inner_rect": {
+                "left": 296,
+                "top": 194,
+                "width": 99,
+                "height": 176,
+                "area": 17424
+              },
+              "center_mode": "outer",
+              "method": "outer_center",
+              "split_mask_area": 26971
+            },
+            "after": {
+              "center": [
+                349.5,
+                282.5
+              ],
+              "center_normalized": [
+                0.3236,
+                0.1839
+              ],
+              "candidate_xyxy_pixel": [
+                284,
+                187,
+                415,
+                378
+              ],
+              "outer_rect": {
+                "left": 274,
+                "top": 171,
+                "width": 151,
+                "height": 223,
+                "area": 33673
+              },
+              "inner_rect": {
+                "left": 290,
+                "top": 203,
+                "width": 112,
+                "height": 159,
+                "area": 17808
+              },
+              "center_mode": "outer",
+              "method": "outer_center",
+              "split_mask_area": 27545
+            },
+            "displacement": [
+              0.5,
+              0.0
+            ],
+            "inside_layout_region": true,
+            "completion_accepted": true
+          }
+        ]
+      }
+    ]
+  },
+  "rectangle_crop": {
+    "seed_source": "explicit diagnostic sample points",
+    "cuts": [
+      {
+        "a": [
+          303,
+          362
+        ],
+        "b": [
+          227,
+          133
+        ],
+        "length": 241.2819926973416,
+        "score": 120.12124676945604,
+        "owners": [
+          1,
+          2
+        ]
+      }
+    ],
+    "centers": [
+      {
+        "index": 1,
+        "straight_fraction": 0.9332460732984293,
+        "shape": "rounded_rectangle",
+        "bounds": [
+          229,
+          50,
+          237,
+          311
+        ],
+        "added_fraction": 0.1366497963214418,
+        "status": "completed",
+        "before": {
+          "center": [
+            366.5,
+            205.5
+          ],
+          "center_normalized": [
+            0.6475,
+            0.3764
+          ],
+          "candidate_xyxy_pixel": [
+            267,
+            52,
+            466,
+            359
+          ],
+          "outer_rect": {
+            "left": 229,
+            "top": 50,
+            "width": 237,
+            "height": 311,
+            "area": 73707
+          },
+          "inner_rect": {
+            "left": 305,
+            "top": 54,
+            "width": 160,
+            "height": 303,
+            "area": 48480
+          },
+          "center_mode": "average",
+          "method": "average_outer_inner",
+          "split_mask_area": 64773
+        },
+        "after": {
+          "center": [
+            347.0,
+            205.5
+          ],
+          "center_normalized": [
+            0.6131,
+            0.3764
+          ],
+          "candidate_xyxy_pixel": [
+            230,
+            51,
+            464,
+            360
+          ],
+          "outer_rect": {
+            "left": 229,
+            "top": 50,
+            "width": 237,
+            "height": 311,
+            "area": 73707
+          },
+          "inner_rect": {
+            "left": 232,
+            "top": 52,
+            "width": 231,
+            "height": 307,
+            "area": 70917
+          },
+          "center_mode": "average",
+          "method": "average_outer_inner",
+          "split_mask_area": 73630
+        },
+        "displacement": [
+          -19.5,
+          0.0
+        ],
+        "inside_layout_region": true,
+        "completion_accepted": true
+      },
+      {
+        "index": 2,
+        "straight_fraction": 0.9322033898305084,
+        "shape": "rounded_rectangle",
+        "bounds": [
+          72,
+          135,
+          231,
+          320
+        ],
+        "added_fraction": 0.1402176429729104,
+        "status": "completed",
+        "before": {
+          "center": [
+            168.5,
+            295.0
+          ],
+          "center_normalized": [
+            0.2977,
+            0.5403
+          ],
+          "candidate_xyxy_pixel": [
+            72,
+            138,
+            265,
+            452
+          ],
+          "outer_rect": {
+            "left": 72,
+            "top": 135,
+            "width": 231,
+            "height": 320,
+            "area": 73920
+          },
+          "inner_rect": {
+            "left": 73,
+            "top": 140,
+            "width": 154,
+            "height": 310,
+            "area": 47740
+          },
+          "center_mode": "average",
+          "method": "average_outer_inner",
+          "split_mask_area": 64749
+        },
+        "after": {
+          "center": [
+            187.5,
+            295.0
+          ],
+          "center_normalized": [
+            0.3313,
+            0.5403
+          ],
+          "candidate_xyxy_pixel": [
+            73,
+            136,
+            302,
+            454
+          ],
+          "outer_rect": {
+            "left": 72,
+            "top": 135,
+            "width": 231,
+            "height": 320,
+            "area": 73920
+          },
+          "inner_rect": {
+            "left": 74,
+            "top": 138,
+            "width": 227,
+            "height": 314,
+            "area": 71278
+          },
+          "center_mode": "average",
+          "method": "average_outer_inner",
+          "split_mask_area": 73835
+        },
+        "displacement": [
+          19.0,
+          0.0
+        ],
+        "inside_layout_region": true,
+        "completion_accepted": true
+      }
+    ]
+  }
+}

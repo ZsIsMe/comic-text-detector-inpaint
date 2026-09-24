@@ -1,0 +1,226 @@
+{
+  "page": "13-19",
+  "items": [
+    1,
+    2
+  ],
+  "severity": "輕微",
+  "review_reason": "1 號下端有輕微凹口",
+  "source_group": {
+    "items": [
+      1,
+      2
+    ],
+    "cuts": [
+      {
+        "a": [
+          759,
+          157
+        ],
+        "b": [
+          794,
+          305
+        ],
+        "length": 152.08221460775746,
+        "score": 80.69113744781646,
+        "owners": [
+          1,
+          2
+        ]
+      }
+    ],
+    "centers": [
+      {
+        "index": 1,
+        "straight_fraction": 0.20819112627986347,
+        "shape": "mirrored_outline",
+        "axis": {
+          "point": [
+            807.5,
+            207.0
+          ],
+          "direction": [
+            0.0,
+            1.0
+          ]
+        },
+        "axis_samples": 40,
+        "axis_support_span": 0.19402985074626866,
+        "axis_support": "one_end_constant",
+        "axis_residual": 0.0,
+        "added_fraction": 0.16017103602972102,
+        "symmetry_error_before": 0.2789238750150802,
+        "symmetry_error_after": 0.003257328990228013,
+        "status": "completed",
+        "before": {
+          "center": [
+            810.0,
+            207.5
+          ],
+          "center_normalized": [
+            0.75,
+            0.1351
+          ],
+          "candidate_xyxy_pixel": [
+            772,
+            121,
+            848,
+            294
+          ],
+          "outer_rect": {
+            "left": 762,
+            "top": 107,
+            "width": 97,
+            "height": 201,
+            "area": 19497
+          },
+          "inner_rect": {
+            "left": 790,
+            "top": 132,
+            "width": 55,
+            "height": 146,
+            "area": 8030
+          },
+          "center_mode": "outer",
+          "method": "outer_center",
+          "split_mask_area": 14232
+        },
+        "after": {
+          "center": [
+            808.0,
+            207.5
+          ],
+          "center_normalized": [
+            0.7481,
+            0.1351
+          ],
+          "candidate_xyxy_pixel": [
+            764,
+            121,
+            852,
+            294
+          ],
+          "outer_rect": {
+            "left": 757,
+            "top": 107,
+            "width": 102,
+            "height": 201,
+            "area": 20502
+          },
+          "inner_rect": {
+            "left": 771,
+            "top": 132,
+            "width": 74,
+            "height": 146,
+            "area": 10804
+          },
+          "center_mode": "outer",
+          "method": "outer_center",
+          "split_mask_area": 16519
+        },
+        "displacement": [
+          -2.0,
+          0.0
+        ],
+        "inside_layout_region": true,
+        "completion_accepted": true
+      },
+      {
+        "index": 2,
+        "straight_fraction": 0.21869488536155202,
+        "shape": "mirrored_outline",
+        "axis": {
+          "point": [
+            703.241827885105,
+            286.0
+          ],
+          "direction": [
+            0.007111358242191726,
+            1.0
+          ]
+        },
+        "axis_samples": 134,
+        "axis_support_span": 0.9832775919732442,
+        "axis_support": "both_ends",
+        "axis_residual": 0.7349648214139961,
+        "added_fraction": 0.03720876585928489,
+        "symmetry_error_before": 0.08391531117397454,
+        "symmetry_error_after": 0.012619342291371995,
+        "status": "completed",
+        "before": {
+          "center": [
+            703.0,
+            286.0
+          ],
+          "center_normalized": [
+            0.6509,
+            0.1862
+          ],
+          "candidate_xyxy_pixel": [
+            628,
+            152,
+            778,
+            420
+          ],
+          "outer_rect": {
+            "left": 612,
+            "top": 137,
+            "width": 181,
+            "height": 299,
+            "area": 54119
+          },
+          "inner_rect": {
+            "left": 641,
+            "top": 169,
+            "width": 119,
+            "height": 237,
+            "area": 28203
+          },
+          "center_mode": "outer",
+          "method": "outer_center",
+          "split_mask_area": 43320
+        },
+        "after": {
+          "center": [
+            704.0,
+            286.5
+          ],
+          "center_normalized": [
+            0.6519,
+            0.1865
+          ],
+          "candidate_xyxy_pixel": [
+            624,
+            157,
+            784,
+            416
+          ],
+          "outer_rect": {
+            "left": 612,
+            "top": 137,
+            "width": 184,
+            "height": 299,
+            "area": 55016
+          },
+          "inner_rect": {
+            "left": 635,
+            "top": 179,
+            "width": 137,
+            "height": 219,
+            "area": 30003
+          },
+          "center_mode": "outer",
+          "method": "outer_center",
+          "split_mask_area": 44930
+        },
+        "displacement": [
+          1.0,
+          0.5
+        ],
+        "inside_layout_region": true,
+        "completion_accepted": true
+      }
+    ]
+  },
+  "folder": "/Users/zhongsheng/Documents/comic-text-detector-inpaint/artifacts/completion_symmetry_review/01_visual_notches/13-19_items_1_2"
+}

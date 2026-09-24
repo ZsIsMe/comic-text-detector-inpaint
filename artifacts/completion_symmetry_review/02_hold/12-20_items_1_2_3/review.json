@@ -1,0 +1,339 @@
+{
+  "page": "12-20",
+  "items": [
+    1,
+    2,
+    3
+  ],
+  "severity": "程式已保留",
+  "review_reason": "1 號：excessive_completion",
+  "source_group": {
+    "items": [
+      1,
+      2,
+      3
+    ],
+    "cuts": [
+      {
+        "a": [
+          768,
+          290
+        ],
+        "b": [
+          760,
+          197
+        ],
+        "length": 93.34345183246653,
+        "score": 42.29422554151858,
+        "owners": [
+          1,
+          1,
+          2
+        ]
+      },
+      {
+        "a": [
+          928,
+          75
+        ],
+        "b": [
+          973,
+          231
+        ],
+        "length": 162.3607095328177,
+        "score": 94.99729860284255,
+        "owners": [
+          1,
+          2,
+          2
+        ]
+      }
+    ],
+    "centers": [
+      {
+        "index": 1,
+        "straight_fraction": 0.24413145539906103,
+        "shape": "mirrored_outline",
+        "axis": {
+          "point": [
+            960.5,
+            141.5
+          ],
+          "direction": [
+            0.0,
+            1.0
+          ]
+        },
+        "axis_samples": 12,
+        "axis_support_span": 0.06321839080459771,
+        "axis_support": "one_end_constant",
+        "axis_residual": 0.0,
+        "added_fraction": 0.5142822561123215,
+        "status": "excessive_completion",
+        "before": {
+          "center": [
+            972.5,
+            138.0
+          ],
+          "center_normalized": [
+            0.9005,
+            0.0898
+          ],
+          "candidate_xyxy_pixel": [
+            946,
+            72,
+            999,
+            204
+          ],
+          "outer_rect": {
+            "left": 938,
+            "top": 56,
+            "width": 69,
+            "height": 164,
+            "area": 11316
+          },
+          "inner_rect": {
+            "left": 964,
+            "top": 90,
+            "width": 37,
+            "height": 100,
+            "area": 3700
+          },
+          "center_mode": "outer",
+          "method": "outer_center",
+          "split_mask_area": 8224
+        },
+        "after": {
+          "center": [
+            972.5,
+            138.0
+          ],
+          "center_normalized": [
+            0.9005,
+            0.0898
+          ],
+          "candidate_xyxy_pixel": [
+            946,
+            72,
+            999,
+            204
+          ],
+          "outer_rect": {
+            "left": 938,
+            "top": 56,
+            "width": 69,
+            "height": 164,
+            "area": 11316
+          },
+          "inner_rect": {
+            "left": 964,
+            "top": 90,
+            "width": 37,
+            "height": 100,
+            "area": 3700
+          },
+          "center_mode": "outer",
+          "method": "outer_center",
+          "split_mask_area": 8224
+        },
+        "displacement": [
+          0.0,
+          0.0
+        ],
+        "inside_layout_region": true,
+        "completion_accepted": false
+      },
+      {
+        "index": 2,
+        "straight_fraction": 0.27479338842975204,
+        "shape": "mirrored_outline",
+        "axis": {
+          "point": [
+            866.6711784919561,
+            201.0
+          ],
+          "direction": [
+            0.008856416181658234,
+            1.0
+          ]
+        },
+        "axis_samples": 49,
+        "axis_support_span": 0.9819494584837545,
+        "axis_support": "both_ends",
+        "axis_residual": 0.4890120278411132,
+        "added_fraction": 0.05522633231447404,
+        "symmetry_error_before": 0.11029469548133596,
+        "symmetry_error_after": 0.0059724950884086445,
+        "status": "completed",
+        "before": {
+          "center": [
+            867.0,
+            201.5
+          ],
+          "center_normalized": [
+            0.8028,
+            0.1312
+          ],
+          "candidate_xyxy_pixel": [
+            778,
+            77,
+            956,
+            326
+          ],
+          "outer_rect": {
+            "left": 762,
+            "top": 63,
+            "width": 210,
+            "height": 277,
+            "area": 58170
+          },
+          "inner_rect": {
+            "left": 785,
+            "top": 92,
+            "width": 146,
+            "height": 220,
+            "area": 32120
+          },
+          "center_mode": "outer",
+          "method": "outer_center",
+          "split_mask_area": 48055
+        },
+        "after": {
+          "center": [
+            867.0,
+            201.5
+          ],
+          "center_normalized": [
+            0.8028,
+            0.1312
+          ],
+          "candidate_xyxy_pixel": [
+            771,
+            80,
+            963,
+            323
+          ],
+          "outer_rect": {
+            "left": 762,
+            "top": 63,
+            "width": 210,
+            "height": 277,
+            "area": 58170
+          },
+          "inner_rect": {
+            "left": 781,
+            "top": 99,
+            "width": 173,
+            "height": 209,
+            "area": 36157
+          },
+          "center_mode": "outer",
+          "method": "outer_center",
+          "split_mask_area": 50699
+        },
+        "displacement": [
+          0.0,
+          0.0
+        ],
+        "inside_layout_region": true,
+        "completion_accepted": true
+      },
+      {
+        "index": 3,
+        "straight_fraction": 0.21291448516579406,
+        "shape": "mirrored_outline",
+        "axis": {
+          "point": [
+            681.5250057487824,
+            274.0
+          ],
+          "direction": [
+            0.0005060964236569893,
+            1.0
+          ]
+        },
+        "axis_samples": 160,
+        "axis_support_span": 0.9816849816849816,
+        "axis_support": "both_ends",
+        "axis_residual": 0.9185644999798228,
+        "added_fraction": 0.014046228092456184,
+        "symmetry_error_before": 0.04673546338559238,
+        "symmetry_error_after": 0.019299464179400674,
+        "status": "completed",
+        "before": {
+          "center": [
+            680.0,
+            275.0
+          ],
+          "center_normalized": [
+            0.6296,
+            0.179
+          ],
+          "candidate_xyxy_pixel": [
+            603,
+            156,
+            757,
+            394
+          ],
+          "outer_rect": {
+            "left": 593,
+            "top": 138,
+            "width": 174,
+            "height": 273,
+            "area": 47502
+          },
+          "inner_rect": {
+            "left": 616,
+            "top": 174,
+            "width": 133,
+            "height": 203,
+            "area": 26999
+          },
+          "center_mode": "outer",
+          "method": "outer_center",
+          "split_mask_area": 39332
+        },
+        "after": {
+          "center": [
+            682.0,
+            275.0
+          ],
+          "center_normalized": [
+            0.6315,
+            0.179
+          ],
+          "candidate_xyxy_pixel": [
+            604,
+            156,
+            760,
+            394
+          ],
+          "outer_rect": {
+            "left": 593,
+            "top": 138,
+            "width": 178,
+            "height": 273,
+            "area": 48594
+          },
+          "inner_rect": {
+            "left": 616,
+            "top": 174,
+            "width": 133,
+            "height": 203,
+            "area": 26999
+          },
+          "center_mode": "outer",
+          "method": "outer_center",
+          "split_mask_area": 39882
+        },
+        "displacement": [
+          2.0,
+          0.0
+        ],
+        "inside_layout_region": true,
+        "completion_accepted": true
+      }
+    ]
+  },
+  "folder": "/Users/zhongsheng/Documents/comic-text-detector-inpaint/artifacts/completion_symmetry_review/02_hold/12-20_items_1_2_3"
+}
