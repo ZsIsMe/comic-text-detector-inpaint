@@ -165,7 +165,7 @@ def spatial_spread(image: np.ndarray, sample: np.ndarray) -> tuple[float, int]:
     return float(np.ptp(np.asarray(colors), axis=0).max()), len(colors)
 
 
-def _quality(image, safe, text, protected):
+def _quality(image, safe, text, protected, region, jpeg_source=False):
     area = int(np.count_nonzero(safe))
     excluded = cv2.dilate(text.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
     sample = safe & ~excluded
@@ -174,7 +174,7 @@ def _quality(image, safe, text, protected):
     def reject(reason):
         debug['reason'] = reason
         return None, sample, debug
-    if np.any(safe & protected):
+    if np.any((region > 0) & protected):
         return reject('manual_other')
     if pixels < 64 or pixels < area * 0.25:
         return reject('insufficient_background')
@@ -219,7 +219,10 @@ def _quality(image, safe, text, protected):
         # A fixed count (formerly eight) misclassified anti-aliased fragments on
         # high-resolution/many-character pages. Area, shape and proximity below
         # constrain them independently of page resolution and character count.
-        if noise_pixels > pixels * 0.005:
+        # JPEG scans can leave sparse one-pixel grey flecks across otherwise
+        # uniform bubbles. They are already limited to <=4 px and <=32 delta.
+        speckle_limit = 0.012 if jpeg_source else 0.005
+        if noise_pixels > pixels * speckle_limit:
             return reject('texture')
         for idx in range(1, n):
             if idx in speckles:
@@ -416,7 +419,8 @@ def _resolve_overlaps(image, text, regions):
     return resolved, seam_guard
 
 
-def fill_bubbles(image, text_mask, polygons, shrink_ratio=0.02, protected=None):
+def fill_bubbles(image, text_mask, polygons, shrink_ratio=0.02, protected=None,
+                 *, jpeg_source=False):
     """Return overlay, geometry veto, samples and diagnostics without mutating inputs.
 
     Background variation vetoes local-ring fills. Uniform background with a few
@@ -489,7 +493,7 @@ def fill_bubbles(image, text_mask, polygons, shrink_ratio=0.02, protected=None):
             records.append(dict(overlap_meta, accepted=False, reason='text_crosses_boundary', box=[x1,y1,x2,y2]))
             continue
         color, sample, record = _quality(image[y1:y2, x1:x2], safe, local_text,
-                                         protected[y1:y2, x1:x2])
+                                         protected[y1:y2, x1:x2], local, jpeg_source)
         record['box'] = [x1, y1, x2, y2]
         record['inset_px'] = r
         record['protected_outline_pixels'] = outline_pixels

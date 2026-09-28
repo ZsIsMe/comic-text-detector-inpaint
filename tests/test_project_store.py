@@ -114,10 +114,10 @@ class ProjectTests(unittest.TestCase):
 
     def test_cache_updates_preserve_other_payloads_and_recover_from_bad_cache(self):
         file = store.cache_path(self.paths, self.path)
-        store.update_cache_file(file, text_mask=self.mask)
+        store.write_archive(file, {'text_mask': self.mask})  # legacy cache
         store.update_cache_file(file, bubble_json=np.array('{}'))
         store.update_cache_file(file, sample=self.mask)
-        self.assertEqual(set(store.read_cache_file(file)), {'text_mask', 'bubble_json', 'sample'})
+        self.assertEqual(set(store.read_cache_file(file)), {'bubble_json', 'sample'})
         file.write_bytes(b'broken')
         self.assertEqual(store.read_cache_file(file), {})
         store.update_cache_file(file, sample=self.mask)
@@ -189,7 +189,20 @@ class ProjectTests(unittest.TestCase):
             regenerate_image_from_mask(self.path, self.paths, reclassify=True)
             factory.assert_called_once_with('rfdetr', {'device': 'cpu'})
         self.assertFalse(np.any(read_page_state(self.paths, self.path)['overlay'][70:80, 82:90]))
-        np.testing.assert_array_equal(store.read_cache_file(store.cache_path(self.paths, self.path))['text_mask'], self.mask)
+        self.assertNotIn('text_mask', store.read_cache_file(store.cache_path(self.paths, self.path)))
+
+    def test_reclassify_ignores_legacy_text_mask_cache(self):
+        self.classify()
+        cache = store.cache_path(self.paths, self.path)
+        legacy = store.read_cache_file(cache)
+        legacy['text_mask'] = np.zeros_like(self.mask)
+        store.write_archive(cache, legacy)
+        with patch('detect_solid_inpaint_folder.create_detector') as factory, \
+                patch('detect_solid_inpaint_folder.detect_bubbles', return_value=([], 'detected')):
+            factory.return_value.return_value = (None, self.mask, None)
+            regenerate_image_from_mask(self.path, self.paths, reclassify=True)
+            factory.assert_called_once()
+        self.assertNotIn('text_mask', store.read_cache_file(cache))
 
     def test_legacy_project_is_not_silently_overwritten(self):
         legacy = self.root/'legacy/ctd_inpainted/raw/mask'
@@ -227,7 +240,7 @@ class EditorTests(unittest.TestCase):
         self.sample_patch.stop();self.settings_patch.stop()
         ProjectTests.tearDown(self)
 
-    def test_solid_bubble_transfer_only_moves_text_and_undo_restores_fill(self):
+    def test_solid_bubble_transfer_moves_whole_selection_and_undo_restores_fill(self):
         w = self.window
         state = read_page_state(self.paths, self.path)
         state['overlay'][25:150, 30:180] = [240,240,240,255]
@@ -238,13 +251,13 @@ class EditorTests(unittest.TestCase):
         self.assertTrue(w.transfer_selection_from_other_masks(np.ones(self.mask.shape, bool)))
         self.assertFalse(np.any(w.current_manual_solid))
         self.assertTrue(np.all(w.current_manual_other[self.mask > 0] == 255))
-        self.assertEqual(w.current_manual_other[30, 35], 0)
+        self.assertEqual(w.current_manual_other[30, 35], 255)
         self.assertTrue(w.save_all_edit_masks())
         w.undo_mask()
         np.testing.assert_array_equal(w.current_manual_solid, before)
         self.assertFalse(np.any(w.current_manual_other))
 
-    def test_batch_other_conversion_preserves_manual_areas_without_bubble_background(self):
+    def test_batch_other_conversion_moves_whole_bubble_and_preserves_manual_areas(self):
         from solid_inpaint_ui import _convert_image_edit_masks
         state = read_page_state(self.paths, self.path)
         state['overlay'][25:150,30:180] = [240,240,240,255]
@@ -255,7 +268,7 @@ class EditorTests(unittest.TestCase):
         result = read_page_state(self.paths, self.path)
         self.assertFalse(np.any(result['overlay']))
         self.assertTrue(np.all(result['other'][self.mask > 0] == 255))
-        self.assertEqual(result['other'][40,50], 0)
+        self.assertEqual(result['other'][40,50], 255)
         self.assertTrue(np.all(result['other'][30:35,35:40] == 255))
         self.assertTrue(np.all(result['other'][155:160,35:40] == 255))
 
@@ -280,15 +293,18 @@ class EditorTests(unittest.TestCase):
         w.redo_mask()
         self.assertTrue(np.all(read_page_state(self.paths, self.path)['other'][70:80, 83:90] == 255))
 
-    def test_erase_all_does_not_modify_detector_cache_or_reappear_on_reload(self):
+    def test_erase_all_does_not_modify_cache_or_reappear_on_reload(self):
         w = self.window
-        before = store.read_cache_file(store.cache_path(self.paths, self.path))['text_mask'].copy()
+        before = store.read_cache_file(store.cache_path(self.paths, self.path))
         selection = np.zeros_like(self.mask, bool);selection[65:95, 82:98] = True
         w.on_erase_all_masks_requested(selection)
         w.reload_current()
         self.assertFalse(np.any(w.current_manual_solid[selection]))
         self.assertFalse(np.any(w.current_manual_other[selection]))
-        np.testing.assert_array_equal(store.read_cache_file(store.cache_path(self.paths, self.path))['text_mask'], before)
+        after = store.read_cache_file(store.cache_path(self.paths, self.path))
+        self.assertEqual(set(after), set(before))
+        for key in before:
+            np.testing.assert_array_equal(after[key], before[key])
 
     def test_export_uses_authoritative_page_without_png_intermediates(self):
         with patch('solid_inpaint_ui.QMessageBox.information'):
@@ -354,41 +370,72 @@ class EditorTests(unittest.TestCase):
         for key in before:
             np.testing.assert_array_equal(after[key], before[key])
 
-    def test_preview_separates_text_from_fill_and_matches_old_sample_opacity(self):
+    def test_preview_shows_complete_fill_and_samples_only_outside_selection(self):
         from solid_inpaint_ui import _editor_mask_preview
         base = np.full((8, 8, 3), 200, np.uint8)
         base[3, 3] = 0
-        text = np.zeros((8, 8), np.uint8); text[3, 3] = 255
-        solid = np.zeros_like(text); solid[1:7, 1:7] = 255
-        sample = solid.copy(); sample[text > 0] = 0
+        solid = np.zeros((8, 8), np.uint8); solid[1:7, 1:7] = 255
+        sample = np.full_like(solid, 255)
         for alpha in (0, 0.5, 0.8, 1):
-            actual = _editor_mask_preview(base, solid, None, alpha, sample, detected_text=text)
-            # 舊版先混合原圖與白色文字，再用固定 28% 疊加黃色取樣區。
-            expected = (base.astype(np.float32) * (1-alpha)).astype(np.uint8)
-            expected[text > 0] = (base[text > 0] * (1-alpha) + 255*alpha).astype(np.uint8)
-            expected[sample > 0] = (expected[sample > 0] * .72 + np.array([70, 235, 255]) * .28).astype(np.uint8)
-            np.testing.assert_array_equal(actual, expected)
-        pure = _editor_mask_preview(base, solid, None, 1, sample, detected_text=text)
+            actual = _editor_mask_preview(base, solid, None, alpha, sample)
+            expected_fill = (base[2, 2] * (1-alpha) + 255*alpha).astype(np.uint8)
+            np.testing.assert_array_equal(actual[2, 2], expected_fill)
+            expected_sample = (np.array([200, 200, 200]) * (1-alpha) * .72
+                               + np.array([70, 235, 255]) * .28).astype(np.uint8)
+            np.testing.assert_array_equal(actual[0, 0], expected_sample)
+        pure = _editor_mask_preview(base, solid, None, 1, sample)
         np.testing.assert_array_equal(pure[3, 3], [255, 255, 255])
-        np.testing.assert_array_equal(pure[2, 2], [19, 65, 71])
-        np.testing.assert_array_equal(pure[0, 0], [0, 0, 0])
+        np.testing.assert_array_equal(pure[2, 2], [255, 255, 255])
         self.assertEqual(self.window.alpha_slider.value(), 70)
         self.window.alpha_slider.setValue(63)
         self.assertEqual(self.window._load_mask_alpha_percent(), 63)
 
-    def test_manual_addition_and_erasure_change_display_without_detector_changes(self):
+    def test_f1_preview_shows_whole_fill_and_keeps_sample_outside_it(self):
+        from solid_inpaint_ui import _editor_mask_preview
+        base = np.full((8, 8, 3), 200, np.uint8)
+        solid = np.zeros((8, 8), np.uint8); solid[1:7, 1:7] = 255
+        other = np.zeros_like(solid); other[0, 7] = 255
+        sample = np.full_like(solid, 255)
+        preview = _editor_mask_preview(
+            base, solid, other, 1, sample,
+        )
+        np.testing.assert_array_equal(preview[3, 3], [255, 255, 255])
+        np.testing.assert_array_equal(preview[2, 2], [255, 255, 255])
+        np.testing.assert_array_equal(preview[0, 0], [19, 65, 71])
+        np.testing.assert_array_equal(preview[0, 7], [165, 110, 255])
+
+    def test_mode_switch_preserves_white_fill_preview_and_uses_cached_sample(self):
+        w = self.window
+        self.assertIsNotNone(w.current_background_sample)
+        self.assertFalse(hasattr(w, 'detected_text_mask'))
+        w.show_background_sample = False
+        w.alpha_slider.setValue(100)
+        w.set_edit_mode('manual_solid')
+        first = w.mask_view.pixmap_item.pixmap().toImage()
+        w.set_edit_mode('manual_other')
+        second = w.mask_view.pixmap_item.pixmap().toImage()
+        self.assertEqual(first, second)
+        self.assertGreater(np.count_nonzero(w.current_manual_solid), np.count_nonzero(self.mask))
+
+    def test_missing_sample_cache_leaves_preview_usable(self):
+        w = self.window
+        store.cache_path(self.paths, self.path).unlink()
+        w.reload_current()
+        self.assertIsNone(w.current_background_sample)
+        w.set_edit_mode('manual_other')
+        self.assertFalse(w.mask_view.pixmap_item.pixmap().isNull())
+
+    def test_manual_addition_and_erasure_change_display(self):
         from solid_inpaint_ui import _editor_mask_preview, LocalEditDialog
         w = self.window
         w.show_background_sample = False
         w.alpha_slider.setValue(100)
-        original_text = w.detected_text_mask.copy()
         solid = w.current_manual_solid.copy()
         solid[20:25, 20:25] = 255
         solid[70:75, 85:90] = 0
         w.set_current_edit_mask(solid)
         expected = _editor_mask_preview(
             w.current_base, solid, w.current_manual_other, 1,
-            detected_text=w.detected_text_mask, manual_edits=w.preview_manual_edits(),
         )
         np.testing.assert_array_equal(expected[22, 22], [255]*3)
         np.testing.assert_array_equal(expected[72, 87], [0]*3)
@@ -396,12 +443,10 @@ class EditorTests(unittest.TestCase):
         np.testing.assert_array_equal(w.render_brush_live_patch(0, 0, 100, 100)[:, :, :3], expected[:100, :100])
         dialog = LocalEditDialog(w.current_base, solid, (0, 0, 100, 100), (255, 255, 255), 1,
             preview_context={'mode': 'manual_solid', 'solid': solid.copy(), 'other': w.current_manual_other.copy(),
-                             'text': w.detected_text_mask, 'edited': w.preview_manual_edits(),
                              'solid_color': (255, 255, 255), 'sample': None})
         np.testing.assert_array_equal(dialog.render_preview(solid), expected)
         np.testing.assert_array_equal(dialog.render_live_patch(0, 0, 100, 100)[:, :, :3], expected[:100, :100])
         dialog.close()
-        np.testing.assert_array_equal(w.detected_text_mask, original_text)
 
     def test_local_edit_dialog_accepts_grayscale_source(self):
         from solid_inpaint_ui import LocalEditDialog

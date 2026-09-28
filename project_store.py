@@ -52,6 +52,9 @@ def update_cache_file(path, **values):
             data = read_archive(path)
         except (OSError, ValueError, EOFError, zipfile.BadZipFile):
             data = {}
+        # Detector masks are transient inputs, not an independent saved selection.
+        data.pop('text_mask', None)
+        values.pop('text_mask', None)
         data.update(values)
         write_archive(path, data)
 

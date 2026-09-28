@@ -150,7 +150,7 @@ class SolidBubbleTests(unittest.TestCase):
         _, _, _, records = bubble.fill_bubbles(image, mask, polys)
         self.assertEqual(records[0]['reason'], 'text_crosses_boundary')
 
-    def test_expansion_holes_do_not_erase_local_fill(self):
+    def test_bubble_veto_erases_local_fill_inside_boundary(self):
         image, mask, polys = scene()
         overlay = np.full((*mask.shape, 4), 255, np.uint8)
         overlay[80:90, 79] = 0
@@ -158,84 +158,61 @@ class SolidBubbleTests(unittest.TestCase):
         result = (overlay, veto, np.zeros_like(mask), [{'accepted': True}])
         with patch('detect_solid_inpaint_folder.fill_bubbles', return_value=result):
             output, other, _, _ = _solid_overlay_from_mask(image, mask, polys)
-            self.assertTrue(np.all(output[80:90, 79, 3] == 255))
-            self.assertFalse(np.any(other))
+            self.assertFalse(np.any(output[80:90, 79, 3]))
 
-    def test_exterior_requires_every_side_even_when_two_sides_are_white(self):
+    def test_local_sampling_is_independent_of_bubble_polygon(self):
         image, mask, polys = scene()
         image[60:115, 99:110] = 0
         inside, _, _, inside_report = _solid_overlay_from_mask(image, mask, polys)
         outside, other, sample, report = _solid_overlay_from_mask(image, mask)
-        self.assertTrue(inside_report['blocks_debug'][0]['local_is_solid'])
-        self.assertTrue(np.all(inside[mask > 0, 3] == 255))
-        self.assertFalse(np.any(outside[mask > 0, 3]))
-        self.assertTrue(np.all(other[mask > 0] == 255))
-        checks = report['blocks_debug'][0]['direction_checks']
-        self.assertEqual(set(checks), {'top', 'bottom', 'left', 'right', 'near_ring'})
-        self.assertFalse(checks['right']['is_solid'])
-        self.assertTrue(np.any(sample[60:115, 99:110]))
+        self.assertEqual(inside_report['blocks_debug'][0]['local_is_solid'],
+                         report['blocks_debug'][0]['local_is_solid'])
+        self.assertNotIn('direction_checks', report['blocks_debug'][0])
 
     def test_flat_exterior_still_fills_without_bubbles(self):
         image, mask, _ = scene()
         output, other, _, report = _solid_overlay_from_mask(image, mask)
         self.assertTrue(np.all(output[mask > 0, 3] == 255))
         self.assertFalse(np.any(other))
-        self.assertFalse(report['blocks_debug'][0]['in_bubble'])
-
-    def test_white_letter_outline_does_not_hide_complex_background(self):
-        image, mask, _ = scene()
-        yy, xx = np.indices(mask.shape)
-        image[:] = np.where(((xx // 4 + yy // 4) % 2)[..., None], 170, 230)
-        # Narrow and wider masks must both inspect beyond the white outline.
-        white = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17,17)))
-        image[white > 0] = 255
-        image[mask > 0] = 0
-        for radius in (0, 2):
-            expanded = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*radius+1,)*2))
-            output, other, _, report = _solid_overlay_from_mask(image, expanded)
-            self.assertFalse(report['blocks_debug'][0]['local_is_solid'])
-            self.assertFalse(np.any(output))
-            self.assertTrue(np.all(other[mask > 0] == 255))
-
-    def test_exterior_line_crossing_text_is_not_erased(self):
-        image, mask, polys = scene()
-        cv2.line(image, (88, 20), (88, 155), (0, 0, 0), 3)
-        output, other, _, _ = _solid_overlay_from_mask(image, mask)
-        self.assertFalse(np.any(output[mask > 0, 3]))
-        self.assertTrue(np.all(other[mask > 0] == 255))
+        self.assertNotIn('in_bubble', report['blocks_debug'][0])
 
     def test_sample_preview_matches_classification(self):
         from detect_solid_inpaint_folder import iter_background_samples_from_mask
         image, mask, polys = scene()
-        for polygons in ([], polys):
-            _, _, expected, _ = _solid_overlay_from_mask(image, mask, polygons)
-            preview = np.zeros_like(mask)
-            for sample in iter_background_samples_from_mask(image, mask, polygons):
-                preview |= sample
-            np.testing.assert_array_equal(preview, expected)
+        _, _, expected, _ = _solid_overlay_from_mask(image, mask)
+        preview = np.zeros_like(mask)
+        for sample in iter_background_samples_from_mask(image, mask):
+            preview |= sample
+        np.testing.assert_array_equal(preview, expected)
 
     def test_polygon_bounds_do_not_make_exterior_text_interior(self):
         image, mask, _ = scene()
         triangle = np.array([[20,20], [179,20], [179,159]], np.float32)
         _, _, _, report = _solid_overlay_from_mask(image, mask, [triangle])
-        self.assertFalse(report['blocks_debug'][0]['in_bubble'])
+        self.assertNotIn('in_bubble', report['blocks_debug'][0])
 
-    def test_accepted_bubble_cannot_promote_other_to_solid(self):
+    def test_verified_bubble_promotes_local_other_to_solid(self):
         image, mask, polys = scene()
-        image[mask == 0] = 100
-        image[60:115, 99:110] = 220
         from detect_solid_inpaint_folder import SolidQuality
-        failed = SolidQuality(False, 0, (100,100,100), 100, 0, 0, 100, 0, 100, 100, 'full')
-        expansion = np.zeros((*mask.shape, 4), np.uint8)
-        expansion[25:155,25:175] = 255
-        result = (expansion, np.zeros_like(mask), np.zeros_like(mask),
-                  [{'accepted': True, 'box': [20,20,180,160]}])
-        with patch('detect_solid_inpaint_folder._best_quality', return_value=failed), \
-             patch('detect_solid_inpaint_folder.fill_bubbles', return_value=result):
+        failed = SolidQuality(False, 0, (0,0,0), 100, 0, 0, 100, 0, 100, 100, 'full')
+        with patch('detect_solid_inpaint_folder._best_quality', return_value=failed):
             output, other, _, report = _solid_overlay_from_mask(image, mask, polys)
-        self.assertFalse(np.any(output))
-        self.assertTrue(np.all(other[mask > 0] == 255))
-        self.assertEqual(report['solid_bubbles'], 0)
+        self.assertFalse(report['blocks_debug'][0]['local_is_solid'])
+        self.assertEqual(report['solid_bubbles'], 1)
+        self.assertTrue(np.all(output[mask > 0] == 255))
+        self.assertEqual(output[40, 40, 3], 255)
+        self.assertFalse(np.any(other))
+        self.assertEqual(report['other_blocks'], 0)
+
+    def test_verified_bubble_uses_bubble_color_over_local_fill(self):
+        image, mask, polys = scene()
+        from detect_solid_inpaint_folder import SolidQuality
+        wrong_color = SolidQuality(True, 0, (0,0,0), 0, 0, 0, 0, 0, 0, 0, 'full')
+        with patch('detect_solid_inpaint_folder._best_quality', return_value=wrong_color):
+            output, other, _, report = _solid_overlay_from_mask(image, mask, polys)
+        self.assertEqual(report['solid_bubbles'], 1)
+        np.testing.assert_array_equal(output[80, 85], [255, 255, 255, 255])
+        self.assertFalse(np.any(other))
 
     def test_uncertain_artwork_keeps_safe_local_fill_without_erasing_art(self):
         image, mask, polys = scene()
@@ -246,15 +223,15 @@ class SolidBubbleTests(unittest.TestCase):
         self.assertTrue(np.all(output[mask > 0, 3] == 255))
         self.assertFalse(np.any(output[38:46, 143:151, 3]))
 
-    def test_failed_gradient_expansion_keeps_local_classification(self):
+    def test_failed_gradient_expansion_vetoes_local_fill(self):
         image, mask, polys = scene()
         image[:] = np.linspace(220, 250, 200).astype(np.uint8)[None, :, None]
         image[mask > 0] = 0
         output, other, _, report = _solid_overlay_from_mask(image, mask, polys)
         self.assertEqual(report['solid_bubbles'], 0)
         self.assertTrue(report['blocks_debug'][0]['local_is_solid'])
-        self.assertTrue(np.all(output[mask > 0, 3] == 255))
-        self.assertFalse(np.any(other))
+        self.assertFalse(np.any(output[mask > 0, 3]))
+        self.assertTrue(np.all(other[mask > 0] == 255))
         self.assertEqual(output[40, 40, 3], 0)
 
     def test_artwork_far_from_text_vetoes_fill(self):
@@ -277,6 +254,16 @@ class SolidBubbleTests(unittest.TestCase):
         output, _, _, records = bubble.fill_bubbles(image, mask, polys)
         self.assertTrue(records[0]['accepted'], records)
         self.assertTrue(np.all(output[35, 35, :3] == 255))
+
+    def test_jpeg_density_speckles_do_not_disable_whole_bubble_fill(self):
+        image, mask, polys = scene()
+        image[30:150:10, 30:170:10] = 230
+        _, _, _, png_records = bubble.fill_bubbles(image, mask, polys)
+        self.assertEqual(png_records[0]['reason'], 'texture')
+        output, _, _, records = bubble.fill_bubbles(image, mask, polys, jpeg_source=True)
+        self.assertTrue(records[0]['accepted'], records)
+        self.assertGreater(records[0]['compression_speckle_pixels'] / records[0]['sample_pixels'], 0.005)
+        self.assertTrue(np.all(output[mask > 0, 3] == 255))
 
     def test_halftone_pattern_is_not_treated_as_compression_noise(self):
         image, mask, polys = scene()
@@ -351,7 +338,7 @@ class SolidBubbleTests(unittest.TestCase):
         self.assertFalse(np.any(output[35:65, 45:75, 3]))
         self.assertEqual(output[110, 145, 3], 255)
 
-    def test_failed_overlap_expansion_keeps_local_classification(self):
+    def test_failed_overlap_expansion_vetoes_local_fill(self):
         image, mask, polygons = scene()
         image[:] = np.linspace(220, 250, 200).astype(np.uint8)[None, :, None]
         image[mask > 0] = 0
@@ -359,8 +346,8 @@ class SolidBubbleTests(unittest.TestCase):
         output, other, _, report = _solid_overlay_from_mask(image, mask, polygons)
         self.assertEqual(report['solid_bubbles'], 0)
         self.assertTrue(report['blocks_debug'][0]['local_is_solid'])
-        self.assertTrue(np.all(output[mask > 0, 3] == 255))
-        self.assertFalse(np.any(other))
+        self.assertFalse(np.any(output[mask > 0, 3]))
+        self.assertTrue(np.all(other[mask > 0] == 255))
         self.assertEqual(output[40, 40, 3], 0)
 
     def test_irregular_regions_do_not_claim_neighbor_text_in_their_bounds(self):
@@ -395,21 +382,36 @@ class SolidBubbleTests(unittest.TestCase):
         self.assertFalse(np.any(output))
         self.assertEqual(records[0]['reason'], 'manual_other')
 
+    def test_manual_other_in_inset_rim_protects_entire_bubble(self):
+        image, mask, polys = scene()
+        protected = np.zeros_like(mask)
+        protected[80:84, 21] = 255  # Inside the contour, outside the eroded safe area.
+        region = bubble._polygon_mask(polys[0], mask.shape)
+        safe = cv2.erode(region, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))) > 0
+        self.assertTrue(np.all(region[protected > 0] > 0))
+        self.assertFalse(np.any(safe[protected > 0]))
+        output, _, _, records = bubble.fill_bubbles(image, mask, polys, protected=protected)
+        self.assertFalse(np.any(output))
+        self.assertEqual(records[0]['reason'], 'manual_other')
+        final, _, _, report = _solid_overlay_from_mask(image, mask, polys, protected=protected)
+        self.assertEqual(report['solid_bubbles'], 0)
+        self.assertEqual(final[40, 40, 3], 0)
+
     def test_no_text_never_triggers_whole_bubble_fill(self):
         image, mask, polys = scene()
         output, _, _, records = bubble.fill_bubbles(image, mask*0, polys)
         self.assertFalse(np.any(output))
         self.assertEqual(records, [])
 
-    def test_crossing_text_blocks_expansion_but_keeps_flat_local_fill(self):
+    def test_crossing_text_blocks_expansion_and_vetoes_local_fill(self):
         image, mask, polys = scene()
         mask[60:70, 10:30] = 255
         image[mask > 0] = 0
         output, _, _, report = _solid_overlay_from_mask(image, mask, polys)
         self.assertEqual(report['solid_bubbles'], 0)
-        self.assertTrue(np.all(output[60:70, 17:25, 3] == 255))
+        self.assertFalse(np.any(output[60:70, 17:25, 3]))
         self.assertEqual(output[40, 40, 3], 0)
-        self.assertFalse(report['blocks_debug'][0]['in_bubble'])
+        self.assertNotIn('in_bubble', report['blocks_debug'][0])
 
 
 class BubbleIntegrationTests(unittest.TestCase):
@@ -421,7 +423,7 @@ class BubbleIntegrationTests(unittest.TestCase):
             store.update_project(directory, settings={'solid_fill': {'enabled':'false', 'shrink_percent':'NaN'}})
             self.assertEqual(bubble.load_settings(directory), {'enabled': True, 'shrink_percent': 2.0})
 
-    def test_regeneration_keeps_text_mask_and_protects_manual_other(self):
+    def test_regeneration_omits_text_mask_and_protects_manual_other(self):
         with tempfile.TemporaryDirectory() as directory:
             image, mask, polys = scene()
             image[80:84, 111:115] = 0
@@ -431,7 +433,7 @@ class BubbleIntegrationTests(unittest.TestCase):
             with patch('detect_solid_inpaint_folder.detect_bubbles', return_value=(polys, 'detected')):
                 report = regenerate_image_from_mask(path, paths, mask)
                 self.assertEqual(report['solid_bubbles'], 1)
-                np.testing.assert_array_equal(store.read_cache_file(store.cache_path(paths, path))['text_mask'], mask)
+                self.assertNotIn('text_mask', store.read_cache_file(store.cache_path(paths, path)))
                 protected = np.zeros_like(mask)
                 protected[80:84, 111:115] = 255
                 state = read_page_state(paths, path)

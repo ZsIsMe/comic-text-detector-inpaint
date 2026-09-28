@@ -64,12 +64,9 @@ from detect_solid_inpaint_folder import (
     _ensure_dirs,
     _background_sample_cache_path,
     _background_cache_context,
-    _mask_hash,
-    _save_background_sample_cache,
     _write_preview_pdf,
     add_detection_to_mask,
     build_report,
-    bubble_context,
     create_detector,
     DEFAULT_DETECTOR,
     DETECTOR_CTBD,
@@ -78,11 +75,9 @@ from detect_solid_inpaint_folder import (
     DETECTOR_RFDETR,
     DETECTOR_YSGYOLO,
     image_files_in_folder,
-    iter_background_samples_from_mask,
     load_report,
     process_image_with_detector,
     REFINEMASK_ANNOTATION,
-    REPAIR_EXPAND_PX,
     regenerate_image_from_mask,
     regenerate_image_from_imported_mask,
     write_report,
@@ -200,24 +195,8 @@ def _read_edit_masks_for_image(paths, img_path):
         raise FileNotFoundError(f'無法讀取原圖：{img_path}')
     shape = base.shape[:2]
     state = read_page_state(paths, img_path, shape)
-    cache = store.read_cache_file(store.cache_path(paths, img_path))
-    text = cache.get('text_mask', np.zeros(shape, np.uint8))
-    if text.shape != shape or str(cache.get('source_signature', '')) != store.source_signature(img_path):
-        text = np.zeros(shape, np.uint8)
-    return shape, {'mask': text, 'manual_solid': state['overlay'][:, :, 3].copy(),
+    return shape, {'manual_solid': state['overlay'][:, :, 3].copy(),
                    'manual_other': state['other'].copy()}
-
-
-def _solid_repair_transfer(solid, selection, text, edited=None):
-    """Remove selected solid coverage, but transfer only text/manual repair pixels."""
-    removed = (solid > 0) & (selection > 0)
-    if text is None or text.shape != solid.shape or not np.any(text):
-        return removed, removed.copy()
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * REPAIR_EXPAND_PX + 1,) * 2)
-    repair = cv2.dilate((text > 0).astype(np.uint8), kernel) > 0
-    if edited is not None:
-        repair |= edited > 0
-    return removed, removed & repair
 
 
 def _convert_image_edit_masks(paths, img_path, target_mode):
@@ -225,28 +204,22 @@ def _convert_image_edit_masks(paths, img_path, target_mode):
         raise ValueError('請選擇純色填充或圖像修補。')
     shape, masks = _read_edit_masks_for_image(paths, img_path)
     combined = masks['manual_solid'] | masks['manual_other']
-    if target_mode == 'manual_other':
-        state = read_page_state(paths, img_path, shape)
-        _, transfer = _solid_repair_transfer(masks['manual_solid'],
-            np.ones(shape, np.uint8), masks['mask'], state['edited'])
-        combined = masks['manual_other'] | (transfer.astype(np.uint8) * 255)
     empty = np.zeros(shape, np.uint8)
     save_page_edits(img_path, paths,
         combined if target_mode == 'manual_solid' else empty,
         combined if target_mode == 'manual_other' else empty)
 
 
-def _load_background_sample_cache(paths: dict[str, str], img_path: str, mask: np.ndarray) -> np.ndarray | None:
+def _load_background_sample_cache(paths: dict[str, str], img_path: str, shape: tuple[int, int]) -> np.ndarray | None:
     cache_path = _background_sample_cache_path(paths, img_path)
     if not osp.isfile(cache_path):
         return None
     try:
         with np.load(cache_path) as data:
-            if (int(data['mask_hash']) != _mask_hash(mask)
-                    or str(data['context']) != _background_cache_context(paths, img_path)):
+            if str(data['context']) != _background_cache_context(paths, img_path):
                 return None
             sample = np.asarray(data['sample'], dtype=np.uint8)
-        if sample.shape != mask.shape:
+        if sample.shape != shape:
             return None
         return np.where(sample > 0, 255, 0).astype(np.uint8)
     except Exception:
@@ -335,19 +308,11 @@ def _overlay_transparent_mask_on_bgr(
 
 def _editor_mask_preview(
     base, solid, other, alpha, sample=None, solid_color=None,
-    *, detected_text=None, manual_edits=None,
 ):
-    """文字與背景取樣分開顯示，不能把整區填色 overlay 當成文字。"""
+    """White always shows the complete saved solid selection in either mode."""
     alpha = max(0.0, min(1.0, alpha))
-    text = np.zeros(base.shape[:2], dtype=np.uint8)
-    if solid is not None:
-        if detected_text is not None:
-            text[(detected_text > 0) & (solid > 0)] = 255
-        # 人工添加的範圍也要可見；擦除、轉入圖像修補的部分不再顯示白色。
-        if manual_edits is not None:
-            text[(manual_edits > 0) & (solid > 0)] = 255
     preview = _mask_overlay_image(
-        base, text, alpha,
+        base, solid, alpha,
         solid_color if solid_color is not None else EDIT_MODE_COLORS['manual_solid'],
     )
     preview = _overlay_transparent_mask_on_bgr(
@@ -355,7 +320,8 @@ def _editor_mask_preview(
     )
     if sample is not None:
         sample = sample.copy()
-        sample[text > 0] = 0
+        if solid is not None:
+            sample[solid > 0] = 0
         if other is not None:
             sample[other > 0] = 0
     return _overlay_mask_on_bgr(
@@ -1955,10 +1921,9 @@ class LocalEditDialog(QDialog):
             other[solid > 0] = 0
         else:
             solid[other > 0] = 0
-        edited = (crop(context['edited']) > 0) | (solid != crop(context['solid']))
         return _editor_mask_preview(
             crop(self.source_bgr), solid, other, self.alpha, crop(context['sample']),
-            context['solid_color'], detected_text=crop(context['text']), manual_edits=edited,
+            context['solid_color'],
         )
 
     def refresh_preview(self, keep_view: bool = True) -> None:
@@ -2819,11 +2784,10 @@ class SolidFillSettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle('純色填充設定')
         layout = QVBoxLayout(self)
-        self.enabled = QCheckBox('使用 MangaLens 區分氣泡內外，擴展純色氣泡填充')
+        self.enabled = QCheckBox('使用 MangaLens，填滿可靠純色氣泡內部')
         self.enabled.setChecked(values['enabled'])
         layout.addWidget(self.enabled)
-        hint = QLabel('氣泡內可局部取樣，氣泡外須四周通過；停用時全用四周判斷。\n'
-                      '氣泡擴展失敗時保留原有局部填充。\n'
+        hint = QLabel('清除氣泡內漏檢的小筆畫；漸層、圖案或背景不足時保留待修改。\n'
                       '「圖像修補」標記會阻止所在氣泡整區填色。')
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -2840,7 +2804,7 @@ class SolidFillSettingsDialog(QDialog):
         self.enabled.toggled.connect(self.shrink.setEnabled)
         row.addWidget(self.shrink)
         layout.addLayout(row)
-        layout.addWidget(QLabel('重新分類目前文件夾，保留人工修改；缺少快取時重新偵測。'))
+        layout.addWidget(QLabel('重新分類目前文件夾，保留人工修改並重新偵測文字。'))
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Apply).setText('套用並重新分類')
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('取消')
@@ -2848,44 +2812,6 @@ class SolidFillSettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
         self.resize(460, 230)
-
-
-class BackgroundSampleWorker(QObject):
-    partial = Signal(int, str, object, object)
-    finished = Signal(int, str, object, object)
-    failed = Signal(int, str, object, str)
-
-    def __init__(self, request_id: int, img_path: str, image: np.ndarray, mask: np.ndarray,
-                 paths: dict | None = None, protected: np.ndarray | None = None) -> None:
-        super().__init__()
-        self.request_id = request_id
-        self.img_path = img_path
-        self.image = image.copy()
-        self.mask = np.where(mask > 0, 255, 0).astype(np.uint8)
-        self.mask_hash = _mask_hash(self.mask)
-        self.cancelled = False
-        self.paths = paths
-        self.protected = None if protected is None else protected.copy()
-
-    def cancel(self) -> None:
-        self.cancelled = True
-
-    def run(self) -> None:
-        try:
-            sample = np.zeros(self.mask.shape, dtype=np.uint8)
-            polygons = []
-            if self.paths and not self.cancelled:
-                polygons, _, _ = bubble_context(self.image, self.mask, self.paths, self.img_path)
-            for block_sample in iter_background_samples_from_mask(self.image, self.mask, polygons):
-                if self.cancelled:
-                    break
-                sample = cv2.bitwise_or(sample, block_sample)
-                self.partial.emit(self.request_id, self.img_path, self.mask_hash, sample.copy())
-                if self.cancelled:
-                    break
-            self.finished.emit(self.request_id, self.img_path, self.mask_hash, sample)
-        except Exception as exc:
-            self.failed.emit(self.request_id, self.img_path, self.mask_hash, str(exc))
 
 
 class CtdSelectionWorker(QObject):
@@ -3155,7 +3081,6 @@ class MainWindow(QMainWindow):
         self.report: dict = {}
         self.current_img_path = ''
         self.current_base: np.ndarray | None = None
-        self.detected_text_mask: np.ndarray | None = None
         self.current_page: dict | None = None
         self.current_manual_solid: np.ndarray | None = None
         self.current_manual_other: np.ndarray | None = None
@@ -3180,11 +3105,6 @@ class MainWindow(QMainWindow):
         self.worker: FolderWorker | ConvertMasksWorker | None = None
         self.page_worker_thread: QThread | None = None
         self.page_worker: PageRegenerateWorker | None = None
-        self.background_worker_thread: QThread | None = None
-        self.background_worker: BackgroundSampleWorker | None = None
-        self.background_sample_request_id = 0
-        self.pending_background_img_path = ''
-        self.pending_background_mask: np.ndarray | None = None
         self.ctd_selection_worker_thread: QThread | None = None
         self.ctd_selection_worker: CtdSelectionWorker | None = None
         self.ctd_selection_request_id = 0
@@ -3204,9 +3124,6 @@ class MainWindow(QMainWindow):
         self.render_timer = QTimer(self)
         self.render_timer.setSingleShot(True)
         self.render_timer.timeout.connect(self.start_pending_render)
-        self.background_sample_timer = QTimer(self)
-        self.background_sample_timer.setSingleShot(True)
-        self.background_sample_timer.timeout.connect(self.start_background_sample_worker)
         self.resize_fit_timer = QTimer(self)
         self.resize_fit_timer.setSingleShot(True)
         self.resize_fit_timer.timeout.connect(self.fit_both_views)
@@ -3472,7 +3389,7 @@ class MainWindow(QMainWindow):
         self.selection_add_inner_btn.setToolTip('魔法棒專用：同時添加選區與內部孔洞')
         self.selection_transfer_btn = QPushButton('F12 從其他轉入')
         self.selection_transfer_btn.setCheckable(True)
-        self.selection_transfer_btn.setToolTip('把選區內另一類轉入；轉成圖像修補時只保留文字範圍，移除氣泡擴展填色')
+        self.selection_transfer_btn.setToolTip('把本次選區內其他 mask 的重疊部分移到目前 mask，並從原 mask 移除')
         self.selection_ctd_btn = QPushButton('添加CTD檢測選區')
         self.selection_ctd_btn.setCheckable(True)
         self.selection_ctd_btn.setToolTip('只對本次矩形選區跑 CTD，並把檢測結果添加到目前 mask')
@@ -4003,12 +3920,6 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             QMessageBox.warning(self, '儲存失敗', str(exc))
             return
-        self.background_sample_request_id += 1
-        self.background_sample_timer.stop()
-        self.pending_background_img_path = ''
-        self.pending_background_mask = None
-        if self.background_worker is not None:
-            self.background_worker.cancel()
         pages = [p for p in self.imglist if store.has_page(self.paths, p)]
         if pages:
             self.start_worker('regenerate', pages)
@@ -4445,7 +4356,6 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError) as exc:
             self.current_page = None
             self.current_base = None
-            self.detected_text_mask = None
             self.current_manual_solid = None
             self.current_manual_other = None
             self.mask_view.setEnabled(False)
@@ -4456,10 +4366,9 @@ class MainWindow(QMainWindow):
         self.current_page = state
         shape = base.shape[:2]
         overlay, other_mask = state['overlay'], state['other']
-        self.detected_text_mask = masks['mask']
         self.current_manual_solid = masks['manual_solid']
         self.current_manual_other = masks['manual_other']
-        self.current_background_sample = _load_background_sample_cache(self.paths, self.current_img_path, self.detected_text_mask)
+        self.current_background_sample = _load_background_sample_cache(self.paths, self.current_img_path, shape)
         if self.current_background_sample is None:
             self.queue_background_sample()
         else:
@@ -4691,12 +4600,6 @@ class MainWindow(QMainWindow):
             return
         self.status.showMessage(f'PSD 素材已導出：{folder}；可執行 create_psds_from_outputs.jsx。')
 
-    def preview_manual_edits(self, solid=None):
-        solid = self.current_manual_solid if solid is None else solid
-        if self.current_page is None or solid is None:
-            return None
-        return (self.current_page['edited'] > 0) | (solid != self.current_page['overlay'][:, :, 3])
-
     def refresh_mask_preview(self, keep_view: bool = True) -> None:
         if self.is_mask_stroke_active or self.is_local_edit_active:
             return
@@ -4709,7 +4612,6 @@ class MainWindow(QMainWindow):
             self.current_base, self.current_manual_solid, self.current_manual_other,
             self.alpha, self.current_background_sample if self.show_background_sample else None,
             solid_color=self.mask_display_color,
-            detected_text=self.detected_text_mask, manual_edits=self.preview_manual_edits(),
         )
         mask_qimage = _qimage_from_bgr(mask_preview)
         self.mask_view.set_qimage(mask_qimage, keep_view=keep_view)
@@ -4788,14 +4690,12 @@ class MainWindow(QMainWindow):
         return None
 
     def current_masks_snapshot(self):
-        return {'mask': self.detected_text_mask.copy(),
-                'manual_solid': self.current_manual_solid.copy(),
+        return {'manual_solid': self.current_manual_solid.copy(),
                 'manual_other': self.current_manual_other.copy(),
                 'overlay': self.current_page['overlay'].copy(),
                 'edited': self.current_page['edited'].copy()}
 
     def restore_masks_snapshot(self, snapshot):
-        self.detected_text_mask = snapshot['mask'].copy()
         self.current_manual_solid = snapshot['manual_solid'].copy()
         self.current_manual_other = snapshot['manual_other'].copy()
         self.current_page = {'overlay': snapshot['overlay'].copy(),
@@ -5055,7 +4955,7 @@ class MainWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def push_undo_snapshot(self) -> None:
-        if self.detected_text_mask is None:
+        if self.current_manual_solid is None:
             return
         self.undo_stack.append(self.current_masks_snapshot())
         self.undo_stack = self.undo_stack[-MAX_UNDO_STEPS:]
@@ -5069,17 +4969,8 @@ class MainWindow(QMainWindow):
         self.is_mask_stroke_active = bool(active)
         if not active:
             return
-        # Any background result already in flight belongs to the pre-stroke mask.
-        # Invalidate it before the first brush pixel is written so it cannot
-        # replace the live editor buffer or force a full left-preview refresh.
-        self.background_sample_request_id += 1
-        self.background_sample_timer.stop()
         self.render_timer.stop()
         self.resize_fit_timer.stop()
-        self.pending_background_img_path = ''
-        self.pending_background_mask = None
-        if self.background_worker is not None:
-            self.background_worker.cancel()
 
     def on_mask_edited(self, mask: object) -> None:
         self.mask_view.stop_live_mask_preview()
@@ -5097,7 +4988,6 @@ class MainWindow(QMainWindow):
             self.current_base, self.current_manual_solid, self.current_manual_other,
             self.alpha, self.current_background_sample if self.show_background_sample else None,
             solid_color=self.mask_display_color,
-            detected_text=self.detected_text_mask, manual_edits=self.preview_manual_edits(),
         )
         self.mask_view.set_qimage(_qimage_from_bgr(preview), keep_view=True)
         self.mask_view.start_live_mask_preview(self.render_brush_live_patch)
@@ -5113,7 +5003,6 @@ class MainWindow(QMainWindow):
         preview = _editor_mask_preview(
             self.current_base[y1:y2, x1:x2], crop(solid), crop(other), self.alpha, crop(sample),
             solid_color=self.mask_display_color,
-            detected_text=crop(self.detected_text_mask), manual_edits=crop(self.preview_manual_edits(solid)),
         )
         # 完整合成 dirty region，避免在已淡出的底圖上再次混合透明度。
         patch = np.empty((*preview.shape[:2], 4), dtype=np.uint8)
@@ -5172,8 +5061,7 @@ class MainWindow(QMainWindow):
             self,
             preview_context={
                 'mode': self.edit_mode, 'solid': self.current_manual_solid.copy(),
-                'other': self.current_manual_other.copy(), 'text': self.detected_text_mask,
-                'edited': self.preview_manual_edits(), 'solid_color': self.mask_display_color,
+                'other': self.current_manual_other.copy(), 'solid_color': self.mask_display_color,
                 'sample': self.current_background_sample if self.show_background_sample else None,
             },
         )
@@ -5210,7 +5098,7 @@ class MainWindow(QMainWindow):
 
     def on_erase_all_masks_requested(self, selection: object) -> None:
         selection_mask = np.asarray(selection, dtype=bool)
-        if self.detected_text_mask is None or selection_mask.shape[:2] != self.detected_text_mask.shape[:2]:
+        if self.current_base is None or selection_mask.shape[:2] != self.current_base.shape[:2]:
             self.status.showMessage('右鍵清除選區尺寸不一致。')
             return
         masks = [
@@ -5316,13 +5204,6 @@ class MainWindow(QMainWindow):
             transfer |= (other > 0) & selection
         if not np.any(transfer):
             return False
-        removed = transfer.copy()
-        if self.edit_mode == 'manual_other':
-            edited = None
-            if self.paths and self.current_img_path:
-                edited = read_page_state(self.paths, self.current_img_path, current.shape)['edited']
-            removed, transfer = _solid_repair_transfer(
-                self.current_manual_solid, selection, self.detected_text_mask, edited)
         self.push_undo_snapshot()
         current[transfer] = 255
         for mode in EDIT_MODE_LABELS:
@@ -5330,13 +5211,13 @@ class MainWindow(QMainWindow):
                 continue
             other = self.mask_for_mode(mode)
             if other is not None:
-                other[removed] = 0
+                other[transfer] = 0
         return True
 
     def undo_mask(self) -> None:
         if self.worker_thread is not None:
             return
-        if self.detected_text_mask is None or not self.undo_stack:
+        if self.current_manual_solid is None or not self.undo_stack:
             return
         self.redo_stack.append(self.current_masks_snapshot())
         self.restore_masks_snapshot(self.undo_stack.pop())
@@ -5352,7 +5233,7 @@ class MainWindow(QMainWindow):
     def redo_mask(self) -> None:
         if self.worker_thread is not None:
             return
-        if self.detected_text_mask is None or not self.redo_stack:
+        if self.current_manual_solid is None or not self.redo_stack:
             return
         self.undo_stack.append(self.current_masks_snapshot())
         self.restore_masks_snapshot(self.redo_stack.pop())
@@ -5404,109 +5285,10 @@ class MainWindow(QMainWindow):
         return True
 
     def queue_background_sample(self) -> None:
-        self.background_sample_request_id += 1
-        if (
-            not self.show_background_sample
-            or not self.current_img_path
-            or self.current_base is None
-            or self.detected_text_mask is None
-        ):
-            self.pending_background_img_path = ''
-            self.pending_background_mask = None
-            self.background_sample_timer.stop()
-            if self.background_worker is not None:
-                self.background_worker.cancel()
-            if hasattr(self, 'background_sample_status'):
-                self.background_sample_status.setText('')
-            return
-        if self.background_worker is not None:
-            self.background_worker.cancel()
-        self.pending_background_img_path = self.current_img_path
-        self.pending_background_mask = self.detected_text_mask.copy()
-        self.background_sample_status.setText('背景選區等待中...')
-        self.background_sample_timer.start(450)
-
-    def start_background_sample_worker(self) -> None:
-        if (
-            not self.pending_background_img_path
-            or self.pending_background_mask is None
-            or self.pending_background_img_path != self.current_img_path
-            or self.current_base is None
-        ):
-            return
-        if self.background_worker_thread is not None:
-            self.background_sample_timer.start(450)
-            return
-        request_id = self.background_sample_request_id
-        img_path = self.pending_background_img_path
-        mask = self.pending_background_mask.copy()
-        base = self.current_base.copy()
-        self.pending_background_img_path = ''
-        self.pending_background_mask = None
-        self.background_sample_status.setText('背景選區計算中...')
-
-        self.background_worker_thread = QThread()
-        self.background_worker = BackgroundSampleWorker(
-            request_id, img_path, base, mask, dict(self.paths), self.current_manual_other,
-        )
-        self.background_worker.moveToThread(self.background_worker_thread)
-        self.background_worker_thread.started.connect(self.background_worker.run)
-        self.background_worker.partial.connect(self.on_background_sample_partial)
-        self.background_worker.finished.connect(self.on_background_sample_finished)
-        self.background_worker.failed.connect(self.on_background_sample_failed)
-        self.background_worker.finished.connect(self.background_worker_thread.quit)
-        self.background_worker.failed.connect(self.background_worker_thread.quit)
-        self.background_worker_thread.finished.connect(self.cleanup_background_worker)
-        self.background_worker_thread.start()
-
-    def on_background_sample_partial(
-        self,
-        request_id: int,
-        img_path: str,
-        mask_hash: int,
-        sample: object,
-    ) -> None:
-        if (
-            request_id != self.background_sample_request_id
-            or img_path != self.current_img_path
-            or mask_hash != _mask_hash(self.detected_text_mask)
-        ):
-            return
-        self.current_background_sample = np.asarray(sample, dtype=np.uint8)
-        self.refresh_mask_preview(keep_view=True)
-
-    def on_background_sample_finished(
-        self,
-        request_id: int,
-        img_path: str,
-        mask_hash: int,
-        sample: object,
-    ) -> None:
-        if (
-            request_id != self.background_sample_request_id
-            or img_path != self.current_img_path
-            or mask_hash != _mask_hash(self.detected_text_mask)
-        ):
-            return
-        self.current_background_sample = np.asarray(sample, dtype=np.uint8)
-        _save_background_sample_cache(self.paths, img_path, mask_hash, self.current_background_sample)
-        self.background_sample_status.setText('')
-        self.refresh_mask_preview(keep_view=True)
-
-    def on_background_sample_failed(self, request_id: int, img_path: str, mask_hash: int, message: str) -> None:
-        if (
-            request_id == self.background_sample_request_id
-            and img_path == self.current_img_path
-            and mask_hash == _mask_hash(self.detected_text_mask)
-        ):
-            self.background_sample_status.setText('背景選區失敗')
-        self.status.showMessage(f'背景選區計算失敗：{message}')
-
-    def cleanup_background_worker(self) -> None:
-        self.background_worker = None
-        self.background_worker_thread = None
-        if self.pending_background_img_path:
-            self.background_sample_timer.start(50)
+        # Background samples are produced during detection and cached by source.
+        # Editor changes do not recreate a text mask or reclassify the page.
+        if hasattr(self, 'background_sample_status'):
+            self.background_sample_status.setText('')
 
     def queue_auto_render(self):
         # Edits already update the authoritative page atomically. Rendering is
