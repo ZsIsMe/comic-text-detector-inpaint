@@ -458,3 +458,196 @@ class EditorTests(unittest.TestCase):
         np.testing.assert_array_equal(dialog.page_bgr[:, :, 0], grayscale)
         np.testing.assert_array_equal(dialog.render_preview(self.mask)[:, :, 0], grayscale)
         dialog.close()
+
+    def test_local_edit_switches_classes_and_undo_redo_restores_both(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+        from solid_inpaint_ui import LocalEditDialog
+        source = np.full((12, 12, 3), 180, np.uint8)
+        solid = np.zeros((12, 12), np.uint8); solid[3:5, 3:5] = 255
+        other = np.zeros_like(solid); other[6:8, 6:8] = 255
+        dialog = LocalEditDialog(source, solid, (2, 2, 9, 9), (255, 255, 255), 1,
+            preview_context={'mode': 'manual_solid', 'solid': solid, 'other': other,
+                             'solid_color': (255, 255, 255), 'sample': None})
+        try:
+            dialog.show()
+            self.app.processEvents()
+            dialog.magic_tolerance_slider.setFocus()
+            QTest.keyClick(dialog.magic_tolerance_slider, Qt.Key.Key_F2)
+            self.assertEqual(dialog.edit_mode, 'manual_other')
+            dialog.on_edit_started()
+            edited = dialog.current_mask.copy(); edited[3:5, 3:5] = 255
+            dialog.on_mask_edited(edited)
+            self.assertTrue(np.all(dialog.current_other[3:5, 3:5] == 255))
+            self.assertFalse(np.any(dialog.current_solid[3:5, 3:5]))
+            QTest.keyClick(dialog.magic_tolerance_slider, Qt.Key.Key_F1)
+            self.assertEqual(dialog.edit_mode, 'manual_solid')
+            dialog.on_edit_started()
+            edited = dialog.current_mask.copy(); edited[6:8, 6:8] = 255
+            dialog.on_mask_edited(edited)
+            self.assertTrue(np.all(dialog.current_solid[6:8, 6:8] == 255))
+            self.assertFalse(np.any(dialog.current_other[6:8, 6:8]))
+            dialog.undo(); dialog.undo()
+            result_solid, result_other = dialog.result_masks()
+            np.testing.assert_array_equal(result_solid, solid[2:9, 2:9])
+            np.testing.assert_array_equal(result_other, other[2:9, 2:9])
+            dialog.redo(); dialog.redo()
+            self.assertFalse(np.any(dialog.current_solid[3:5, 3:5]))
+            self.assertFalse(np.any(dialog.current_other[6:8, 6:8]))
+            self.assertFalse(np.any(solid[6:8, 6:8]))
+            self.assertTrue(np.all(other[6:8, 6:8] == 255))
+        finally:
+            dialog.close()
+
+    def test_local_magic_sliders_change_selection_within_roi(self):
+        from solid_inpaint_ui import LocalEditDialog
+        source = np.full((12, 12, 3), 130, np.uint8)
+        source[5:7, 5:7] = 100
+        blank = np.zeros((12, 12), np.uint8)
+        dialog = LocalEditDialog(source, blank, (3, 3, 9, 9), (255, 255, 255), 1,
+                                 magic_tolerance=0, magic_expand_px=0)
+        try:
+            dialog.set_tool('magic')
+            exact = dialog.view._magic_selection_at((5, 5))
+            self.assertEqual(int(np.count_nonzero(exact)), 4)
+            dialog.magic_tolerance_slider.setValue(40)
+            self.assertEqual(dialog.magic_tolerance_label.text(), '容差 40')
+            self.assertEqual(int(np.count_nonzero(dialog.view._magic_selection_at((5, 5)))), 36)
+            dialog.magic_tolerance_slider.setValue(0)
+            dialog.magic_expand_slider.setValue(2)
+            self.assertEqual(dialog.magic_expand_label.text(), '擴展 2px')
+            expanded = dialog.view._magic_selection_at((5, 5))
+            self.assertGreater(int(np.count_nonzero(expanded)), 4)
+            self.assertFalse(np.any(expanded[:3]))
+            self.assertFalse(np.any(expanded[9:]))
+            self.assertFalse(np.any(expanded[:, :3]))
+            self.assertFalse(np.any(expanded[:, 9:]))
+            self.assertIsNone(dialog.view._magic_selection_at((2, 5)))
+        finally:
+            dialog.close()
+
+    def test_local_brush_stroke_blocks_mode_switch_until_committed(self):
+        from PySide6.QtCore import QRectF, Qt
+        from PySide6.QtTest import QTest
+        from solid_inpaint_ui import LocalEditDialog
+        source = np.full((12, 12, 3), 180, np.uint8)
+        blank = np.zeros((12, 12), np.uint8)
+        dialog = LocalEditDialog(source, blank, (2, 2, 9, 9), (255, 255, 255), 1)
+        try:
+            dialog.show()
+            self.app.processEvents()
+            dialog.view._set_brush_stroke_active(True)
+            dialog.on_edit_started()
+            dialog.view.mask[5, 5] = 255
+            dialog.on_brush_preview_changed(QRectF(5, 5, 1, 1))
+            dialog.magic_tolerance_slider.setFocus()
+            QTest.keyClick(dialog.magic_tolerance_slider, Qt.Key.Key_F2)
+            self.assertEqual(dialog.edit_mode, 'manual_solid')
+            self.assertTrue(dialog.solid_btn.isChecked())
+            dialog.view._set_brush_stroke_active(False)
+            dialog.on_mask_edited(dialog.view.mask)
+            QTest.keyClick(dialog.magic_tolerance_slider, Qt.Key.Key_F2)
+            self.assertEqual(dialog.edit_mode, 'manual_other')
+            self.assertEqual(dialog.current_solid[5, 5], 255)
+            self.assertEqual(dialog.current_other[5, 5], 0)
+        finally:
+            dialog.close()
+
+    def test_local_mode_and_magic_settings_sync_to_main_without_saving_masks(self):
+        from PySide6.QtWidgets import QDialog
+        from solid_inpaint_ui import LocalEditDialog
+        w = self.window
+        selection = np.zeros_like(self.mask, bool); selection[60:100, 80:100] = True
+        before = read_page_state(self.paths, self.path)
+        for result in (QDialog.DialogCode.Rejected, QDialog.DialogCode.Accepted):
+            with self.subTest(result=result):
+                w.set_edit_mode('manual_solid')
+                w.set_edit_tool('rect')
+                w.set_selection_combine_mode('local_edit_selection')
+                w.magic_tolerance_slider.setValue(18)
+                w.magic_expand_slider.setValue(3)
+
+                def change_settings(dialog):
+                    self.assertEqual(dialog.magic_tolerance_slider.value(), 18)
+                    self.assertEqual(dialog.magic_expand_slider.value(), 3)
+                    dialog.set_edit_mode('manual_other')
+                    self.assertEqual(w.edit_mode, 'manual_other')
+                    self.assertTrue(w.edit_manual_other_btn.isChecked())
+                    np.testing.assert_array_equal(w.mask_view.mask, w.current_manual_other)
+                    self.assertEqual(w.mask_view.tool, 'rect')
+                    self.assertEqual(w.selection_combine_mode, 'local_edit_selection')
+                    dialog.magic_tolerance_slider.setValue(44)
+                    dialog.magic_expand_slider.setValue(9)
+                    self.assertEqual(w.magic_tolerance_slider.value(), 44)
+                    self.assertEqual(w.magic_expand_slider.value(), 9)
+                    self.assertEqual(w.magic_tolerance_label.text(), '容差 44')
+                    self.assertEqual(w.magic_expand_label.text(), '擴展 9px')
+                    self.assertEqual(w.mask_view.magic_tolerance, 44)
+                    self.assertEqual(w.mask_view.magic_expand_px, 9)
+                    return result
+
+                with patch.object(LocalEditDialog, 'exec', change_settings):
+                    w.open_local_edit_dialog(selection)
+                self.assertEqual(w.edit_mode, 'manual_other')
+                self.assertEqual(w.mask_view.tool, 'rect')
+                self.assertEqual(w.selection_combine_mode, 'add')
+                self.assertEqual(w.magic_tolerance_slider.value(), 44)
+                self.assertEqual(w.magic_expand_slider.value(), 9)
+                np.testing.assert_array_equal(w.mask_view.mask, w.current_manual_other)
+                after = read_page_state(self.paths, self.path)
+                for key in before:
+                    np.testing.assert_array_equal(after[key], before[key])
+
+    def test_local_edit_apply_and_cancel_keep_both_classes_and_main_history(self):
+        from PySide6.QtWidgets import QDialog
+        from solid_inpaint_ui import LocalEditDialog
+        w = self.window
+        state = read_page_state(self.paths, self.path)
+        state['overlay'][62:66, 82:86] = 0
+        state['other'][62:66, 82:86] = 255
+        store.save_page(self.paths, self.path, state)
+        w.reload_current()
+        before = read_page_state(self.paths, self.path)
+        selection = np.zeros_like(self.mask, bool); selection[60:100, 80:100] = True
+
+        def edit_dialog(dialog):
+            self.assertEqual(dialog.magic_tolerance_slider.value(), w.mask_view.magic_tolerance)
+            self.assertEqual(dialog.magic_expand_slider.value(), w.mask_view.magic_expand_px)
+            dialog.set_edit_mode('manual_other')
+            dialog.on_edit_started()
+            other = dialog.current_mask.copy(); other[70:74, 88:92] = 255
+            dialog.on_mask_edited(other)
+            dialog.set_edit_mode('manual_solid')
+            dialog.on_edit_started()
+            solid = dialog.current_mask.copy(); solid[62:66, 82:86] = 255
+            dialog.on_mask_edited(solid)
+            return QDialog.DialogCode.Rejected
+
+        with patch.object(LocalEditDialog, 'exec', edit_dialog):
+            w.open_local_edit_dialog(selection)
+        cancelled = read_page_state(self.paths, self.path)
+        for key in before:
+            np.testing.assert_array_equal(cancelled[key], before[key])
+
+        def apply_dialog(dialog):
+            edit_dialog(dialog)
+            return QDialog.DialogCode.Accepted
+
+        initial_undo = len(w.undo_stack)
+        with patch.object(LocalEditDialog, 'exec', apply_dialog):
+            w.open_local_edit_dialog(selection)
+        after = read_page_state(self.paths, self.path)
+        self.assertEqual(len(w.undo_stack), initial_undo + 1)
+        self.assertTrue(np.all(after['other'][70:74, 88:92] == 255))
+        self.assertFalse(np.any(after['overlay'][70:74, 88:92, 3]))
+        self.assertTrue(np.all(after['overlay'][62:66, 82:86, 3] == 255))
+        self.assertFalse(np.any(after['other'][62:66, 82:86]))
+        self.assertTrue(np.all(after['edited'][62:66, 82:86] == 255))
+        w.undo_mask()
+        undone = read_page_state(self.paths, self.path)
+        np.testing.assert_array_equal(undone['overlay'], before['overlay'])
+        np.testing.assert_array_equal(undone['other'], before['other'])
+        w.redo_mask()
+        redone = read_page_state(self.paths, self.path)
+        np.testing.assert_array_equal(redone['overlay'], after['overlay'])
+        np.testing.assert_array_equal(redone['other'], after['other'])

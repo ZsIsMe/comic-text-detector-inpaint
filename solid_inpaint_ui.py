@@ -12,7 +12,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PySide6.QtCore import QObject, QPoint, QPointF, QRectF, QSettings, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QPolygonF
+from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QPolygonF, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -1665,6 +1665,10 @@ class RoiBoundaryItem(QGraphicsLineItem):
 
 
 class LocalEditDialog(QDialog):
+    modeChanged = Signal(str)
+    magicToleranceChanged = Signal(int)
+    magicExpandChanged = Signal(int)
+
     def __init__(
         self,
         source_bgr: np.ndarray,
@@ -1674,6 +1678,8 @@ class LocalEditDialog(QDialog):
         alpha: float,
         parent: QWidget | None = None,
         preview_context: dict | None = None,
+        magic_tolerance: int = DEFAULT_MAGIC_TOLERANCE,
+        magic_expand_px: int = DEFAULT_MAGIC_EXPAND_PX,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle('局部編輯')
@@ -1682,17 +1688,48 @@ class LocalEditDialog(QDialog):
             self.page_bgr = cv2.cvtColor(source_bgr, cv2.COLOR_GRAY2BGR)
         else:
             self.page_bgr = source_bgr[:, :, :3].copy()
+        self.preview_context = preview_context
+        self.edit_mode = preview_context['mode'] if preview_context is not None else 'manual_solid'
+        self.current_solid = np.where(
+            (preview_context['solid'] if preview_context is not None else mask) > 0, 255, 0,
+        ).astype(np.uint8)
+        self.current_other = np.where(
+            (preview_context['other'] if preview_context is not None else np.zeros_like(mask)) > 0,
+            255, 0,
+        ).astype(np.uint8)
         self.current_mask = np.where(mask > 0, 255, 0).astype(np.uint8)
+        if self.edit_mode == 'manual_solid':
+            self.current_solid = self.current_mask
+            self.current_other[self.current_solid > 0] = 0
+        else:
+            self.current_other = self.current_mask
+            self.current_solid[self.current_other > 0] = 0
         self.roi_box = self._clamp_roi_box(roi_box)
         self.source_bgr = self.page_bgr
         self.mask_color_bgr = mask_color_bgr
         self.alpha = alpha
-        self.preview_context = preview_context
-        self.undo_stack: list[np.ndarray] = []
-        self.redo_stack: list[np.ndarray] = []
+        self.undo_stack: list[tuple[np.ndarray, np.ndarray]] = []
+        self.redo_stack: list[tuple[np.ndarray, np.ndarray]] = []
         self._updating_roi_controls = False
 
         layout = QVBoxLayout(self)
+        mode_toolbar = QHBoxLayout()
+        self.solid_btn = QPushButton('F1 純色填充')
+        self.other_btn = QPushButton('F2 圖像修補')
+        self.mode_group = QButtonGroup(self)
+        self.mode_group.setExclusive(True)
+        for button in (self.solid_btn, self.other_btn):
+            button.setCheckable(True)
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            self.mode_group.addButton(button)
+            mode_toolbar.addWidget(button)
+        self.solid_btn.clicked.connect(lambda: self.set_edit_mode('manual_solid'))
+        self.other_btn.clicked.connect(lambda: self.set_edit_mode('manual_other'))
+        mode_toolbar.addStretch()
+        layout.addLayout(mode_toolbar)
+        QShortcut(QKeySequence(Qt.Key.Key_F1), self, activated=lambda: self.set_edit_mode('manual_solid'))
+        QShortcut(QKeySequence(Qt.Key.Key_F2), self, activated=lambda: self.set_edit_mode('manual_other'))
+
         toolbar = QHBoxLayout()
         self.rect_btn = QPushButton('矩形')
         self.brush_btn = QPushButton('筆刷')
@@ -1761,6 +1798,26 @@ class LocalEditDialog(QDialog):
         toolbar.addWidget(zoom_in_btn)
         layout.addLayout(toolbar)
 
+        magic_toolbar = QHBoxLayout()
+        self.magic_tolerance_slider = QSlider(Qt.Orientation.Horizontal)
+        self.magic_tolerance_slider.setRange(MIN_MAGIC_TOLERANCE, MAX_MAGIC_TOLERANCE)
+        self.magic_tolerance_slider.setValue(magic_tolerance)
+        self.magic_tolerance_slider.setFixedWidth(130)
+        self.magic_tolerance_label = QLabel(f'容差 {self.magic_tolerance_slider.value()}')
+        self.magic_expand_slider = QSlider(Qt.Orientation.Horizontal)
+        self.magic_expand_slider.setRange(MIN_MAGIC_EXPAND_PX, MAX_MAGIC_EXPAND_PX)
+        self.magic_expand_slider.setValue(magic_expand_px)
+        self.magic_expand_slider.setFixedWidth(120)
+        self.magic_expand_slider.setToolTip('魔法棒完成顏色選取後，再將選區向外擴展指定像素')
+        self.magic_expand_label = QLabel(f'擴展 {self.magic_expand_slider.value()}px')
+        magic_toolbar.addWidget(self.magic_tolerance_label)
+        magic_toolbar.addWidget(self.magic_tolerance_slider)
+        magic_toolbar.addSpacing(10)
+        magic_toolbar.addWidget(self.magic_expand_label)
+        magic_toolbar.addWidget(self.magic_expand_slider)
+        magic_toolbar.addStretch()
+        layout.addLayout(magic_toolbar)
+
         roi_toolbar = QHBoxLayout()
         roi_toolbar.addWidget(QLabel('ROI 範圍'))
         self.roi_x_spin = QSpinBox()
@@ -1795,6 +1852,10 @@ class LocalEditDialog(QDialog):
         layout.addLayout(roi_toolbar)
 
         self.view = MaskEditorView()
+        self.view.set_magic_tolerance(self.magic_tolerance_slider.value())
+        self.view.set_magic_expand_px(self.magic_expand_slider.value())
+        self.magic_tolerance_slider.valueChanged.connect(self.on_magic_tolerance_changed)
+        self.magic_expand_slider.valueChanged.connect(self.on_magic_expand_changed)
         self.view.editStarted.connect(self.on_edit_started)
         self.view.brushPreviewChanged.connect(self.on_brush_preview_changed)
         self.view.maskEdited.connect(self.on_mask_edited)
@@ -1808,9 +1869,10 @@ class LocalEditDialog(QDialog):
 
         hint = QLabel(
             '局部副本：先選「調整邊框」，再拖動藍色上下左右邊界調整 ROI；'
-            '切回其他工具後，邊界線不會攔截滑鼠。邊界不能互相穿越；只有按「套用」才會回寫主頁。'
+            '切回其他工具後，邊界線不會攔截滑鼠。邊界不能互相穿越；F1/F2 切換編輯類型，只有按「套用」才會回寫主頁。'
             '套索雙擊或 Enter 閉合；Esc 取消套索。'
         )
+        hint.setWordWrap(True)
         layout.addWidget(hint)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText('套用')
@@ -1821,6 +1883,8 @@ class LocalEditDialog(QDialog):
 
         self.refresh_preview(keep_view=False)
         self._sync_roi_controls()
+        self.solid_btn.setChecked(self.edit_mode == 'manual_solid')
+        self.other_btn.setChecked(self.edit_mode == 'manual_other')
         self.set_tool('brush')
         self.set_combine_mode('add')
         QTimer.singleShot(0, self.fit_view)
@@ -1828,6 +1892,11 @@ class LocalEditDialog(QDialog):
     def result_mask(self) -> np.ndarray:
         x1, y1, x2, y2 = self.roi_box
         return self.current_mask[y1:y2, x1:x2].copy()
+
+    def result_masks(self) -> tuple[np.ndarray, np.ndarray]:
+        x1, y1, x2, y2 = self.roi_box
+        return (self.current_solid[y1:y2, x1:x2].copy(),
+                self.current_other[y1:y2, x1:x2].copy())
 
     def result_roi_box(self) -> tuple[int, int, int, int]:
         return self.roi_box
@@ -1912,18 +1981,17 @@ class LocalEditDialog(QDialog):
             rect = (0, 0, self.source_bgr.shape[1], self.source_bgr.shape[0])
         x1, y1, x2, y2 = rect
         crop = lambda value: None if value is None else value[y1:y2, x1:x2]
-        context = self.preview_context
-        if context is None:
-            return _mask_overlay_image(crop(self.source_bgr), crop(mask), self.alpha, self.mask_color_bgr)
-        solid = crop(mask if context['mode'] == 'manual_solid' else context['solid']).copy()
-        other = crop(mask if context['mode'] == 'manual_other' else context['other']).copy()
-        if context['mode'] == 'manual_solid':
+        solid = crop(mask if self.edit_mode == 'manual_solid' else self.current_solid).copy()
+        other = crop(mask if self.edit_mode == 'manual_other' else self.current_other).copy()
+        if self.edit_mode == 'manual_solid':
             other[solid > 0] = 0
         else:
             solid[other > 0] = 0
+        context = self.preview_context
         return _editor_mask_preview(
-            crop(self.source_bgr), solid, other, self.alpha, crop(context['sample']),
-            context['solid_color'],
+            crop(self.source_bgr), solid, other, self.alpha,
+            crop(context.get('sample')) if context is not None else None,
+            context['solid_color'] if context is not None else self.mask_color_bgr,
         )
 
     def refresh_preview(self, keep_view: bool = True) -> None:
@@ -1936,7 +2004,10 @@ class LocalEditDialog(QDialog):
 
     def on_edit_started(self) -> None:
         x1, y1, x2, y2 = self.roi_box
-        self.undo_stack.append(self.current_mask[y1:y2, x1:x2].copy())
+        self.undo_stack.append((
+            self.current_solid[y1:y2, x1:x2].copy(),
+            self.current_other[y1:y2, x1:x2].copy(),
+        ))
         self.undo_stack = self.undo_stack[-MAX_UNDO_STEPS:]
         self.redo_stack = []
         if self.view.tool != 'brush':
@@ -1963,7 +2034,41 @@ class LocalEditDialog(QDialog):
     def on_mask_edited(self, mask: object) -> None:
         self.view.stop_live_mask_preview()
         self.current_mask = np.where(np.asarray(mask) > 0, 255, 0).astype(np.uint8)
+        if self.edit_mode == 'manual_solid':
+            self.current_solid = self.current_mask
+            self.current_other[self.current_solid > 0] = 0
+        else:
+            self.current_other = self.current_mask
+            self.current_solid[self.current_other > 0] = 0
         self.refresh_preview(keep_view=True)
+
+    def set_edit_mode(self, mode: str) -> None:
+        if mode not in EDIT_MODE_LABELS:
+            return
+        if self.view._brush_stroke_active:
+            self.solid_btn.setChecked(self.edit_mode == 'manual_solid')
+            self.other_btn.setChecked(self.edit_mode == 'manual_other')
+            return
+        if mode == self.edit_mode:
+            self.solid_btn.setChecked(mode == 'manual_solid')
+            self.other_btn.setChecked(mode == 'manual_other')
+            return
+        self.edit_mode = mode
+        self.current_mask = self.current_solid if mode == 'manual_solid' else self.current_other
+        self.solid_btn.setChecked(mode == 'manual_solid')
+        self.other_btn.setChecked(mode == 'manual_other')
+        self.refresh_preview(keep_view=True)
+        self.modeChanged.emit(mode)
+
+    def on_magic_tolerance_changed(self, value: int) -> None:
+        self.view.set_magic_tolerance(value)
+        self.magic_tolerance_label.setText(f'容差 {value}')
+        self.magicToleranceChanged.emit(value)
+
+    def on_magic_expand_changed(self, value: int) -> None:
+        self.view.set_magic_expand_px(value)
+        self.magic_expand_label.setText(f'擴展 {value}px')
+        self.magicExpandChanged.emit(value)
 
     def set_tool(self, tool: str) -> None:
         self.view.set_tool(tool)
@@ -1995,16 +2100,28 @@ class LocalEditDialog(QDialog):
         if not self.undo_stack:
             return
         x1, y1, x2, y2 = self.roi_box
-        self.redo_stack.append(self.current_mask[y1:y2, x1:x2].copy())
-        self.current_mask[y1:y2, x1:x2] = self.undo_stack.pop()
+        self.redo_stack.append((
+            self.current_solid[y1:y2, x1:x2].copy(),
+            self.current_other[y1:y2, x1:x2].copy(),
+        ))
+        solid, other = self.undo_stack.pop()
+        self.current_solid[y1:y2, x1:x2] = solid
+        self.current_other[y1:y2, x1:x2] = other
+        self.current_mask = self.current_solid if self.edit_mode == 'manual_solid' else self.current_other
         self.refresh_preview(keep_view=True)
 
     def redo(self) -> None:
         if not self.redo_stack:
             return
         x1, y1, x2, y2 = self.roi_box
-        self.undo_stack.append(self.current_mask[y1:y2, x1:x2].copy())
-        self.current_mask[y1:y2, x1:x2] = self.redo_stack.pop()
+        self.undo_stack.append((
+            self.current_solid[y1:y2, x1:x2].copy(),
+            self.current_other[y1:y2, x1:x2].copy(),
+        ))
+        solid, other = self.redo_stack.pop()
+        self.current_solid[y1:y2, x1:x2] = solid
+        self.current_other[y1:y2, x1:x2] = other
+        self.current_mask = self.current_solid if self.edit_mode == 'manual_solid' else self.current_other
         self.refresh_preview(keep_view=True)
 
     def fit_view(self) -> None:
@@ -5062,9 +5179,15 @@ class MainWindow(QMainWindow):
             preview_context={
                 'mode': self.edit_mode, 'solid': self.current_manual_solid.copy(),
                 'other': self.current_manual_other.copy(), 'solid_color': self.mask_display_color,
-                'sample': self.current_background_sample if self.show_background_sample else None,
+                'sample': self.current_background_sample.copy()
+                if self.show_background_sample and self.current_background_sample is not None else None,
             },
+            magic_tolerance=self.mask_view.magic_tolerance,
+            magic_expand_px=self.mask_view.magic_expand_px,
         )
+        dialog.modeChanged.connect(lambda mode: self.set_edit_mode(mode, reset_lower=False))
+        dialog.magicToleranceChanged.connect(self.magic_tolerance_slider.setValue)
+        dialog.magicExpandChanged.connect(self.magic_expand_slider.setValue)
         self.is_local_edit_active = True
         try:
             dialog_result = dialog.exec()
@@ -5075,19 +5198,21 @@ class MainWindow(QMainWindow):
             self.set_selection_combine_mode('add')
             self.reload_current(keep_view=True)
             return
-        edited_crop = dialog.result_mask()
+        solid_crop, other_crop = dialog.result_masks()
         x1, y1, x2, y2 = dialog.result_roi_box()
-        original_crop = current[y1:y2, x1:x2]
-        if edited_crop.shape != original_crop.shape or np.array_equal(edited_crop, original_crop):
+        original_solid = self.current_manual_solid[y1:y2, x1:x2]
+        original_other = self.current_manual_other[y1:y2, x1:x2]
+        if (solid_crop.shape != original_solid.shape or other_crop.shape != original_other.shape
+                or (np.array_equal(solid_crop, original_solid)
+                    and np.array_equal(other_crop, original_other))):
             self.status.showMessage('局部選區沒有修改。')
             self.set_selection_combine_mode('add')
             return
         self.push_undo_snapshot()
         self.mask_revision += 1
-        updated = current.copy()
-        updated[y1:y2, x1:x2] = edited_crop
-        self.set_current_edit_mask(updated)
-        if not self.save_current_edit_mask():
+        self.current_manual_solid[y1:y2, x1:x2] = solid_crop
+        self.current_manual_other[y1:y2, x1:x2] = other_crop
+        if not self.save_all_edit_masks():
             return
         self.mask_view.set_mask(self.current_edit_mask(), self.current_base.shape[:2])
         self.refresh_mask_preview(keep_view=True)
