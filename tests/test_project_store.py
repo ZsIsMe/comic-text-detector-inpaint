@@ -240,6 +240,116 @@ class EditorTests(unittest.TestCase):
         self.sample_patch.stop();self.settings_patch.stop()
         ProjectTests.tearDown(self)
 
+    def test_rect_local_intersection_extracts_dark_components_and_skips_dots(self):
+        from PySide6.QtCore import Qt
+        view = self.window.mask_view
+        source = np.full((24, 32, 3), 220, np.uint8)
+        source[6:13, 5:7] = 80
+        source[6:13, 11:13] = 150
+        source[7, 16] = 0
+        source[10, 18] = 0
+        old = np.zeros(source.shape[:2], np.uint8)
+        old[2:18, 2:21] = 255
+        old[2:6, 25:29] = 255
+        selection = np.zeros_like(old, bool)
+        selection[4:16, 4:20] = True
+        view.set_source_image(source)
+        view.set_tool('rect')
+        view.set_selection_combine_mode('local_intersect')
+        view.set_mask(old, old.shape)
+        view._apply_selection(selection, Qt.MouseButton.LeftButton)
+        expected = np.zeros_like(old)
+        expected[4:16, 4:20] = 255
+        expected[2:6, 25:29] = 255
+        np.testing.assert_array_equal(view.mask, expected)
+
+        view.set_local_intersect_dark_refine(True)
+        view.set_local_intersect_min_area(5)
+        view.set_local_intersect_dark_threshold(100)
+        view.set_mask(old, old.shape)
+        view._apply_selection(selection, Qt.MouseButton.LeftButton)
+        expected[:] = 0
+        expected[6:13, 5:7] = 255
+        expected[2:6, 25:29] = 255
+        np.testing.assert_array_equal(view.mask, expected)
+
+        view.set_local_intersect_dark_threshold(160)
+        view.set_mask(old, old.shape)
+        view._apply_selection(selection, Qt.MouseButton.LeftButton)
+        expected[6:13, 11:13] = 255
+        np.testing.assert_array_equal(view.mask, expected)
+
+        # No qualifying stroke leaves the old component alone.
+        source[:] = 220
+        source[7, 16] = 0
+        view.set_source_image(source)
+        view.set_mask(old, old.shape)
+        view._apply_selection(selection, Qt.MouseButton.LeftButton)
+        np.testing.assert_array_equal(view.mask, old)
+
+    def test_dark_refine_uses_original_pixels_for_clipped_roi_and_rect_only(self):
+        from PySide6.QtCore import Qt
+        view = self.window.mask_view
+        source = np.full((30, 30, 3), 220, np.uint8)
+        source[13:17, 14:16] = 70
+        old = np.zeros(source.shape[:2], np.uint8)
+        old[8:22, 8:22] = 255
+        selection = np.zeros_like(old, bool)
+        selection[10:20, 10:20] = True
+        view.set_source_image(source)
+        view.set_mask(old, old.shape)
+        view.set_selection_combine_mode('local_intersect')
+        view.set_local_intersect_dark_refine(True)
+        view.set_local_intersect_dark_threshold(100)
+        view.set_local_intersect_min_area(5)
+        view.set_edit_clip_rect((10, 10, 20, 20))
+        view.set_tool('rect')
+        view._apply_selection(selection, Qt.MouseButton.LeftButton)
+        expected = old.copy()
+        expected[10:20, 10:20] = 0
+        expected[13:17, 14:16] = 255
+        np.testing.assert_array_equal(view.mask, expected)
+
+        view.set_edit_clip_rect(None)
+        view.set_mask(old, old.shape)
+        view.set_local_intersect_offset(2)
+        view._apply_selection(selection, Qt.MouseButton.LeftButton)
+        self.assertFalse(np.any(view.mask[~selection]))
+        self.assertFalse(np.any(view.mask[selection & (old == 0)]))
+        self.assertGreater(np.count_nonzero(view.mask), 8)
+
+        view.set_local_intersect_offset(0)
+        for tool in ('magic', 'lasso'):
+            view.set_tool(tool)
+            view.set_mask(old, old.shape)
+            view._apply_selection(selection, Qt.MouseButton.LeftButton)
+            np.testing.assert_array_equal(view.mask > 0, selection)
+
+    def test_dark_refine_rect_saves_and_undo_restores_page(self):
+        from PySide6.QtCore import Qt
+        w = self.window
+        source = np.full(self.image.shape, 220, np.uint8)
+        source[70:80, 85:90] = 50
+        w.mask_view.set_source_image(source)
+        w.set_edit_tool('rect')
+        w.set_selection_combine_mode('local_intersect')
+        w.local_intersect_dark_checkbox.setChecked(True)
+        w.local_intersect_dark_threshold_spinbox.setValue(100)
+        w.local_intersect_min_area_spinbox.setValue(5)
+        before = read_page_state(self.paths, self.path)
+        self.assertTrue(w.mask_view._apply_rect((80, 60), (99, 99), Qt.MouseButton.LeftButton))
+        w.mask_view.editStarted.emit()
+        w.mask_view.maskEdited.emit(w.mask_view.mask.copy())
+        saved = read_page_state(self.paths, self.path)
+        self.assertEqual(np.count_nonzero(saved['overlay'][:, :, 3]), 50)
+        self.assertTrue(np.all(saved['overlay'][70:80, 85:90, 3] == 255))
+        w.undo_mask()
+        undone = read_page_state(self.paths, self.path)
+        np.testing.assert_array_equal(undone['overlay'], before['overlay'])
+        w.redo_mask()
+        redone = read_page_state(self.paths, self.path)
+        np.testing.assert_array_equal(redone['overlay'], saved['overlay'])
+
     def test_solid_bubble_transfer_moves_whole_selection_and_undo_restores_fill(self):
         w = self.window
         state = read_page_state(self.paths, self.path)

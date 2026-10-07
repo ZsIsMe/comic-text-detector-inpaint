@@ -665,6 +665,9 @@ class MaskEditorView(ImageView):
         self.magic_tolerance = DEFAULT_MAGIC_TOLERANCE
         self.magic_expand_px = DEFAULT_MAGIC_EXPAND_PX
         self.local_intersect_offset_px = DEFAULT_LOCAL_INTERSECT_OFFSET_PX
+        self.local_intersect_dark_refine = False
+        self.local_intersect_dark_threshold = 128
+        self.local_intersect_min_area = 30
         self.edit_clip_rect: tuple[int, int, int, int] | None = None
         self.mask: np.ndarray | None = None
         self.source_bgr: np.ndarray | None = None
@@ -783,6 +786,15 @@ class MaskEditorView(ImageView):
             MIN_LOCAL_INTERSECT_OFFSET_PX,
             min(MAX_LOCAL_INTERSECT_OFFSET_PX, int(offset_px)),
         )
+
+    def set_local_intersect_dark_refine(self, enabled: bool) -> None:
+        self.local_intersect_dark_refine = bool(enabled)
+
+    def set_local_intersect_dark_threshold(self, threshold: int) -> None:
+        self.local_intersect_dark_threshold = max(0, min(255, int(threshold)))
+
+    def set_local_intersect_min_area(self, area: int) -> None:
+        self.local_intersect_min_area = max(1, int(area))
 
     def set_edit_clip_rect(self, rect: tuple[int, int, int, int] | None) -> None:
         if rect == self.edit_clip_rect:
@@ -1438,7 +1450,7 @@ class MaskEditorView(ImageView):
             local_selection = np.asarray(selection[y1:y2, x1:x2], dtype=bool)
             self.mask = local_mask
             try:
-                self._apply_selection_operation(local_selection, button)
+                self._apply_selection_operation(local_selection, button, (x1, y1))
                 local_result = self.mask
             finally:
                 self.mask = original_mask
@@ -1446,7 +1458,12 @@ class MaskEditorView(ImageView):
             return
         self._apply_selection_operation(np.asarray(selection, dtype=bool), button)
 
-    def _apply_selection_operation(self, selection: np.ndarray, button: Qt.MouseButton) -> None:
+    def _apply_selection_operation(
+        self,
+        selection: np.ndarray,
+        button: Qt.MouseButton,
+        source_origin: tuple[int, int] = (0, 0),
+    ) -> None:
         if self.mask is None:
             return
         operation = self._selection_operation_for_button(button)
@@ -1457,7 +1474,7 @@ class MaskEditorView(ImageView):
             self.mask[selection] = 0
             return
         if operation == 'local_intersect':
-            self._apply_local_intersection(selection)
+            self._apply_local_intersection(selection, source_origin)
             return
         if operation == 'selection_inner' and self.tool == 'magic':
             self._apply_selection_inner(selection)
@@ -1480,7 +1497,11 @@ class MaskEditorView(ImageView):
             )
         )
 
-    def _apply_local_intersection(self, selection: np.ndarray) -> None:
+    def _apply_local_intersection(
+        self,
+        selection: np.ndarray,
+        source_origin: tuple[int, int] = (0, 0),
+    ) -> None:
         if self.mask is None:
             return
         current = self.mask > 0
@@ -1494,11 +1515,45 @@ class MaskEditorView(ImageView):
             return
         touched_components = np.isin(labels, hit_labels)
         local_result = touched_components & selection
+        refine = self.tool == 'rect' and self.local_intersect_dark_refine
+        if refine:
+            dark_selection = self._dark_components_in_selection(selection, source_origin)
+            if dark_selection is None or not np.any(local_result & dark_selection):
+                return
+            local_result &= dark_selection
         local_result = self._offset_local_intersection(local_result)
+        if refine:
+            local_result &= current & selection
         next_mask = current.copy()
         next_mask[touched_components] = False
         next_mask |= local_result
         self.mask[:, :] = np.where(next_mask, 255, 0).astype(np.uint8)
+
+    def _dark_components_in_selection(
+        self,
+        selection: np.ndarray,
+        source_origin: tuple[int, int],
+    ) -> np.ndarray | None:
+        if self.source_bgr is None:
+            return None
+        ys, xs = np.nonzero(selection)
+        if xs.size == 0:
+            return None
+        x1, x2 = int(xs.min()), int(xs.max()) + 1
+        y1, y2 = int(ys.min()), int(ys.max()) + 1
+        ox, oy = source_origin
+        source = self.source_bgr[oy + y1:oy + y2, ox + x1:ox + x2]
+        if source.shape[:2] != (y2 - y1, x2 - x1):
+            return None
+        gray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
+        dark = ((gray <= self.local_intersect_dark_threshold)
+                & selection[y1:y2, x1:x2]).astype(np.uint8)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(dark, connectivity=8)
+        keep = np.zeros(count, dtype=bool)
+        keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= self.local_intersect_min_area
+        result = np.zeros(selection.shape, dtype=bool)
+        result[y1:y2, x1:x2] = keep[labels]
+        return result
 
     def _apply_selection_inner(self, selection: np.ndarray) -> None:
         if self.mask is None:
@@ -3565,6 +3620,45 @@ class MainWindow(QMainWindow):
         self.local_intersect_offset_spinbox.setToolTip('局部交集結果的擴展/收縮；正數擴展，負數收縮')
         self.local_intersect_offset_spinbox.valueChanged.connect(self.on_local_intersect_offset_changed)
         local_intersect_layout.addWidget(self.local_intersect_offset_spinbox)
+        self.local_intersect_dark_controls = QWidget()
+        dark_layout = QHBoxLayout(self.local_intersect_dark_controls)
+        dark_layout.setContentsMargins(0, 0, 0, 0)
+        dark_layout.setSpacing(4)
+        self.local_intersect_dark_checkbox = QCheckBox('擷取深色筆畫')
+        self.local_intersect_dark_checkbox.setToolTip('矩形內依原圖亮度擷取深色區塊，過濾小網點，再收窄目前選區')
+        self.local_intersect_dark_checkbox.toggled.connect(
+            lambda enabled: self.mask_view.set_local_intersect_dark_refine(enabled)
+        )
+        dark_layout.addWidget(self.local_intersect_dark_checkbox)
+        dark_layout.addWidget(QLabel('門檻'))
+        self.local_intersect_dark_threshold_spinbox = QSpinBox()
+        self.local_intersect_dark_threshold_spinbox.setRange(0, 255)
+        self.local_intersect_dark_threshold_spinbox.setValue(128)
+        self.local_intersect_dark_threshold_spinbox.setFixedWidth(90)
+        self.local_intersect_dark_threshold_spinbox.setEnabled(False)
+        self.local_intersect_dark_threshold_spinbox.setToolTip('原圖灰階亮度小於或等於此值才視為深色')
+        self.local_intersect_dark_threshold_spinbox.valueChanged.connect(
+            lambda value: self.mask_view.set_local_intersect_dark_threshold(value)
+        )
+        self.local_intersect_dark_checkbox.toggled.connect(
+            self.local_intersect_dark_threshold_spinbox.setEnabled
+        )
+        dark_layout.addWidget(self.local_intersect_dark_threshold_spinbox)
+        dark_layout.addWidget(QLabel('最小面積'))
+        self.local_intersect_min_area_spinbox = QSpinBox()
+        self.local_intersect_min_area_spinbox.setRange(1, 100000)
+        self.local_intersect_min_area_spinbox.setValue(30)
+        self.local_intersect_min_area_spinbox.setFixedWidth(112)
+        self.local_intersect_min_area_spinbox.setEnabled(False)
+        self.local_intersect_min_area_spinbox.setToolTip('忽略小於此像素面積的深色連通區塊；小文字或標點可能需要補選')
+        self.local_intersect_min_area_spinbox.valueChanged.connect(
+            lambda value: self.mask_view.set_local_intersect_min_area(value)
+        )
+        self.local_intersect_dark_checkbox.toggled.connect(
+            self.local_intersect_min_area_spinbox.setEnabled
+        )
+        dark_layout.addWidget(self.local_intersect_min_area_spinbox)
+        dark_layout.addStretch()
         edit_toolbar.addWidget(self.rect_btn)
         edit_toolbar.addWidget(self.brush_btn)
         edit_toolbar.addWidget(self.magic_btn)
@@ -3609,6 +3703,7 @@ class MainWindow(QMainWindow):
         edit_toolbar.addWidget(self.redo_btn)
         edit_toolbar.addStretch()
         workspace_layout.addLayout(edit_toolbar)
+        workspace_layout.addWidget(self.local_intersect_dark_controls)
 
         view_options = QHBoxLayout()
         view_options.addWidget(QLabel('Mask / 原圖'))
@@ -4933,6 +5028,9 @@ class MainWindow(QMainWindow):
             and self.selection_combine_mode == 'local_intersect'
         )
         self.local_intersect_controls.setVisible(visible)
+        self.local_intersect_dark_controls.setVisible(
+            visible and self.mask_view.tool == 'rect'
+        )
 
     def update_selection_combine_status(self) -> None:
         if getattr(self, 'mask_view', None) is None:
