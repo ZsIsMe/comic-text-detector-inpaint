@@ -350,6 +350,408 @@ class EditorTests(unittest.TestCase):
         redone = read_page_state(self.paths, self.path)
         np.testing.assert_array_equal(redone['overlay'], saved['overlay'])
 
+    def test_magic_drag_samples_path_once_and_saves_one_undo(self):
+        from PySide6.QtCore import QPointF, Qt
+        from PySide6.QtTest import QTest
+        w = self.window
+        w.set_edit_mode('manual_other')
+        w.set_edit_tool('magic')
+        w.set_selection_combine_mode('add')
+        source = np.full(self.image.shape, 220, np.uint8)
+        source[68:73, 84:87] = 80
+        source[68:73, 94:97] = 80
+        w.mask_view.set_source_image(source)
+        w.magic_scope_spinbox.setValue(32)
+        w.magic_dwell_spinbox.setValue(0)
+        w.magic_tolerance_slider.setValue(0)
+        w.show()
+        view = w.mask_view
+        start = view.mapFromScene(QPointF(85, 70))
+        end = view.mapFromScene(QPointF(95, 70))
+        self.assertEqual(view.image_point_from_view(start), (85, 70))
+        before_undo = len(w.undo_stack)
+        viewport = view.viewport()
+        QTest.mousePress(viewport, Qt.MouseButton.LeftButton, pos=start)
+        QTest.mouseMove(viewport, end)
+        self.assertEqual(len(w.undo_stack), before_undo)
+        self.assertFalse(np.any(w.current_manual_other))
+        QTest.mouseRelease(viewport, Qt.MouseButton.LeftButton, pos=end)
+        self.assertEqual(len(w.undo_stack), before_undo + 1)
+        saved = read_page_state(self.paths, self.path)['other']
+        self.assertEqual(np.count_nonzero(saved), 30)
+        w.undo_mask()
+        self.assertFalse(np.any(read_page_state(self.paths, self.path)['other']))
+        w.redo_mask()
+        np.testing.assert_array_equal(read_page_state(self.paths, self.path)['other'], saved)
+
+    def test_magic_drag_to_outside_roi_still_samples_up_to_boundary(self):
+        from PySide6.QtCore import QPointF, Qt
+        from PySide6.QtTest import QTest
+        w = self.window
+        w.set_edit_mode('manual_other')
+        w.set_edit_tool('magic')
+        source = np.full(self.image.shape, 220, np.uint8)
+        source[68:73, 84:87] = 80
+        source[68:73, 97:100] = 80
+        source[68:73, 100:104] = 80
+        view = w.mask_view
+        view.set_source_image(source)
+        view.set_edit_clip_rect((80, 60, 100, 90))
+        view.set_magic_scope_px(32)
+        view.set_magic_dwell_ms(0)
+        view.set_magic_tolerance(0)
+        w.show()
+        start = view.mapFromScene(QPointF(85, 70))
+        outside = view.mapFromScene(QPointF(105, 70))
+        viewport = view.viewport()
+        QTest.mousePress(viewport, Qt.MouseButton.LeftButton, pos=start)
+        QTest.mouseMove(viewport, outside)
+        QTest.mouseRelease(viewport, Qt.MouseButton.LeftButton, pos=outside)
+        saved = read_page_state(self.paths, self.path)['other']
+        self.assertTrue(np.all(saved[68:73, 84:87] == 255))
+        self.assertTrue(np.all(saved[68:73, 97:100] == 255))
+        self.assertFalse(np.any(saved[:, 100:]))
+
+    def test_magic_fixed_color_scope_and_preview_are_crop_bound(self):
+        from solid_inpaint_ui import MaskEditorView
+        view = MaskEditorView()
+        source = np.full((100, 100, 3), 220, np.uint8)
+        source[49:52, 49:52] = 100
+        source[49:52, 58:61] = 100
+        source[49:52, 63:65] = 100
+        source[49:52, 65:68] = 115
+        old = np.full((100, 100), 255, np.uint8)
+        view.set_source_image(source)
+        view.set_mask(old, old.shape)
+        view.set_tool('magic')
+        view.set_selection_combine_mode('subtract')
+        view.set_magic_tolerance(10)
+        view.set_magic_scope_px(32)
+        view.set_magic_dwell_ms(0)
+        rect = view._magic_scope_rect((50, 50))
+        self.assertEqual(rect, (34, 34, 66, 66))
+        with patch('solid_inpaint_ui.cv2.floodFill', wraps=cv2.floodFill) as flood:
+            view._magic_preview_pending_point = (50, 50)
+            view._refresh_magic_preview()
+        self.assertEqual(flood.call_args.args[0].shape[:2], (32, 32))
+        self.assertLessEqual(view._magic_preview_item.pixmap().width(), 32)
+
+        view._start_magic_stroke((50, 50))
+        view._advance_magic_stroke((60, 50))
+        view._advance_magic_stroke((66, 50))  # Cross the square boundary.
+        view._finish_magic_stroke()
+        self.assertFalse(np.any(view.mask[49:52, 49:52]))
+        self.assertFalse(np.any(view.mask[49:52, 58:61]))
+        self.assertFalse(np.any(view.mask[49:52, 63:65]))
+        self.assertTrue(np.all(view.mask[49:52, 65:68] == 255))
+        self.assertTrue(np.all(view.mask[:34] == 255))
+        self.assertTrue(np.all(view.mask[:, 66:] == 255))
+
+        view.set_mask(old, old.shape)
+        view.set_edit_clip_rect((40, 40, 56, 56))
+        self.assertEqual(view._magic_scope_rect((50, 50)), (40, 40, 56, 56))
+        selection = view._magic_selection_at((50, 50))
+        self.assertFalse(np.any(selection[:40]))
+        self.assertFalse(np.any(selection[56:]))
+        self.assertFalse(np.any(selection[:, :40]))
+        self.assertFalse(np.any(selection[:, 56:]))
+
+        # A dark path outside the ROI cannot join two regions inside it.
+        u_shape = np.full((10, 10, 3), 220, np.uint8)
+        u_shape[2, 3:8] = 80
+        u_shape[3:8, 3] = 80
+        u_shape[3:8, 7] = 80
+        view.set_source_image(u_shape)
+        view.set_mask(np.zeros((10, 10), np.uint8), (10, 10))
+        view.set_edit_clip_rect((3, 3, 8, 8))
+        view.set_magic_tolerance(0)
+        clipped = view._magic_selection_at((3, 5))
+        self.assertTrue(np.all(clipped[3:8, 3]))
+        self.assertFalse(np.any(clipped[3:8, 7]))
+
+    def test_magic_stroke_cancel_emit_modes_and_intersection(self):
+        from PySide6.QtCore import Qt
+        from solid_inpaint_ui import MaskEditorView
+        source = np.full((80, 80, 3), 220, np.uint8)
+        source[38:42, 38:42] = 80
+        source[38:42, 48:52] = 80
+        old = np.zeros((80, 80), np.uint8)
+        old[35:45, 35:45] = 255
+        old[35:45, 45:55] = 255
+        old[5:10, 5:10] = 255
+        view = MaskEditorView()
+        view.set_source_image(source)
+        view.set_mask(old, old.shape)
+        view.set_tool('magic')
+        view.set_magic_scope_px(32)
+        view.set_magic_dwell_ms(0)
+        view.set_magic_tolerance(0)
+        view.set_selection_combine_mode('local_intersect')
+        rect = view._magic_scope_rect((39, 39))
+        local = view._magic_local_selection((39, 39), rect)
+        additions, removals, fallback = view._magic_preview_masks(local, rect)
+        self.assertEqual(additions.shape, (32, 32))
+        self.assertEqual(removals.shape, (32, 32))
+        self.assertFalse(np.any(fallback))
+        np.testing.assert_array_equal(view.mask, old)
+        view._start_magic_stroke((39, 39))
+        view._advance_magic_stroke((49, 39))
+        view.cancel_magic_stroke()
+        np.testing.assert_array_equal(view.mask, old)
+        view._start_magic_stroke((39, 39))
+        view._advance_magic_stroke((49, 39))
+        view._finish_magic_stroke()
+        self.assertTrue(np.all(view.mask[5:10, 5:10] == 255))
+        self.assertFalse(np.any(view.mask[35:45, 35:55] & (source[35:45, 35:55, 0] == 220)))
+        self.assertTrue(np.all(view.mask[38:42, 38:42] == 255))
+        self.assertTrue(np.all(view.mask[38:42, 48:52] == 255))
+
+        view.set_mask(old, old.shape)
+        view.set_selection_combine_mode('selection_inner')
+        ring = np.ones((32, 32), dtype=bool)
+        ring[10:14, 10:14] = False
+        view._apply_magic_selection_local(ring, rect, Qt.MouseButton.LeftButton)
+        self.assertTrue(np.all(view.mask[5:10, 5:10] == 255))
+        self.assertTrue(np.all(view.mask[rect[1] + 10:rect[1] + 14,
+                                          rect[0] + 10:rect[0] + 14] == 255))
+
+        selections = []
+        view.selectionCreated.connect(lambda selection: selections.append(selection))
+        for mode in ('transfer_from_other', 'ctd_detect_selection',
+                     'local_edit_selection'):
+            view.set_selection_combine_mode(mode)
+            view._start_magic_stroke((39, 39))
+            view._advance_magic_stroke((49, 39))
+            view._finish_magic_stroke()
+            self.assertEqual(len(selections), 1)
+            self.assertEqual(np.count_nonzero(selections.pop()), 32)
+
+    def test_magic_scope_setting_restores_and_local_dialog_syncs(self):
+        from PySide6.QtWidgets import QDialog
+        from solid_inpaint_ui import LocalEditDialog, MainWindow
+        w = self.window
+        w.magic_scope_spinbox.setValue(768)
+        w.magic_dwell_spinbox.setValue(225)
+        self.assertEqual(w.mask_view.magic_scope_px, 768)
+        self.assertEqual(w.mask_view.magic_dwell_ms, 225)
+        self.assertEqual(int(w.settings.value('magic_scope_px')), 768)
+        self.assertEqual(int(w.settings.value('magic_dwell_ms')), 225)
+        another = MainWindow()
+        try:
+            self.assertEqual(another.magic_scope_spinbox.value(), 768)
+            self.assertEqual(another.mask_view.magic_scope_px, 768)
+            self.assertEqual(another.magic_dwell_spinbox.value(), 225)
+        finally:
+            another.close()
+        selection = np.zeros_like(self.mask, bool)
+        selection[60:100, 80:100] = True
+
+        def inspect_dialog(dialog):
+            self.assertEqual(dialog.magic_scope_spinbox.value(), 768)
+            self.assertEqual(dialog.magic_dwell_spinbox.value(), 225)
+            dialog.magic_scope_spinbox.setValue(512)
+            dialog.magic_dwell_spinbox.setValue(75)
+            self.assertEqual(dialog.view.magic_scope_px, 512)
+            self.assertEqual(dialog.view.magic_dwell_ms, 75)
+            self.assertEqual(w.magic_scope_spinbox.value(), 512)
+            self.assertEqual(w.magic_dwell_spinbox.value(), 75)
+            return QDialog.DialogCode.Rejected
+
+        with patch.object(LocalEditDialog, 'exec', inspect_dialog):
+            w.open_local_edit_dialog(selection)
+        self.assertEqual(int(w.settings.value('magic_scope_px')), 512)
+        self.assertEqual(int(w.settings.value('magic_dwell_ms')), 75)
+
+    def test_magic_dwell_waits_for_endpoint_and_scope_follows_cursor(self):
+        from PySide6.QtTest import QTest
+        from solid_inpaint_ui import MaskEditorView
+        source = np.full((80, 100, 3), 220, np.uint8)
+        source[38:42, 19:23] = 80
+        source[38:42, 39:43] = 80
+        source[38:42, 59:64] = 80
+        blank = np.zeros(source.shape[:2], np.uint8)
+        view = MaskEditorView()
+        view.set_source_image(source)
+        view.set_mask(blank, blank.shape)
+        view.set_tool('magic')
+        view.set_magic_scope_px(32)
+        view.set_magic_tolerance(0)
+        view.set_magic_dwell_ms(50)
+        view._start_magic_stroke((20, 40))
+        self.assertTrue(np.all(view._magic_stroke_covered[38:42, 19:23]))
+        view._advance_magic_stroke((60, 40))
+        self.assertEqual(view._magic_stroke_rect, (44, 24, 76, 56))
+        self.assertTrue(view._magic_candidate_item.isVisible())
+        self.assertFalse(np.any(view._magic_stroke_covered[38:42, 59:64]))
+        QTest.qWait(75)
+        self.assertTrue(np.all(view._magic_stroke_covered[38:42, 59:64]))
+        self.assertFalse(view._magic_candidate_item.isVisible())
+        view._finish_magic_stroke()
+        self.assertTrue(np.all(view.mask[38:42, 19:23]))
+        self.assertTrue(np.all(view.mask[38:42, 59:64]))
+        self.assertFalse(np.any(view.mask[38:42, 39:43]))
+
+        # With a long connected stroke, moving the scope extends confirmed pixels.
+        source[:] = 220
+        source[39:41, 20:81] = 80
+        view.set_source_image(source)
+        view.set_mask(blank, blank.shape)
+        view._start_magic_stroke((20, 40))
+        view._advance_magic_stroke((40, 40))
+        view._advance_magic_stroke((60, 40))
+        view._finish_magic_stroke()
+        self.assertTrue(np.all(view.mask[39:41, 20:76]))
+        self.assertFalse(np.any(view.mask[39:41, 76:81]))
+
+    def test_magic_dwell_quick_pass_release_and_candidate_reset(self):
+        from PySide6.QtTest import QTest
+        from solid_inpaint_ui import MaskEditorView
+        source = np.full((80, 100, 3), 220, np.uint8)
+        source[38:42, 19:23] = 80
+        source[38:42, 40:51] = 80
+        blank = np.zeros(source.shape[:2], np.uint8)
+        view = MaskEditorView()
+        view.set_source_image(source)
+        view.set_mask(blank, blank.shape)
+        view.set_tool('magic')
+        view.set_magic_scope_px(32)
+        view.set_magic_tolerance(0)
+        view.set_magic_dwell_ms(50)
+        view._start_magic_stroke((20, 40))
+        view._advance_magic_stroke((42, 40))
+        QTest.qWait(20)
+        view._advance_magic_stroke((48, 40))  # Same component, new scope.
+        QTest.qWait(40)
+        self.assertTrue(np.all(view._magic_stroke_covered[38:42, 40:51]))
+        view._finish_magic_stroke()
+
+        view.set_mask(blank, blank.shape)
+        view._start_magic_stroke((20, 40))
+        view._advance_magic_stroke((42, 40))
+        QTest.qWait(20)
+        view._advance_magic_stroke((70, 40))  # White cancels the candidate.
+        QTest.qWait(40)
+        self.assertFalse(np.any(view._magic_stroke_covered[38:42, 40:51]))
+        view._advance_magic_stroke((42, 40))
+        QTest.qWait(25)
+        self.assertFalse(np.any(view._magic_stroke_covered[38:42, 40:51]))
+        view._finish_magic_stroke()  # Early release never adds pending.
+        self.assertFalse(np.any(view.mask[38:42, 40:51]))
+
+    def test_magic_dwell_qtest_stationary_release_saves_once(self):
+        from PySide6.QtCore import QPointF, Qt
+        from PySide6.QtTest import QTest
+        w = self.window
+        w.set_edit_mode('manual_other')
+        w.set_edit_tool('magic')
+        w.magic_scope_spinbox.setValue(32)
+        w.magic_dwell_spinbox.setValue(50)
+        w.magic_tolerance_slider.setValue(0)
+        source = np.full(self.image.shape, 220, np.uint8)
+        source[68:73, 84:87] = 80
+        source[68:73, 94:97] = 80
+        view = w.mask_view
+        view.set_source_image(source)
+        w.show()
+        start = view.mapFromScene(QPointF(85, 70))
+        second = view.mapFromScene(QPointF(95, 70))
+        viewport = view.viewport()
+        before_undo = len(w.undo_stack)
+        QTest.mousePress(viewport, Qt.MouseButton.LeftButton, pos=start)
+        QTest.mouseMove(viewport, second)
+        self.assertEqual(len(w.undo_stack), before_undo)
+        QTest.qWait(75)
+        QTest.mouseRelease(viewport, Qt.MouseButton.LeftButton, pos=second)
+        saved = read_page_state(self.paths, self.path)['other']
+        self.assertEqual(np.count_nonzero(saved), 30)
+        self.assertEqual(len(w.undo_stack), before_undo + 1)
+        w.undo_mask()
+        self.assertFalse(np.any(read_page_state(self.paths, self.path)['other']))
+        w.redo_mask()
+        np.testing.assert_array_equal(read_page_state(self.paths, self.path)['other'], saved)
+
+    def test_magic_dwell_leave_and_lifecycle_cancel_timer(self):
+        from PySide6.QtTest import QTest
+        from solid_inpaint_ui import MaskEditorView
+        source = np.full((80, 100, 3), 220, np.uint8)
+        source[38:42, 19:23] = 80
+        source[38:42, 59:63] = 80
+        blank = np.zeros(source.shape[:2], np.uint8)
+        view = MaskEditorView()
+        view.set_source_image(source)
+        view.set_mask(blank, blank.shape)
+        view.set_tool('magic')
+        view.set_magic_dwell_ms(50)
+        view.set_magic_scope_px(32)
+        view.set_magic_tolerance(0)
+        view._start_magic_stroke((20, 40))
+        view._advance_magic_stroke((60, 40))
+        QTest.qWait(25)
+        view._advance_magic_stroke(None)  # Leave viewport.
+        QTest.qWait(40)
+        view._advance_magic_stroke((60, 40))
+        QTest.qWait(25)
+        self.assertFalse(np.any(view._magic_stroke_covered[38:42, 59:63]))
+        QTest.qWait(40)
+        self.assertTrue(np.all(view._magic_stroke_covered[38:42, 59:63]))
+        view.cancel_magic_stroke()
+
+        for cancel in (
+            lambda: view.set_tool('rect'),
+            lambda: view.set_source_image(source),
+            lambda: view.set_edit_clip_rect((0, 0, 80, 80)),
+            lambda: view.set_mask(blank, blank.shape),
+        ):
+            view.set_tool('magic')
+            view._start_magic_stroke((20, 40))
+            view._advance_magic_stroke((60, 40))
+            self.assertTrue(view._magic_dwell_timer.isActive())
+            cancel()
+            QTest.qWait(65)
+            self.assertIsNone(view._magic_stroke_rect)
+            self.assertFalse(view._magic_dwell_timer.isActive())
+            self.assertFalse(view._magic_candidate_item.isVisible())
+            view.set_edit_clip_rect(None)
+
+    def test_magic_dwell_release_confirms_elapsed_candidate_before_timer_dispatch(self):
+        import time
+        from solid_inpaint_ui import MaskEditorView
+        source = np.full((80, 100, 3), 220, np.uint8)
+        source[38:42, 19:23] = 80
+        source[38:42, 59:63] = 80
+        blank = np.zeros(source.shape[:2], np.uint8)
+        view = MaskEditorView()
+        view.set_source_image(source)
+        view.set_mask(blank, blank.shape)
+        view.set_tool('magic')
+        view.set_magic_dwell_ms(30)
+        view._start_magic_stroke((20, 40))
+        view._advance_magic_stroke((60, 40))
+        time.sleep(0.045)  # No Qt event dispatch during sleep.
+        self.assertTrue(view._magic_dwell_timer.isActive())
+        view._finish_magic_stroke()
+        self.assertTrue(np.all(view.mask[38:42, 59:63] == 255))
+
+    def test_magic_escape_and_setting_change_cancel_active_stroke(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+        w = self.window
+        w.set_edit_tool('magic')
+        w.show()
+        view = w.mask_view
+        original = view.mask.copy()
+        view._start_magic_stroke((85, 70))
+        self.assertTrue(w.is_mask_stroke_active)
+        QTest.keyClick(view, Qt.Key.Key_Escape)
+        self.assertIsNone(view._magic_stroke_rect)
+        self.assertFalse(w.is_mask_stroke_active)
+        np.testing.assert_array_equal(view.mask, original)
+
+        view._start_magic_stroke((85, 70))
+        w.magic_tolerance_slider.setValue(w.magic_tolerance_slider.value() + 1)
+        self.assertIsNone(view._magic_stroke_rect)
+        np.testing.assert_array_equal(view.mask, original)
+
     def test_solid_bubble_transfer_moves_whole_selection_and_undo_restores_fill(self):
         w = self.window
         state = read_page_state(self.paths, self.path)

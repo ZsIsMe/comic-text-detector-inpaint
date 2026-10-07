@@ -7,6 +7,7 @@ import os
 import os.path as osp
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import cv2
@@ -112,6 +113,12 @@ MAX_MAGIC_TOLERANCE = 100
 DEFAULT_MAGIC_EXPAND_PX = 0
 MIN_MAGIC_EXPAND_PX = 0
 MAX_MAGIC_EXPAND_PX = 80
+DEFAULT_MAGIC_SCOPE_PX = 1024
+MIN_MAGIC_SCOPE_PX = 32
+MAX_MAGIC_SCOPE_PX = 8192
+DEFAULT_MAGIC_DWELL_MS = 150
+MIN_MAGIC_DWELL_MS = 0
+MAX_MAGIC_DWELL_MS = 1000
 DEFAULT_LOCAL_INTERSECT_OFFSET_PX = 0
 MIN_LOCAL_INTERSECT_OFFSET_PX = -80
 MAX_LOCAL_INTERSECT_OFFSET_PX = 80
@@ -664,6 +671,8 @@ class MaskEditorView(ImageView):
         self.brush_radius = DEFAULT_BRUSH_RADIUS
         self.magic_tolerance = DEFAULT_MAGIC_TOLERANCE
         self.magic_expand_px = DEFAULT_MAGIC_EXPAND_PX
+        self.magic_scope_px = DEFAULT_MAGIC_SCOPE_PX
+        self.magic_dwell_ms = DEFAULT_MAGIC_DWELL_MS
         self.local_intersect_offset_px = DEFAULT_LOCAL_INTERSECT_OFFSET_PX
         self.local_intersect_dark_refine = False
         self.local_intersect_dark_threshold = 128
@@ -688,10 +697,27 @@ class MaskEditorView(ImageView):
         self._lasso_preview: QGraphicsPolygonItem | None = None
         self._brush_cursor: QGraphicsEllipseItem | None = None
         self._magic_preview_item: QGraphicsPixmapItem | None = None
+        self._magic_scope_item: QGraphicsRectItem | None = None
+        self._magic_candidate_item: QGraphicsPixmapItem | None = None
         self._magic_preview_pending_point: tuple[int, int] | None = None
         self._magic_preview_point: tuple[int, int] | None = None
-        self._magic_preview_cache_key: tuple[int, int, int, int] | None = None
+        self._magic_preview_cache_key: tuple[int, int, int, int, int] | None = None
         self._magic_preview_has_content = False
+        self._magic_stroke_rect: tuple[int, int, int, int] | None = None
+        self._magic_stroke_last_point: tuple[int, int] | None = None
+        self._magic_stroke_lower: tuple[int, int, int] | None = None
+        self._magic_stroke_upper: tuple[int, int, int] | None = None
+        self._magic_stroke_covered: np.ndarray | None = None
+        self._magic_stroke_selection: np.ndarray | None = None
+        self._magic_stroke_allowed: np.ndarray | None = None
+        self._magic_confirmed_items: list[QGraphicsPixmapItem] = []
+        self._magic_candidate_since_ns = 0
+        self._magic_candidate_rect: tuple[int, int, int, int] | None = None
+        self._magic_candidate_mask: np.ndarray | None = None
+        self._magic_dwell_timer = QTimer(self)
+        self._magic_dwell_timer.setSingleShot(True)
+        self._magic_dwell_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._magic_dwell_timer.timeout.connect(self._confirm_magic_candidate)
         self._magic_preview_timer = QTimer(self)
         self._magic_preview_timer.setSingleShot(True)
         self._magic_preview_timer.setInterval(MAGIC_PREVIEW_DELAY_MS)
@@ -722,6 +748,7 @@ class MaskEditorView(ImageView):
         shape: tuple[int, int],
         reset_brush_line: bool = False,
     ) -> None:
+        self.cancel_magic_stroke()
         self.image_shape = shape
         self._clear_magic_preview()
         self.cancel_lasso()
@@ -735,6 +762,7 @@ class MaskEditorView(ImageView):
             self.mask = np.where(mask > 0, 255, 0).astype(np.uint8)
 
     def set_source_image(self, image: np.ndarray | None) -> None:
+        self.cancel_magic_stroke()
         self._clear_magic_preview()
         if image is None:
             self.source_bgr = None
@@ -745,6 +773,7 @@ class MaskEditorView(ImageView):
             self.source_bgr = image[:, :, :3].copy()
 
     def set_tool(self, tool: str) -> None:
+        self.cancel_magic_stroke()
         if tool != 'lasso':
             self.cancel_lasso()
         if tool != 'brush':
@@ -761,6 +790,8 @@ class MaskEditorView(ImageView):
 
     def set_selection_combine_mode(self, mode: str) -> None:
         if mode in SELECTION_COMBINE_LABELS:
+            if mode != self.selection_combine_mode:
+                self.cancel_magic_stroke()
             self.selection_combine_mode = mode
             self._invalidate_magic_preview()
             if self._lasso_points:
@@ -771,15 +802,26 @@ class MaskEditorView(ImageView):
         self._move_brush_cursor_to_last_position()
 
     def set_magic_tolerance(self, tolerance: int) -> None:
+        self.cancel_magic_stroke()
         self.magic_tolerance = max(MIN_MAGIC_TOLERANCE, min(MAX_MAGIC_TOLERANCE, int(tolerance)))
         self._invalidate_magic_preview()
 
     def set_magic_expand_px(self, expand_px: int) -> None:
+        self.cancel_magic_stroke()
         self.magic_expand_px = max(
             MIN_MAGIC_EXPAND_PX,
             min(MAX_MAGIC_EXPAND_PX, int(expand_px)),
         )
         self._invalidate_magic_preview()
+
+    def set_magic_scope_px(self, scope_px: int) -> None:
+        self.cancel_magic_stroke()
+        self.magic_scope_px = max(MIN_MAGIC_SCOPE_PX, min(MAX_MAGIC_SCOPE_PX, int(scope_px)))
+        self._invalidate_magic_preview()
+
+    def set_magic_dwell_ms(self, dwell_ms: int) -> None:
+        self.cancel_magic_stroke()
+        self.magic_dwell_ms = max(MIN_MAGIC_DWELL_MS, min(MAX_MAGIC_DWELL_MS, int(dwell_ms)))
 
     def set_local_intersect_offset(self, offset_px: int) -> None:
         self.local_intersect_offset_px = max(
@@ -799,6 +841,7 @@ class MaskEditorView(ImageView):
     def set_edit_clip_rect(self, rect: tuple[int, int, int, int] | None) -> None:
         if rect == self.edit_clip_rect:
             return
+        self.cancel_magic_stroke()
         self.edit_clip_rect = rect
         self._invalidate_magic_preview()
 
@@ -877,11 +920,7 @@ class MaskEditorView(ImageView):
             return
         if self.tool == 'magic':
             self._clear_magic_preview()
-            if self._apply_magic_wand(point, event.button()):
-                self._begin_edit_once()
-                if self.mask is not None:
-                    self.maskEdited.emit(self.mask.copy())
-            self._edit_started = False
+            self._start_magic_stroke(point)
             event.accept()
             return
         if self.tool == 'lasso':
@@ -923,6 +962,7 @@ class MaskEditorView(ImageView):
             event.accept()
             return
         hover_point = self.image_point_from_view(event.position().toPoint())
+        stroke_point = hover_point
         if hover_point is not None and not self._point_in_edit_clip(hover_point):
             hover_point = None
         self._update_brush_cursor(hover_point)
@@ -931,6 +971,10 @@ class MaskEditorView(ImageView):
             self._lasso_hover_point = hover_point
             self._update_lasso_preview()
         if self._active_button is None:
+            event.accept()
+            return
+        if self.tool == 'magic' and self._magic_stroke_rect is not None:
+            self._advance_magic_stroke(stroke_point)
             event.accept()
             return
         point = self.image_point_from_view(event.position().toPoint(), clamp=True)
@@ -981,6 +1025,16 @@ class MaskEditorView(ImageView):
         if event.button() != self._active_button:
             super().mouseReleaseEvent(event)
             return
+        if self.tool == 'magic' and self._magic_stroke_rect is not None:
+            point = self.image_point_from_view(event.position().toPoint())
+            if (self._magic_candidate_rect is not None
+                    and time.monotonic_ns() - self._magic_candidate_since_ns
+                    >= self.magic_dwell_ms * 1_000_000):
+                self._confirm_magic_candidate()
+            self._advance_magic_stroke(point)
+            self._finish_magic_stroke()
+            event.accept()
+            return
         point = self.image_point_from_view(event.position().toPoint(), clamp=True)
         if point is not None:
             point = self._constrain_point_to_edit_clip(point)
@@ -1019,11 +1073,24 @@ class MaskEditorView(ImageView):
 
     def leaveEvent(self, event) -> None:
         self._update_brush_cursor(None)
-        self._clear_magic_preview()
+        if self._magic_stroke_rect is None:
+            self._clear_magic_preview()
+        else:
+            self._magic_stroke_last_point = None
+            self._clear_magic_candidate()
+            if self._magic_scope_item is not None:
+                self._magic_scope_item.setVisible(False)
         if self.tool == 'lasso' and self._lasso_points:
             self._lasso_hover_point = None
             self._update_lasso_preview()
         super().leaveEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape and self._magic_stroke_rect is not None:
+            self.cancel_magic_stroke()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _is_pan_modifier(self, modifiers: Qt.KeyboardModifier) -> bool:
         return bool(
@@ -1230,63 +1297,362 @@ class MaskEditorView(ImageView):
         point: tuple[int, int],
         button: Qt.MouseButton,
     ) -> bool:
-        if self.mask is None or self.source_bgr is None:
+        rect = self._magic_scope_rect(point)
+        if rect is None:
             return False
-        selection = self._magic_selection_at(point)
-        if selection is None:
-            return False
-        if not np.any(selection):
+        local = self._magic_local_selection(point, rect)
+        if local is None:
             return False
         if self._should_emit_selection(button):
-            self.selectionCreated.emit(selection.copy())
+            self.selectionCreated.emit(self._magic_full_selection(local, rect))
             return False
-        old_mask = self.mask.copy()
-        self._apply_selection(selection, button)
-        return not np.array_equal(old_mask, self.mask)
+        return self._apply_magic_selection_local(local, rect, button)
 
-    def _magic_selection_at(self, point: tuple[int, int]) -> np.ndarray | None:
-        """Return the flood-fill selection under a point without changing the mask."""
+    def _magic_scope_rect(self, point: tuple[int, int]) -> tuple[int, int, int, int] | None:
         if self.mask is None or self.source_bgr is None:
             return None
         height, width = self.mask.shape[:2]
         if not (0 <= point[0] < width and 0 <= point[1] < height):
             return None
-        if self.edit_clip_rect is None:
-            x1, y1, x2, y2 = 0, 0, width, height
-        else:
-            clip_x1, clip_y1, clip_x2, clip_y2 = self.edit_clip_rect
-            x1 = max(0, min(width, int(clip_x1)))
-            y1 = max(0, min(height, int(clip_y1)))
-            x2 = max(x1, min(width, int(clip_x2)))
-            y2 = max(y1, min(height, int(clip_y2)))
+        side = self.magic_scope_px
+        x1, y1 = point[0] - side // 2, point[1] - side // 2
+        x2, y2 = x1 + side, y1 + side
+        x1, y1, x2, y2 = max(0, x1), max(0, y1), min(width, x2), min(height, y2)
+        if self.edit_clip_rect is not None:
+            cx1, cy1, cx2, cy2 = self.edit_clip_rect
+            x1, y1, x2, y2 = max(x1, cx1), max(y1, cy1), min(x2, cx2), min(y2, cy2)
+        if x1 >= x2 or y1 >= y2 or not (x1 <= point[0] < x2 and y1 <= point[1] < y2):
+            return None
+        return x1, y1, x2, y2
+
+    def _magic_local_selection(
+        self, point: tuple[int, int], rect: tuple[int, int, int, int],
+    ) -> np.ndarray | None:
+        if self.source_bgr is None:
+            return None
+        x1, y1, x2, y2 = rect
         if not (x1 <= point[0] < x2 and y1 <= point[1] < y2):
             return None
-
-        # Flood-fill the ROI crop itself. Clipping only the finished selection is
-        # insufficient because a connected region can leave the ROI and re-enter
-        # it elsewhere, making pixels outside the local editor affect the result.
-        local_source = self.source_bgr[y1:y2, x1:x2]
-        local_height, local_width = local_source.shape[:2]
-        flood_mask = np.zeros((local_height + 2, local_width + 2), dtype=np.uint8)
-        tolerance = int(self.magic_tolerance)
-        diff = (tolerance, tolerance, tolerance)
+        source = self.source_bgr[y1:y2, x1:x2]
+        height, width = source.shape[:2]
+        flood_mask = np.zeros((height + 2, width + 2), np.uint8)
+        diff = (self.magic_tolerance,) * 3
         flags = 8 | cv2.FLOODFILL_FIXED_RANGE | cv2.FLOODFILL_MASK_ONLY | (255 << 8)
-        cv2.floodFill(
-            local_source.copy(),
-            flood_mask,
-            (point[0] - x1, point[1] - y1),
-            (0, 0, 0),
-            diff,
-            diff,
-            flags,
-        )
-        local_selection = flood_mask[1:local_height + 1, 1:local_width + 1] > 0
-        if not np.any(local_selection):
+        cv2.floodFill(source.copy(), flood_mask, (point[0] - x1, point[1] - y1),
+                      (0, 0, 0), diff, diff, flags)
+        return self._expand_magic_selection(flood_mask[1:height + 1, 1:width + 1] > 0)
+
+    def _magic_full_selection(
+        self, local: np.ndarray, rect: tuple[int, int, int, int],
+    ) -> np.ndarray:
+        assert self.mask is not None
+        full = np.zeros(self.mask.shape[:2], dtype=bool)
+        x1, y1, x2, y2 = rect
+        full[y1:y2, x1:x2] = local
+        return full
+
+    def _apply_magic_selection_local(
+        self, local: np.ndarray, rect: tuple[int, int, int, int], button: Qt.MouseButton,
+    ) -> bool:
+        if self.mask is None:
+            return False
+        x1, y1, x2, y2 = rect
+        original = self.mask
+        crop = original[y1:y2, x1:x2].copy()
+        self.mask = crop
+        try:
+            self._apply_selection_operation(local, button, (x1, y1))
+            changed = not np.array_equal(crop, original[y1:y2, x1:x2])
+        finally:
+            self.mask = original
+        if changed:
+            original[y1:y2, x1:x2] = crop
+        return changed
+
+    def _start_magic_stroke(self, point: tuple[int, int]) -> None:
+        rect = self._magic_scope_rect(point)
+        if rect is None or self.source_bgr is None or self.mask is None:
+            return
+        seed = self.source_bgr[point[1], point[0]].astype(np.int16)
+        tolerance = int(self.magic_tolerance)
+        self._magic_stroke_lower = tuple(np.maximum(0, seed - tolerance).astype(np.uint8).tolist())
+        self._magic_stroke_upper = tuple(np.minimum(255, seed + tolerance).astype(np.uint8).tolist())
+        self._magic_stroke_rect = rect
+        self._magic_stroke_covered = np.zeros(self.mask.shape[:2], dtype=bool)
+        self._magic_stroke_selection = np.zeros(self.mask.shape[:2], dtype=bool)
+        self._magic_stroke_allowed = np.zeros(self.mask.shape[:2], dtype=bool)
+        self._magic_stroke_last_point = None
+        self._active_button = Qt.MouseButton.LeftButton
+        self._edit_started = False
+        self._set_brush_stroke_active(True)
+        self._show_magic_scope(rect)
+        component = self._magic_component_at(point)
+        if component is not None:
+            current_rect, labels, label = component
+            self._confirm_magic_patch(current_rect, labels == label)
+        self._magic_stroke_last_point = point
+
+    def _magic_component_at(
+        self, point: tuple[int, int],
+    ) -> tuple[tuple[int, int, int, int], np.ndarray, int] | None:
+        rect = self._magic_scope_rect(point)
+        if rect is None or self.source_bgr is None:
             return None
-        local_selection = self._expand_magic_selection(local_selection)
-        selection = np.zeros((height, width), dtype=bool)
-        selection[y1:y2, x1:x2] = local_selection
-        return selection
+        x1, y1, x2, y2 = rect
+        eligible = cv2.inRange(
+            self.source_bgr[y1:y2, x1:x2],
+            self._magic_stroke_lower, self._magic_stroke_upper,
+        )
+        _, labels = cv2.connectedComponents(eligible, connectivity=8)
+        self._magic_stroke_rect = rect
+        self._show_magic_scope(rect)
+        return rect, labels, int(labels[point[1] - y1, point[0] - x1])
+
+    def _advance_magic_stroke(self, point: tuple[int, int] | None) -> None:
+        if self._magic_stroke_rect is None:
+            return
+        if point is None:
+            self._magic_stroke_last_point = None
+            self._clear_magic_candidate()
+            if self._magic_scope_item is not None:
+                self._magic_scope_item.setVisible(False)
+            return
+        if self.magic_dwell_ms == 0:
+            self._advance_magic_fast(point)
+            return
+        self._magic_stroke_last_point = point
+        component = self._magic_component_at(point)
+        if component is None:
+            self._clear_magic_candidate()
+            if self._magic_scope_item is not None:
+                self._magic_scope_item.setVisible(False)
+            return
+        rect, labels, label = component
+        if label == 0:
+            self._clear_magic_candidate()
+            return
+        current = labels == label
+        x1, y1, x2, y2 = rect
+        covered = self._magic_stroke_covered
+        if covered is not None and np.any(covered[y1:y2, x1:x2] & current):
+            self._clear_magic_candidate()
+            self._confirm_magic_patch(rect, current)
+            return
+        if not self._same_magic_candidate(rect, current):
+            self._clear_magic_candidate()
+            self._magic_candidate_since_ns = time.monotonic_ns()
+            self._magic_dwell_timer.start(self.magic_dwell_ms)
+        self._magic_candidate_rect = rect
+        self._magic_candidate_mask = current
+        self._show_magic_candidate(rect, current)
+        if time.monotonic_ns() - self._magic_candidate_since_ns >= self.magic_dwell_ms * 1_000_000:
+            self._confirm_magic_candidate()
+
+    def _same_magic_candidate(
+        self, rect: tuple[int, int, int, int], current: np.ndarray,
+    ) -> bool:
+        previous_rect, previous_mask = self._magic_candidate_rect, self._magic_candidate_mask
+        if previous_rect is None or previous_mask is None:
+            return False
+        x1 = max(rect[0], previous_rect[0])
+        y1 = max(rect[1], previous_rect[1])
+        x2 = min(rect[2], previous_rect[2])
+        y2 = min(rect[3], previous_rect[3])
+        if x1 >= x2 or y1 >= y2:
+            return False
+        return bool(np.any(
+            current[y1 - rect[1]:y2 - rect[1], x1 - rect[0]:x2 - rect[0]]
+            & previous_mask[y1 - previous_rect[1]:y2 - previous_rect[1],
+                            x1 - previous_rect[0]:x2 - previous_rect[0]]
+        ))
+
+    def _advance_magic_fast(self, point: tuple[int, int]) -> None:
+        start = self._magic_stroke_last_point or point
+        self._magic_stroke_last_point = point
+        if self.mask is None:
+            return
+        height, width = self.mask.shape[:2]
+        bounds = self.edit_clip_rect or (0, 0, width, height)
+        bx1, by1, bx2, by2 = bounds
+        intersects, local_start, local_end = cv2.clipLine(
+            (0, 0, bx2 - bx1, by2 - by1),
+            (start[0] - bx1, start[1] - by1),
+            (point[0] - bx1, point[1] - by1),
+        )
+        if not intersects:
+            return
+        sx, sy = local_start[0] + bx1, local_start[1] + by1
+        ex, ey = local_end[0] + bx1, local_end[1] + by1
+        distance = max(abs(ex - sx), abs(ey - sy))
+        steps = max(1, (distance + max(1, self.magic_scope_px // 4) - 1)
+                    // max(1, self.magic_scope_px // 4))
+        previous = (sx, sy)
+        for i in range(steps + 1):
+            current = (
+                round(sx + (ex - sx) * i / steps),
+                round(sy + (ey - sy) * i / steps),
+            )
+            component = self._magic_component_at(current)
+            if component is None:
+                previous = current
+                continue
+            rect, labels, _ = component
+            x1, y1, x2, y2 = rect
+            clipped, line_start, line_end = cv2.clipLine(
+                (0, 0, x2 - x1, y2 - y1),
+                (previous[0] - x1, previous[1] - y1),
+                (current[0] - x1, current[1] - y1),
+            )
+            previous = current
+            if not clipped:
+                continue
+            line_steps = max(abs(line_end[0] - line_start[0]), abs(line_end[1] - line_start[1]))
+            selected_labels = set()
+            for j in range(line_steps + 1):
+                x = round(line_start[0] + (line_end[0] - line_start[0]) * j / max(line_steps, 1))
+                y = round(line_start[1] + (line_end[1] - line_start[1]) * j / max(line_steps, 1))
+                label = int(labels[y, x])
+                if label:
+                    selected_labels.add(label)
+            for label in selected_labels:
+                self._confirm_magic_patch(rect, labels == label)
+
+    def _confirm_magic_candidate(self) -> None:
+        rect, mask = self._magic_candidate_rect, self._magic_candidate_mask
+        if self._magic_stroke_rect is None or rect is None or mask is None:
+            return
+        elapsed_ms = (time.monotonic_ns() - self._magic_candidate_since_ns) / 1_000_000
+        if elapsed_ms < self.magic_dwell_ms:
+            self._magic_dwell_timer.start(max(1, int(self.magic_dwell_ms - elapsed_ms + 1)))
+            return
+        self._clear_magic_candidate()
+        self._confirm_magic_patch(rect, mask)
+
+    def _confirm_magic_patch(
+        self, rect: tuple[int, int, int, int], mask: np.ndarray,
+    ) -> None:
+        covered = self._magic_stroke_covered
+        selection = self._magic_stroke_selection
+        allowed = self._magic_stroke_allowed
+        if covered is None or selection is None or allowed is None:
+            return
+        x1, y1, x2, y2 = rect
+        covered_crop = covered[y1:y2, x1:x2]
+        selection_crop = selection[y1:y2, x1:x2]
+        expanded = self._expand_magic_selection(mask)
+        fresh = expanded & ~selection_crop
+        allowed[y1:y2, x1:x2] = True
+        covered_crop |= mask
+        if not np.any(fresh):
+            return
+        selection_crop |= expanded
+        # During a sweep, show confirmed pixels themselves. Computing each new
+        # patch's operation delta in isolation can mark an earlier confirmed
+        # part as removed, even though release applies the union once.
+        ys, xs = np.where(fresh)
+        left, right = int(xs.min()), int(xs.max()) + 1
+        top, bottom = int(ys.min()), int(ys.max()) + 1
+        local = fresh[top:bottom, left:right]
+        overlay = np.zeros((*local.shape, 4), dtype=np.uint8)
+        overlay[local] = (*MAGIC_PREVIEW_COLOR_BGR, MAGIC_PREVIEW_ALPHA)
+        item = QGraphicsPixmapItem(QPixmap.fromImage(_qimage_from_rgba(overlay)))
+        item.setOffset(x1 + left, y1 + top)
+        item.setZValue(12)
+        item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.scene().addItem(item)
+        self._magic_confirmed_items.append(item)
+
+    def _finish_magic_stroke(self) -> None:
+        if self._magic_candidate_rect is not None:
+            self._confirm_magic_candidate()
+        covered, allowed = self._magic_stroke_selection, self._magic_stroke_allowed
+        self.cancel_magic_stroke()
+        if covered is None or allowed is None or not np.any(covered) or self.mask is None:
+            return
+        if self._should_emit_selection(Qt.MouseButton.LeftButton):
+            self.selectionCreated.emit(covered)
+        elif self._apply_magic_stroke_selection(covered, allowed):
+            self._begin_edit_once()
+            self.maskEdited.emit(self.mask.copy())
+            self._edit_started = False
+
+    def _apply_magic_stroke_selection(self, selection: np.ndarray, allowed: np.ndarray) -> bool:
+        if self.mask is None:
+            return False
+        ys, xs = np.where(allowed)
+        if xs.size == 0:
+            return False
+        x1, x2 = int(xs.min()), int(xs.max()) + 1
+        y1, y2 = int(ys.min()), int(ys.max()) + 1
+        rect = (x1, y1, x2, y2)
+        original = self.mask
+        crop = original[y1:y2, x1:x2]
+        next_crop = crop.copy()
+        self.mask = next_crop
+        try:
+            self._apply_selection_operation(selection[y1:y2, x1:x2],
+                                            Qt.MouseButton.LeftButton, (x1, y1))
+        finally:
+            self.mask = original
+        next_crop[~allowed[y1:y2, x1:x2]] = crop[~allowed[y1:y2, x1:x2]]
+        if np.array_equal(crop, next_crop):
+            return False
+        crop[:] = next_crop
+        return True
+
+    def _clear_magic_candidate(self) -> None:
+        self._magic_dwell_timer.stop()
+        self._magic_candidate_since_ns = 0
+        self._magic_candidate_rect = None
+        self._magic_candidate_mask = None
+        if self._magic_candidate_item is not None:
+            self._magic_candidate_item.setVisible(False)
+
+    def _show_magic_candidate(
+        self, rect: tuple[int, int, int, int], mask: np.ndarray,
+    ) -> None:
+        ys, xs = np.where(mask)
+        if xs.size == 0:
+            return
+        x1, x2 = int(xs.min()), int(xs.max()) + 1
+        y1, y2 = int(ys.min()), int(ys.max()) + 1
+        crop = mask[y1:y2, x1:x2]
+        overlay = np.zeros((*crop.shape, 4), dtype=np.uint8)
+        overlay[crop] = (255, 225, 150, 72)
+        if self._magic_candidate_item is None:
+            self._magic_candidate_item = QGraphicsPixmapItem()
+            self._magic_candidate_item.setZValue(13)
+            self._magic_candidate_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self.scene().addItem(self._magic_candidate_item)
+        self._magic_candidate_item.setOffset(rect[0] + x1, rect[1] + y1)
+        self._magic_candidate_item.setPixmap(QPixmap.fromImage(_qimage_from_rgba(overlay)))
+        self._magic_candidate_item.setVisible(True)
+
+    def cancel_magic_stroke(self) -> None:
+        if self._magic_stroke_rect is not None:
+            self._active_button = None
+            self._set_brush_stroke_active(False)
+            self._edit_started = False
+        self._clear_magic_candidate()
+        for item in self._magic_confirmed_items:
+            self.scene().removeItem(item)
+        self._magic_confirmed_items.clear()
+        self._magic_stroke_rect = None
+        self._magic_stroke_last_point = None
+        self._magic_stroke_lower = None
+        self._magic_stroke_upper = None
+        self._magic_stroke_covered = None
+        self._magic_stroke_selection = None
+        self._magic_stroke_allowed = None
+        self._clear_magic_preview()
+
+    def _magic_selection_at(self, point: tuple[int, int]) -> np.ndarray | None:
+        """Return the flood-fill selection under a point without changing the mask."""
+        rect = self._magic_scope_rect(point)
+        if rect is None:
+            return None
+        local = self._magic_local_selection(point, rect)
+        return None if local is None else self._magic_full_selection(local, rect)
 
     def _expand_magic_selection(self, selection: np.ndarray) -> np.ndarray:
         expand_px = int(self.magic_expand_px)
@@ -1318,6 +1684,8 @@ class MaskEditorView(ImageView):
         return expanded
 
     def _update_magic_preview(self, point: tuple[int, int] | None) -> None:
+        if self._magic_stroke_rect is not None:
+            return
         if (
             self.tool != 'magic'
             or point is None
@@ -1327,12 +1695,18 @@ class MaskEditorView(ImageView):
         ):
             self._clear_magic_preview()
             return
+        rect = self._magic_scope_rect(point)
+        if rect is None:
+            self._clear_magic_preview()
+            return
+        self._show_magic_scope(rect)
         self._magic_preview_pending_point = point
         key = (
             point[0],
             point[1],
             int(self.magic_tolerance),
             int(self.magic_expand_px),
+            int(self.magic_scope_px),
         )
         if key == self._magic_preview_cache_key:
             if self._magic_preview_item is not None:
@@ -1345,18 +1719,25 @@ class MaskEditorView(ImageView):
         point = self._magic_preview_pending_point
         if self.tool != 'magic' or point is None:
             return
-        selection = self._magic_selection_at(point)
+        rect = self._magic_scope_rect(point)
+        selection = None if rect is None else self._magic_local_selection(point, rect)
         self._magic_preview_point = point
         self._magic_preview_cache_key = (
             point[0],
             point[1],
             int(self.magic_tolerance),
             int(self.magic_expand_px),
+            int(self.magic_scope_px),
         )
-        if selection is None or self.mask is None:
+        if selection is None or rect is None or self.mask is None:
             self._clear_magic_preview()
             return
-        additions, removals, fallback = self._magic_preview_masks(selection)
+        self._render_magic_preview(selection, rect)
+
+    def _render_magic_preview(
+        self, selection: np.ndarray, rect: tuple[int, int, int, int],
+    ) -> None:
+        additions, removals, fallback = self._magic_preview_masks(selection, rect)
         visible_selection = additions | removals | fallback
         if not np.any(visible_selection):
             self._magic_preview_has_content = False
@@ -1390,17 +1771,20 @@ class MaskEditorView(ImageView):
             self._magic_preview_item.setAcceptHoverEvents(False)
             self._magic_preview_item.setTransformationMode(Qt.TransformationMode.FastTransformation)
             self.scene().addItem(self._magic_preview_item)
-        self._magic_preview_item.setOffset(x1, y1)
+        self._magic_preview_item.setOffset(rect[0] + x1, rect[1] + y1)
         self._magic_preview_item.setPixmap(QPixmap.fromImage(_qimage_from_rgba(overlay)))
         self._magic_preview_has_content = True
         self._magic_preview_item.setVisible(True)
 
-    def _magic_preview_masks(self, selection: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _magic_preview_masks(
+        self, selection: np.ndarray, rect: tuple[int, int, int, int],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Build the visible add/remove delta for the selected combine operation."""
         if self.mask is None:
             empty = np.zeros_like(selection, dtype=bool)
             return empty, empty, empty
-        current = self.mask > 0
+        x1, y1, x2, y2 = rect
+        current = self.mask[y1:y2, x1:x2] > 0
         operation = self.selection_combine_mode
         if operation == 'add':
             empty = np.zeros_like(selection, dtype=bool)
@@ -1416,8 +1800,8 @@ class MaskEditorView(ImageView):
             )
         original_mask = self.mask
         try:
-            self.mask = original_mask.copy()
-            self._apply_selection(selection, Qt.MouseButton.LeftButton)
+            self.mask = original_mask[y1:y2, x1:x2].copy()
+            self._apply_selection_operation(selection, Qt.MouseButton.LeftButton, (x1, y1))
             next_mask = self.mask > 0
         finally:
             self.mask = original_mask
@@ -1439,6 +1823,22 @@ class MaskEditorView(ImageView):
         self._magic_preview_has_content = False
         if self._magic_preview_item is not None:
             self._magic_preview_item.setVisible(False)
+        if self._magic_scope_item is not None and self._magic_stroke_rect is None:
+            self._magic_scope_item.setVisible(False)
+
+    def _show_magic_scope(self, rect: tuple[int, int, int, int]) -> None:
+        if self._magic_scope_item is None:
+            self._magic_scope_item = QGraphicsRectItem()
+            pen = QPen(QColor('#70bdff'), 2, Qt.PenStyle.DashLine)
+            pen.setCosmetic(True)
+            self._magic_scope_item.setPen(pen)
+            self._magic_scope_item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+            self._magic_scope_item.setZValue(11)
+            self._magic_scope_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self.scene().addItem(self._magic_scope_item)
+        x1, y1, x2, y2 = rect
+        self._magic_scope_item.setRect(x1, y1, x2 - x1, y2 - y1)
+        self._magic_scope_item.setVisible(True)
 
     def _apply_selection(self, selection: np.ndarray, button: Qt.MouseButton) -> None:
         if self.mask is None:
@@ -1723,6 +2123,8 @@ class LocalEditDialog(QDialog):
     modeChanged = Signal(str)
     magicToleranceChanged = Signal(int)
     magicExpandChanged = Signal(int)
+    magicScopeChanged = Signal(int)
+    magicDwellChanged = Signal(int)
 
     def __init__(
         self,
@@ -1735,6 +2137,8 @@ class LocalEditDialog(QDialog):
         preview_context: dict | None = None,
         magic_tolerance: int = DEFAULT_MAGIC_TOLERANCE,
         magic_expand_px: int = DEFAULT_MAGIC_EXPAND_PX,
+        magic_scope_px: int = DEFAULT_MAGIC_SCOPE_PX,
+        magic_dwell_ms: int = DEFAULT_MAGIC_DWELL_MS,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle('局部編輯')
@@ -1865,11 +2269,29 @@ class LocalEditDialog(QDialog):
         self.magic_expand_slider.setFixedWidth(120)
         self.magic_expand_slider.setToolTip('魔法棒完成顏色選取後，再將選區向外擴展指定像素')
         self.magic_expand_label = QLabel(f'擴展 {self.magic_expand_slider.value()}px')
+        self.magic_scope_spinbox = QSpinBox()
+        self.magic_scope_spinbox.setRange(MIN_MAGIC_SCOPE_PX, MAX_MAGIC_SCOPE_PX)
+        self.magic_scope_spinbox.setValue(magic_scope_px)
+        self.magic_scope_spinbox.setSuffix(' px')
+        self.magic_scope_spinbox.setFixedWidth(115)
+        self.magic_scope_spinbox.setToolTip('以指標為中心的魔法棒範圍邊長；拖掃時跟隨指標')
+        self.magic_dwell_spinbox = QSpinBox()
+        self.magic_dwell_spinbox.setRange(MIN_MAGIC_DWELL_MS, MAX_MAGIC_DWELL_MS)
+        self.magic_dwell_spinbox.setValue(magic_dwell_ms)
+        self.magic_dwell_spinbox.setSuffix(' ms')
+        self.magic_dwell_spinbox.setFixedWidth(105)
+        self.magic_dwell_spinbox.setToolTip('第一點立即確認；其後在同一區塊停留指定毫秒才加入。淡色為候選，濃色為已確認；0 ms 沿路徑立即選取')
         magic_toolbar.addWidget(self.magic_tolerance_label)
         magic_toolbar.addWidget(self.magic_tolerance_slider)
         magic_toolbar.addSpacing(10)
         magic_toolbar.addWidget(self.magic_expand_label)
         magic_toolbar.addWidget(self.magic_expand_slider)
+        magic_toolbar.addSpacing(10)
+        magic_toolbar.addWidget(QLabel('魔法棒範圍'))
+        magic_toolbar.addWidget(self.magic_scope_spinbox)
+        magic_toolbar.addSpacing(10)
+        magic_toolbar.addWidget(QLabel('停留'))
+        magic_toolbar.addWidget(self.magic_dwell_spinbox)
         magic_toolbar.addStretch()
         layout.addLayout(magic_toolbar)
 
@@ -1909,8 +2331,12 @@ class LocalEditDialog(QDialog):
         self.view = MaskEditorView()
         self.view.set_magic_tolerance(self.magic_tolerance_slider.value())
         self.view.set_magic_expand_px(self.magic_expand_slider.value())
+        self.view.set_magic_scope_px(self.magic_scope_spinbox.value())
+        self.view.set_magic_dwell_ms(self.magic_dwell_spinbox.value())
         self.magic_tolerance_slider.valueChanged.connect(self.on_magic_tolerance_changed)
         self.magic_expand_slider.valueChanged.connect(self.on_magic_expand_changed)
+        self.magic_scope_spinbox.valueChanged.connect(self.on_magic_scope_changed)
+        self.magic_dwell_spinbox.valueChanged.connect(self.on_magic_dwell_changed)
         self.view.editStarted.connect(self.on_edit_started)
         self.view.brushPreviewChanged.connect(self.on_brush_preview_changed)
         self.view.maskEdited.connect(self.on_mask_edited)
@@ -2125,6 +2551,14 @@ class LocalEditDialog(QDialog):
         self.magic_expand_label.setText(f'擴展 {value}px')
         self.magicExpandChanged.emit(value)
 
+    def on_magic_scope_changed(self, value: int) -> None:
+        self.view.set_magic_scope_px(value)
+        self.magicScopeChanged.emit(value)
+
+    def on_magic_dwell_changed(self, value: int) -> None:
+        self.view.set_magic_dwell_ms(value)
+        self.magicDwellChanged.emit(value)
+
     def set_tool(self, tool: str) -> None:
         self.view.set_tool(tool)
         self.rect_btn.setChecked(tool == 'rect')
@@ -2187,6 +2621,9 @@ class LocalEditDialog(QDialog):
         self.view.centerOn((x1 + x2) / 2.0, (y1 + y2) / 2.0)
 
     def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape and self.view._magic_stroke_rect is not None:
+            self.view.cancel_magic_stroke()
+            return
         if event.key() == Qt.Key.Key_B:
             self.set_tool('brush')
             return
@@ -3260,6 +3697,8 @@ class MainWindow(QMainWindow):
         self.edit_mode = 'manual_solid'
         self.selection_combine_mode = 'add'
         self.settings = QSettings('ComicTextDetector', 'SolidInpaintUI')
+        self.magic_scope_px = self._load_magic_scope_px()
+        self.magic_dwell_ms = self._load_magic_dwell_ms()
         self.mask_alpha_percent = self._load_mask_alpha_percent()
         self.other_mask_preview_expand_px = self._load_other_mask_preview_expand_px()
         self.other_mask_display_color = self._load_other_mask_display_color()
@@ -3605,6 +4044,29 @@ class MainWindow(QMainWindow):
         self.magic_expand_slider.setFixedWidth(120)
         self.magic_expand_slider.setToolTip('魔法棒完成顏色選取後，再將選區向外擴展指定像素')
         self.magic_expand_slider.valueChanged.connect(self.on_magic_expand_changed)
+        self.magic_scope_controls = QWidget()
+        magic_scope_layout = QHBoxLayout(self.magic_scope_controls)
+        magic_scope_layout.setContentsMargins(0, 0, 0, 0)
+        magic_scope_layout.setSpacing(6)
+        magic_scope_layout.addWidget(QLabel('魔法棒範圍'))
+        self.magic_scope_spinbox = QSpinBox()
+        self.magic_scope_spinbox.setRange(MIN_MAGIC_SCOPE_PX, MAX_MAGIC_SCOPE_PX)
+        self.magic_scope_spinbox.setValue(self.magic_scope_px)
+        self.magic_scope_spinbox.setSuffix(' px')
+        self.magic_scope_spinbox.setFixedWidth(115)
+        self.magic_scope_spinbox.setToolTip('以指標為中心的魔法棒範圍邊長；拖掃時跟隨指標')
+        self.magic_scope_spinbox.valueChanged.connect(self.on_magic_scope_changed)
+        magic_scope_layout.addWidget(self.magic_scope_spinbox)
+        magic_scope_layout.addWidget(QLabel('停留'))
+        self.magic_dwell_spinbox = QSpinBox()
+        self.magic_dwell_spinbox.setRange(MIN_MAGIC_DWELL_MS, MAX_MAGIC_DWELL_MS)
+        self.magic_dwell_spinbox.setValue(self.magic_dwell_ms)
+        self.magic_dwell_spinbox.setSuffix(' ms')
+        self.magic_dwell_spinbox.setFixedWidth(105)
+        self.magic_dwell_spinbox.setToolTip('第一點立即確認；其後在同一區塊停留指定毫秒才加入。淡色為候選，濃色為已確認；0 ms 沿路徑立即選取')
+        self.magic_dwell_spinbox.valueChanged.connect(self.on_magic_dwell_changed)
+        magic_scope_layout.addWidget(self.magic_dwell_spinbox)
+        magic_scope_layout.addStretch()
         self.local_intersect_controls = QWidget()
         local_intersect_layout = QHBoxLayout(self.local_intersect_controls)
         local_intersect_layout.setContentsMargins(0, 0, 0, 0)
@@ -3704,6 +4166,7 @@ class MainWindow(QMainWindow):
         edit_toolbar.addStretch()
         workspace_layout.addLayout(edit_toolbar)
         workspace_layout.addWidget(self.local_intersect_dark_controls)
+        workspace_layout.addWidget(self.magic_scope_controls)
 
         view_options = QHBoxLayout()
         view_options.addWidget(QLabel('Mask / 原圖'))
@@ -3783,6 +4246,8 @@ class MainWindow(QMainWindow):
         views_grid.addWidget(QLabel('填色預覽'), 0, 1)
 
         self.mask_view = MaskEditorView()
+        self.mask_view.set_magic_scope_px(self.magic_scope_px)
+        self.mask_view.set_magic_dwell_ms(self.magic_dwell_ms)
         self.mask_view.editStarted.connect(self.push_undo_snapshot)
         self.mask_view.editStarted.connect(self.begin_mask_edit_revision)
         self.mask_view.brushStrokeStateChanged.connect(self.on_brush_stroke_state_changed)
@@ -3952,6 +4417,20 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             percent = DEFAULT_MASK_ALPHA_PERCENT
         return max(0, min(100, percent))
+
+    def _load_magic_scope_px(self) -> int:
+        try:
+            value = int(self.settings.value('magic_scope_px', DEFAULT_MAGIC_SCOPE_PX))
+        except (TypeError, ValueError):
+            value = DEFAULT_MAGIC_SCOPE_PX
+        return max(MIN_MAGIC_SCOPE_PX, min(MAX_MAGIC_SCOPE_PX, value))
+
+    def _load_magic_dwell_ms(self) -> int:
+        try:
+            value = int(self.settings.value('magic_dwell_ms', DEFAULT_MAGIC_DWELL_MS))
+        except (TypeError, ValueError):
+            value = DEFAULT_MAGIC_DWELL_MS
+        return max(MIN_MAGIC_DWELL_MS, min(MAX_MAGIC_DWELL_MS, value))
 
     def save_mask_alpha_percent(self) -> None:
         self.settings.setValue('mask_alpha_percent', self.mask_alpha_percent)
@@ -4968,6 +5447,7 @@ class MainWindow(QMainWindow):
         self.selection_combine_controls.setVisible(tool in ('rect', 'magic', 'brush', 'lasso'))
         self.brush_controls.setVisible(tool == 'brush')
         self.magic_controls.setVisible(tool == 'magic')
+        self.magic_scope_controls.setVisible(tool == 'magic')
         self.update_selection_combine_controls_visibility()
         self.update_local_intersect_controls_visibility()
         self.update_selection_combine_status()
@@ -5060,6 +5540,18 @@ class MainWindow(QMainWindow):
         self.mask_view.set_magic_expand_px(value)
         self.magic_expand_label.setText(f'擴展 {value}px')
 
+    def on_magic_scope_changed(self, value: int) -> None:
+        self.magic_scope_px = value
+        self.mask_view.set_magic_scope_px(value)
+        self.settings.setValue('magic_scope_px', value)
+        self.settings.sync()
+
+    def on_magic_dwell_changed(self, value: int) -> None:
+        self.magic_dwell_ms = value
+        self.mask_view.set_magic_dwell_ms(value)
+        self.settings.setValue('magic_dwell_ms', value)
+        self.settings.sync()
+
     def on_local_intersect_offset_changed(self, value: int) -> None:
         self.mask_view.set_local_intersect_offset(value)
 
@@ -5099,6 +5591,9 @@ class MainWindow(QMainWindow):
             self.resize_fit_timer.start(120)
 
     def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape and self.mask_view._magic_stroke_rect is not None:
+            self.mask_view.cancel_magic_stroke()
+            return
         if event.key() == Qt.Key.Key_F1:
             self.set_edit_mode('manual_solid')
             return
@@ -5192,7 +5687,8 @@ class MainWindow(QMainWindow):
         self.set_current_edit_mask(np.asarray(mask))
         if not self.save_current_edit_mask():
             return
-        self.refresh_mask_preview(keep_view=True)
+        if self.mask_view.tool != 'magic':
+            self.refresh_mask_preview(keep_view=True)
         self.queue_auto_render()
         self.update_edit_buttons()
 
@@ -5282,10 +5778,14 @@ class MainWindow(QMainWindow):
             },
             magic_tolerance=self.mask_view.magic_tolerance,
             magic_expand_px=self.mask_view.magic_expand_px,
+            magic_scope_px=self.mask_view.magic_scope_px,
+            magic_dwell_ms=self.mask_view.magic_dwell_ms,
         )
         dialog.modeChanged.connect(lambda mode: self.set_edit_mode(mode, reset_lower=False))
         dialog.magicToleranceChanged.connect(self.magic_tolerance_slider.setValue)
         dialog.magicExpandChanged.connect(self.magic_expand_slider.setValue)
+        dialog.magicScopeChanged.connect(self.magic_scope_spinbox.setValue)
+        dialog.magicDwellChanged.connect(self.magic_dwell_spinbox.setValue)
         self.is_local_edit_active = True
         try:
             dialog_result = dialog.exec()
