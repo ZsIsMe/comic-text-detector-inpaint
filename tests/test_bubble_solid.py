@@ -459,9 +459,11 @@ class BubbleIntegrationTests(unittest.TestCase):
                 self.assertEqual(report['bubble_detection']['status'], 'disabled')
                 self.assertEqual(detect.call_count, 1)
 
-    def test_detection_prefers_cuda_and_cache_skips_inference(self):
-        for available, expected_device in ((True, 'cuda:0'), (False, 'cpu')):
-            with self.subTest(cuda_available=available), tempfile.TemporaryDirectory() as directory:
+    def test_detection_prefers_cuda_then_mps_and_cache_skips_inference(self):
+        for available, mps_available, expected_device in (
+                (True, True, 'cuda:0'), (True, False, 'cuda:0'),
+                (False, True, 'mps'), (False, False, 'cpu')):
+            with self.subTest(cuda=available, mps=mps_available), tempfile.TemporaryDirectory() as directory:
                 checkpoint = Path(directory)/'model.pt'
                 checkpoint.write_bytes(b'model')
                 cache = Path(directory)/'cache.npz'
@@ -472,7 +474,8 @@ class BubbleIntegrationTests(unittest.TestCase):
                     boxes=SimpleNamespace(cls=torch.tensor([0])), names={0:'balloon'})
                 with patch.object(bubble, 'MODEL_PATH', checkpoint), patch.object(bubble, '_model', None), \
                         patch.object(bubble, '_model_signature', None), patch('ultralytics.YOLO') as factory, \
-                        patch('torch.cuda.is_available', return_value=available) as cuda_available:
+                        patch('torch.cuda.is_available', return_value=available) as cuda_available, \
+                        patch('torch.backends.mps.is_available', return_value=mps_available) as mps_probe:
                     predict = factory.return_value.predict
                     predict.return_value = [result]
                     polygons, status = bubble.detect_bubbles(image, cache)
@@ -481,12 +484,18 @@ class BubbleIntegrationTests(unittest.TestCase):
                     self.assertEqual(predict.call_args.kwargs['device'], expected_device)
                     self.assertEqual(predict.call_args.kwargs['imgsz'], 1600)
                     self.assertTrue(predict.call_args.kwargs['retina_masks'])
+                    if available:
+                        mps_probe.assert_not_called()
+                    else:
+                        mps_probe.assert_called_once()
                     cuda_available.reset_mock()
+                    mps_probe.reset_mock()
                     cuda_available.return_value = not available
                     cached, status = bubble.detect_bubbles(image, cache)
                     self.assertEqual(status, 'cache')
                     np.testing.assert_array_equal(cached[0], polygon)
                     cuda_available.assert_not_called()
+                    mps_probe.assert_not_called()
                     predict.assert_called_once()
                     factory.assert_called_once()
 

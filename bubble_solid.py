@@ -68,7 +68,7 @@ def detect_bubbles(image: np.ndarray, cache_path: Path) -> tuple[list[np.ndarray
     """Cache per-instance polygons by source pixels and model version, never text mask.
 
     No detection-box fallback: a box is not a safe whole-bubble fill boundary.
-    Inference prefers CUDA and is serialized because Qt workers share the YOLO object.
+    Inference prefers CUDA, then MPS, and is serialized because workers share the model.
     """
     global _model, _model_signature
     stat = MODEL_PATH.stat()
@@ -88,7 +88,12 @@ def detect_bubbles(image: np.ndarray, cache_path: Path) -> tuple[list[np.ndarray
     with _model_lock:
         import torch
 
-        device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+        if torch.cuda.is_available():
+            device = 'cuda:0'
+        elif getattr(torch.backends, 'mps', None) is not None and torch.backends.mps.is_available():
+            device = 'mps'
+        else:
+            device = 'cpu'
         if _model is None or _model_signature != signature:
             from ultralytics import YOLO
             _model = YOLO(str(MODEL_PATH), task='segment')
