@@ -3053,10 +3053,11 @@ class DetectorSelectorWidget(QWidget):
 
         rfdetr_config_layout.addWidget(QLabel('運算裝置'), 1, 0)
         self.rfdetr_device_combo = QComboBox()
-        self.rfdetr_device_combo.addItem('自動 (MPS)', 'auto')
+        self.rfdetr_device_combo.addItem('自動（GPU 優先）', 'auto')
+        self.rfdetr_device_combo.addItem('CUDA (NVIDIA)', 'cuda')
         self.rfdetr_device_combo.addItem('MPS (Apple Silicon)', 'mps')
         self.rfdetr_device_combo.addItem('CPU', 'cpu')
-        self.rfdetr_device_combo.setToolTip('自動會在有 Metal 支援時優先使用 MPS。')
+        self.rfdetr_device_combo.setToolTip('自動依序使用可用的 CUDA、MPS 或 CPU。')
         saved_rfdetr_device = str(self.settings.value('detector/rfdetr/device', 'auto'))
         rfdetr_device_index = self.rfdetr_device_combo.findData(saved_rfdetr_device)
         self.rfdetr_device_combo.setCurrentIndex(max(0, rfdetr_device_index))
