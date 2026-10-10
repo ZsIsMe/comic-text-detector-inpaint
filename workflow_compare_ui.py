@@ -13,7 +13,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QPoint, QPointF, QRectF, QSettings, Qt, QTimer, Signal
+from PySide6.QtCore import QLocale, QPoint, QPointF, QRectF, QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -1776,7 +1776,12 @@ class WorkflowCompareWindow(QMainWindow):
 
 
 def main() -> None:
+    # Keep numeric controls in 0-9 (Windows zh_HK may use Suzhou numerals); Chinese UI text is unchanged.
+    QLocale.setDefault(QLocale.c())
     app = QApplication(sys.argv)
+    # Let native Windows title bars follow the existing dark UI (Qt 6.8+).
+    if sys.platform == 'win32' and hasattr(app.styleHints(), 'setColorScheme'):
+        app.styleHints().setColorScheme(Qt.ColorScheme.Dark)
     app.setApplicationName('工作流比較與合成')
     app.setOrganizationName('ComicTextDetector')
     window = WorkflowCompareWindow()

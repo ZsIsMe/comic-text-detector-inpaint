@@ -359,6 +359,7 @@ def _candidate_seed_points(
     text_mask: np.ndarray,
     repair_area: np.ndarray,
     sample_ring: np.ndarray,
+    offset: tuple[int, int] = (0, 0),
 ) -> list[tuple[int, int]]:
     gray = cv2.cvtColor(color_img, cv2.COLOR_BGR2GRAY)
     grad_x = cv2.Sobel(gray, cv2.CV_16S, 1, 0, ksize=3)
@@ -385,8 +386,13 @@ def _candidate_seed_points(
     ys, xs = np.where(clean)
     colors = color_img[ys, xs].astype(np.int16)
     color_delta = np.max(np.abs(colors - dominant), axis=1)
-    center_y, center_x = np.mean(np.where(repair_area > 0), axis=1)
-    distances = np.hypot(xs.astype(np.float32) - float(center_x), ys.astype(np.float32) - float(center_y))
+    # Score in page coordinates. Translating after float32 conversion can round
+    # tied candidates differently, changing which flood-fill seed wins.
+    offset_x, offset_y = offset
+    center_y, center_x = np.mean(
+        np.asarray(np.where(repair_area > 0)) + np.array([offset_y, offset_x])[:, None], axis=1)
+    distances = np.hypot((xs + offset_x).astype(np.float32) - float(center_x),
+                         (ys + offset_y).astype(np.float32) - float(center_y))
     scores = color_delta.astype(np.float32) + distances * 0.03 + gradient[ys, xs].astype(np.float32) * 0.3
     order = np.argsort(scores)
 
@@ -449,8 +455,37 @@ def _background_wand_sample(
     text_mask: np.ndarray,
     repair_area: np.ndarray,
     sample_ring: np.ndarray,
+    offset: tuple[int, int] = (0, 0),
 ) -> np.ndarray:
-    seeds = _candidate_seed_points(color_img, text_mask, repair_area, sample_ring)
+    """Sample a padded local window, keeping the original page-coordinate scores."""
+    x, y, width, height = cv2.boundingRect(repair_area)
+    if not width or not height:
+        return sample_ring
+    h, w = repair_area.shape
+    margin = max(BACKGROUND_WAND_ROI_PADDING_PX, BACKGROUND_WAND_SEED_SEARCH_PX + 1, 5)
+    x1, y1, x2, y2 = _expand_box((x, y, x + width, y + height), margin, w, h)
+    # Retain arbitrary caller-provided rings too, including fallback samples.
+    sx, sy, sw, sh = cv2.boundingRect(sample_ring)
+    if sw and sh:
+        x1, y1 = min(x1, max(0, sx - 1)), min(y1, max(0, sy - 1))
+        x2, y2 = max(x2, min(w, sx + sw + 1)), max(y2, min(h, sy + sh + 1))
+    roi = np.s_[y1:y2, x1:x2]
+    sample = _background_wand_sample_local(
+        color_img[roi], text_mask[roi], repair_area[roi], sample_ring[roi],
+        (offset[0] + x1, offset[1] + y1))
+    output = np.zeros_like(sample_ring)
+    output[roi] = sample
+    return output
+
+
+def _background_wand_sample_local(
+    color_img: np.ndarray,
+    text_mask: np.ndarray,
+    repair_area: np.ndarray,
+    sample_ring: np.ndarray,
+    offset: tuple[int, int] = (0, 0),
+) -> np.ndarray:
+    seeds = _candidate_seed_points(color_img, text_mask, repair_area, sample_ring, offset)
     if not seeds:
         return sample_ring
 
@@ -655,6 +690,15 @@ def _best_quality(color_img: np.ndarray, repair_area: np.ndarray, sample_ring: n
     return max(solid_directionals, key=lambda item: item.score)
 
 
+def _block_roi(text_mask, box, padding):
+    """Keep exactly the text owned by box, with room for local morphology."""
+    height, width = text_mask.shape
+    x1, y1, x2, y2 = _expand_box(box, padding, width, height)
+    roi = np.s_[y1:y2, x1:x2]
+    local_box = (box[0] - x1, box[1] - y1, box[2] - x1, box[3] - y1)
+    return roi, _mask_for_box(text_mask[roi], local_box), (x1, y1)
+
+
 def _solid_overlay_from_mask(
     img: np.ndarray,
     mask: np.ndarray,
@@ -676,24 +720,25 @@ def _solid_overlay_from_mask(
     other_mask = np.zeros((height, width), dtype=np.uint8)
     background_sample_mask = np.zeros((height, width), dtype=np.uint8)
     debug_blocks = []
+    block_padding = REPAIR_EXPAND_PX + max(
+        BACKGROUND_WAND_ROI_PADDING_PX, BACKGROUND_WAND_SEED_SEARCH_PX + 1, SAMPLE_RING_PX, 5)
 
     for box in boxes:
-        local_text = _mask_for_box(text_mask, box)
+        roi, local_text, offset = _block_roi(text_mask, box, block_padding)
         if not np.any(local_text):
             continue
-        repair_area, sample_ring = _sample_ring_for_local_text(text_mask, local_text, repair_kernel, ring_kernel)
-        background_sample = _background_wand_sample(color_img, text_mask, repair_area, sample_ring)
-        quality = _best_quality(color_img, repair_area, background_sample)
-        background_sample_mask = cv2.bitwise_or(background_sample_mask, background_sample)
+        repair_area, sample_ring = _sample_ring_for_local_text(text_mask[roi], local_text, repair_kernel, ring_kernel)
+        background_sample = _background_wand_sample(color_img[roi], text_mask[roi], repair_area, sample_ring, offset)
+        quality = _best_quality(color_img[roi], repair_area, background_sample)
+        background_sample_mask[roi] |= background_sample
 
         if quality.is_solid:
             active = repair_area > 0
-            overlay[active, 0] = quality.fill_bgr[0]
-            overlay[active, 1] = quality.fill_bgr[1]
-            overlay[active, 2] = quality.fill_bgr[2]
-            overlay[active, 3] = 255
+            local_overlay = overlay[roi]
+            local_overlay[active, :3] = quality.fill_bgr
+            local_overlay[active, 3] = 255
         else:
-            other_mask = cv2.bitwise_or(other_mask, repair_area)
+            other_mask[roi] |= repair_area
 
         block_debug = asdict(quality)
         block_debug['box'] = [int(value) for value in box]
@@ -723,8 +768,8 @@ def _solid_overlay_from_mask(
             if not record['accepted']:
                 continue
             for x, y, w, h in record.get('ignored_boundary_components', []):
-                island = _mask_for_box(text_mask, [x, y, x+w, y+h])
-                ignored_boundary_noise |= cv2.dilate(island, repair_kernel)
+                roi, island, _ = _block_roi(text_mask, [x, y, x+w, y+h], REPAIR_EXPAND_PX)
+                ignored_boundary_noise[roi] |= cv2.dilate(island, repair_kernel)
         near_fill = cv2.dilate(accepted.astype(np.uint8), _kernel(3)) > 0
         n, labels, stats, _ = cv2.connectedComponentsWithStats(other_mask, connectivity=8)
         tiny_edges = []
@@ -746,9 +791,11 @@ def _solid_overlay_from_mask(
         other_mask[(protected > 0) & (cv2.dilate(text_mask, repair_kernel) > 0)] = 255
     for record, box in zip(debug_blocks, boxes):
         record['local_is_solid'] = record['is_solid']
-        block_repair = cv2.dilate(_mask_for_box(text_mask, box), repair_kernel) > 0
-        record['ignored_boundary_pixels'] = int(np.count_nonzero(block_repair & (ignored_boundary_noise > 0)))
-        record['is_solid'] = bool(np.all(((overlay[:, :, 3] > 0) | (ignored_boundary_noise > 0))[block_repair]))
+        roi, local_text, _ = _block_roi(text_mask, box, REPAIR_EXPAND_PX)
+        block_repair = cv2.dilate(local_text, repair_kernel) > 0
+        ignored = ignored_boundary_noise[roi] > 0
+        record['ignored_boundary_pixels'] = int(np.count_nonzero(block_repair & ignored))
+        record['is_solid'] = bool(np.all(((overlay[roi][:, :, 3] > 0) | ignored)[block_repair]))
     summary = {
         'blocks': len(boxes),
         'auto_blocks': sum(1 for item in debug_blocks if item['is_solid']),

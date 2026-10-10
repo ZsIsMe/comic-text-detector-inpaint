@@ -68,7 +68,7 @@ def detect_bubbles(image: np.ndarray, cache_path: Path) -> tuple[list[np.ndarray
     """Cache per-instance polygons by source pixels and model version, never text mask.
 
     No detection-box fallback: a box is not a safe whole-bubble fill boundary.
-    CPU inference is serialized because Qt workers can share the same YOLO object.
+    Inference prefers CUDA and is serialized because Qt workers share the YOLO object.
     """
     global _model, _model_signature
     stat = MODEL_PATH.stat()
@@ -86,6 +86,9 @@ def detect_bubbles(image: np.ndarray, cache_path: Path) -> tuple[list[np.ndarray
         pass
     polygons = []
     with _model_lock:
+        import torch
+
+        device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
         if _model is None or _model_signature != signature:
             from ultralytics import YOLO
             _model = YOLO(str(MODEL_PATH), task='segment')
@@ -93,7 +96,7 @@ def detect_bubbles(image: np.ndarray, cache_path: Path) -> tuple[list[np.ndarray
         for x1, y1, x2, y2 in _tiles(image.shape):
             crop = np.ascontiguousarray(image[y1:y2, x1:x2])
             result = _model.predict(crop, imgsz=1600, conf=0.25, iou=0.7,
-                                    device='cpu', retina_masks=True, verbose=False)[0]
+                                    device=device, retina_masks=True, verbose=False)[0]
             if result.masks is None:
                 continue
             for polygon, class_id in zip(result.masks.xy, result.boxes.cls.cpu().numpy()):
@@ -366,6 +369,7 @@ def _resolve_overlaps(image, text, regions):
     """Resolve overlap groups, keeping ambiguous seams separate from fill regions."""
     parents = list(range(len(regions)))
     areas = [np.count_nonzero(r) for r in regions]
+    bounds = [cv2.boundingRect(r) for r in regions]
     pairs = []
     def find(i):
         while parents[i] != i:
@@ -374,7 +378,15 @@ def _resolve_overlaps(image, text, regions):
         return i
     for i in range(len(regions)):
         for j in range(i+1, len(regions)):
-            overlap = np.count_nonzero((regions[i] > 0) & (regions[j] > 0))
+            ax, ay, aw, ah = bounds[i]
+            bx, by, bw, bh = bounds[j]
+            left, top = max(ax, bx), max(ay, by)
+            right, bottom = min(ax+aw, bx+bw), min(ay+ah, by+bh)
+            if left >= right or top >= bottom:
+                continue
+            overlap = np.count_nonzero(
+                (regions[i][top:bottom, left:right] > 0)
+                & (regions[j][top:bottom, left:right] > 0))
             if overlap:
                 parents[find(j)] = find(i)
                 pairs.append((i, j, overlap / min(areas[i], areas[j])))
@@ -449,30 +461,35 @@ def fill_bubbles(image, text_mask, polygons, shrink_ratio=0.02, protected=None,
     veto[seam_guard] = 255
     hard_veto[seam_guard] = True
     for region, overlap_meta in resolved:
-        if np.count_nonzero(text & (region > 0)) < 8:
-            continue
         x, y, w, h = cv2.boundingRect(region)
         x1, y1, x2, y2 = max(0, x), max(0, y), min(shape[1], x+w), min(shape[0], y+h)
         if x2 <= x1 or y2 <= y1:
             continue
         r = max(1, round(min(x2-x1, y2-y1)*shrink_ratio)) if shrink_ratio else 0
         local = region[y1:y2, x1:x2]
+        local_text = text[y1:y2, x1:x2] & (local > 0)
+        if np.count_nonzero(local_text) < 8:
+            continue
         safe = cv2.erode(local, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*r+1,)*2),
                          borderType=cv2.BORDER_CONSTANT, borderValue=0) > 0
         # The legacy 3px text expansion must not paint over the bubble outline
         # just outside the segmentation either.
-        halo = cv2.dilate(region, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
-        veto[halo > 0] = 255
+        # Include the full dilation support while avoiding a page-sized pass
+        # for every bubble. At image edges OpenCV retains its original border.
+        hx1, hy1 = max(0, x1-3), max(0, y1-3)
+        hx2, hy2 = min(shape[1], x2+3), min(shape[0], y2+3)
+        halo_view = np.s_[hy1:hy2, hx1:hx2]
+        halo = cv2.dilate(region[halo_view], cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))) > 0
+        veto[halo_view][halo] = 255
         # Irregular regions can have overlapping bounding rectangles even after
         # their actual masks are disjoint. Neighbouring text is not owned by
         # this bubble just because it lies in that rectangle.
-        local_text = text[y1:y2, x1:x2] & (local > 0)
         safe, outline_pixels = _protect_boundary_fragments(
             image[y1:y2, x1:x2], safe, local_text,
         )
         # Require most nearby detected text to be contained, not a stray
         # intersection between an exterior caption and a model bubble.
-        labels, inside_counts = np.unique(text_labels[region > 0], return_counts=True)
+        labels, inside_counts = np.unique(text_labels[y1:y2, x1:x2][local > 0], return_counts=True)
         crossing = [idx for idx, count in zip(labels, inside_counts)
                     if idx > 0 and count < 0.7 * text_stats[idx, cv2.CC_STAT_AREA]]
         # Tiny detector islands on the outline must not veto an otherwise
@@ -489,7 +506,7 @@ def fill_bubbles(image, text_mask, polygons, shrink_ratio=0.02, protected=None,
         safe &= ~ignored_guard
         crosses = any(idx not in tiny for idx in crossing)
         if crosses or np.count_nonzero(local_text & safe) < 0.7 * np.count_nonzero(local_text):
-            hard_veto[halo > 0] = True
+            hard_veto[halo_view][halo] = True
             records.append(dict(overlap_meta, accepted=False, reason='text_crosses_boundary', box=[x1,y1,x2,y2]))
             continue
         color, sample, record = _quality(image[y1:y2, x1:x2], safe, local_text,
@@ -519,7 +536,7 @@ def fill_bubbles(image, text_mask, polygons, shrink_ratio=0.02, protected=None,
             guard = cv2.dilate(uncertain.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
             fallback[y1:y2, x1:x2] |= safe & ~guard
         else:
-            hard_veto[halo > 0] = True
+            hard_veto[halo_view][halo] = True
     veto[fallback & ~hard_veto] = 0
     overlay[seam_guard] = 0
     return overlay, veto, samples, records

@@ -12,7 +12,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QObject, QPoint, QPointF, QRectF, QSettings, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QLocale, QObject, QPoint, QPointF, QRectF, QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QPolygonF, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -6162,9 +6162,14 @@ class MainWindow(QMainWindow):
 
 
 def main() -> None:
+    # Keep numeric controls in 0-9 (Windows zh_HK may use Suzhou numerals); Chinese UI text is unchanged.
+    QLocale.setDefault(QLocale.c())
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_CompressHighFrequencyEvents, False)
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_CompressTabletEvents, False)
     app = QApplication(sys.argv)
+    # Let native Windows title bars follow the existing dark UI (Qt 6.8+).
+    if sys.platform == 'win32' and hasattr(app.styleHints(), 'setColorScheme'):
+        app.styleHints().setColorScheme(Qt.ColorScheme.Dark)
     app.setApplicationName('塗白')
     app.setOrganizationName('ComicTextDetector')
     if APP_ICON_PATH.is_file():
