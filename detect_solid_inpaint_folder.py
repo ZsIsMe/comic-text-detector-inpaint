@@ -866,11 +866,17 @@ def _compose_overlay_preview(base_img: np.ndarray, overlay: np.ndarray) -> np.nd
         base = base_img[:, :, :3].copy()
     if overlay is None or len(overlay.shape) != 3 or overlay.shape[2] < 4:
         return base
-    alpha = overlay[:, :, 3:4].astype(np.float32) / 255.0
-    return (
-        base.astype(np.float32) * (1.0 - alpha)
-        + overlay[:, :, :3].astype(np.float32) * alpha
-    ).astype(np.uint8)
+    opacity = overlay[:, :, 3]
+    opaque = opacity == 255
+    base[opaque] = overlay[opaque, :3]
+    partial = (opacity > 0) & ~opaque
+    if np.any(partial):
+        alpha = opacity[partial, None].astype(np.float32) / 255.0
+        base[partial] = (
+            base[partial].astype(np.float32) * (1.0 - alpha)
+            + overlay[partial, :3].astype(np.float32) * alpha
+        ).astype(np.uint8)
+    return base
 
 
 def _fit_image(image: Image.Image, width: int, height: int) -> Image.Image:

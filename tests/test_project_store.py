@@ -240,6 +240,24 @@ class EditorTests(unittest.TestCase):
         self.sample_patch.stop();self.settings_patch.stop()
         ProjectTests.tearDown(self)
 
+    def test_saved_page_refresh_reuses_memory_and_explicit_reload_reads_disk(self):
+        import solid_inpaint_ui as ui
+        w = self.window
+        w.set_edit_mode('manual_other')
+        mask = w.current_manual_other.copy()
+        mask[8:15, 9:20] = 255
+        w.set_current_edit_mask(mask)
+        self.assertTrue(w.save_all_edit_masks())
+        with patch.object(ui, '_optional_imread', side_effect=AssertionError('image reread')), \
+                patch.object(ui, 'read_page_state', side_effect=AssertionError('page reread')), \
+                patch.object(ui, '_load_background_sample_cache', side_effect=AssertionError('cache reread')):
+            w.queue_auto_render(reuse_saved_page=True)
+        np.testing.assert_array_equal(w.current_manual_other, mask)
+        with patch.object(ui, 'read_page_state', wraps=ui.read_page_state) as read:
+            w.reload_current()
+            self.assertEqual(read.call_count, 1)
+        np.testing.assert_array_equal(w.current_manual_other, mask)
+
     def test_rect_local_intersection_extracts_dark_components_and_skips_dots(self):
         from PySide6.QtCore import Qt
         view = self.window.mask_view
@@ -603,6 +621,18 @@ class EditorTests(unittest.TestCase):
         self.assertTrue(np.all(view.mask[39:41, 20:76]))
         self.assertFalse(np.any(view.mask[39:41, 76:81]))
 
+    def _wait_for_magic_pixels(self, view, rows, columns):
+        # Windows can deliver the timer after its deadline. Keep the negative
+        # early-release checks below strict, but allow positive delivery to run.
+        import time
+        from PySide6.QtTest import QTest
+        deadline = time.monotonic() + 0.25
+        while not np.all(view._magic_stroke_covered[rows, columns]):
+            if time.monotonic() >= deadline:
+                return False
+            QTest.qWait(5)
+        return True
+
     def test_magic_dwell_quick_pass_release_and_candidate_reset(self):
         from PySide6.QtTest import QTest
         from solid_inpaint_ui import MaskEditorView
@@ -622,7 +652,7 @@ class EditorTests(unittest.TestCase):
         QTest.qWait(20)
         view._advance_magic_stroke((48, 40))  # Same component, new scope.
         QTest.qWait(40)
-        self.assertTrue(np.all(view._magic_stroke_covered[38:42, 40:51]))
+        self.assertTrue(self._wait_for_magic_pixels(view, slice(38, 42), slice(40, 51)))
         view._finish_magic_stroke()
 
         view.set_mask(blank, blank.shape)
@@ -693,7 +723,7 @@ class EditorTests(unittest.TestCase):
         QTest.qWait(25)
         self.assertFalse(np.any(view._magic_stroke_covered[38:42, 59:63]))
         QTest.qWait(40)
-        self.assertTrue(np.all(view._magic_stroke_covered[38:42, 59:63]))
+        self.assertTrue(self._wait_for_magic_pixels(view, slice(38, 42), slice(59, 63)))
         view.cancel_magic_stroke()
 
         for cancel in (

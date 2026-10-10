@@ -243,15 +243,13 @@ def _mask_overlay_image(
     if mask is None:
         return base_bgr
     mask_active = mask > 0
-    dimmed = (base_bgr.astype(np.float32) * max(0.0, 1.0 - alpha)).astype(np.uint8)
-    color = np.zeros_like(base_bgr)
-    color[:, :, 0] = color_bgr[0]
-    color[:, :, 1] = color_bgr[1]
-    color[:, :, 2] = color_bgr[2]
-    blended = dimmed.copy()
+    # A 256-entry lookup preserves float32 rounding without a full RGB float copy.
+    dim_lut = (np.arange(256, dtype=np.float32) * max(0.0, 1.0 - alpha)).astype(np.uint8)
+    color = np.asarray(color_bgr, dtype=np.float32)
+    blended = cv2.LUT(base_bgr, dim_lut)
     blended[mask_active] = (
         base_bgr[mask_active].astype(np.float32) * (1.0 - alpha)
-        + color[mask_active].astype(np.float32) * alpha
+        + color * alpha
     ).astype(np.uint8)
     return blended
 
@@ -267,14 +265,11 @@ def _overlay_mask_on_bgr(
     active = mask > 0
     if not np.any(active):
         return base_bgr
-    color = np.zeros_like(base_bgr)
-    color[:, :, 0] = color_bgr[0]
-    color[:, :, 1] = color_bgr[1]
-    color[:, :, 2] = color_bgr[2]
+    color = np.asarray(color_bgr, dtype=np.float32)
     output = base_bgr.copy()
     output[active] = (
         output[active].astype(np.float32) * (1.0 - alpha)
-        + color[active].astype(np.float32) * alpha
+        + color * alpha
     ).astype(np.uint8)
     return output
 
@@ -301,14 +296,11 @@ def _overlay_transparent_mask_on_bgr(
     active = mask > 0
     if not np.any(active):
         return base_bgr
-    color = np.zeros_like(base_bgr)
-    color[:, :, 0] = color_bgr[0]
-    color[:, :, 1] = color_bgr[1]
-    color[:, :, 2] = color_bgr[2]
+    color = np.asarray(color_bgr, dtype=np.float32)
     output = base_bgr.copy()
     output[active] = (
         output[active].astype(np.float32) * (1.0 - alpha)
-        + color[active].astype(np.float32) * alpha
+        + color * alpha
     ).astype(np.uint8)
     return output
 
@@ -1386,14 +1378,14 @@ class MaskEditorView(ImageView):
         self._edit_started = False
         self._set_brush_stroke_active(True)
         self._show_magic_scope(rect)
-        component = self._magic_component_at(point)
+        component = self._magic_component_at(point, seeded=True)
         if component is not None:
             current_rect, labels, label = component
             self._confirm_magic_patch(current_rect, labels == label)
         self._magic_stroke_last_point = point
 
     def _magic_component_at(
-        self, point: tuple[int, int],
+        self, point: tuple[int, int], *, seeded: bool = False,
     ) -> tuple[tuple[int, int, int, int], np.ndarray, int] | None:
         rect = self._magic_scope_rect(point)
         if rect is None or self.source_bgr is None:
@@ -1403,10 +1395,25 @@ class MaskEditorView(ImageView):
             self.source_bgr[y1:y2, x1:x2],
             self._magic_stroke_lower, self._magic_stroke_upper,
         )
-        _, labels = cv2.connectedComponents(eligible, connectivity=8)
+        seed = (point[0] - x1, point[1] - y1)
+        if seeded:
+            # The stroke keeps its initial color bounds. Flood only the component
+            # under the cursor; fast path sampling still needs every label.
+            if eligible[seed[1], seed[0]]:
+                flood_mask = np.zeros((eligible.shape[0] + 2, eligible.shape[1] + 2), np.uint8)
+                flags = 8 | cv2.FLOODFILL_FIXED_RANGE | cv2.FLOODFILL_MASK_ONLY | (1 << 8)
+                cv2.floodFill(eligible, flood_mask, seed, 0, 0, 0, flags)
+                labels = flood_mask[1:-1, 1:-1]
+                label = 1
+            else:
+                labels = eligible
+                label = 0
+        else:
+            _, labels = cv2.connectedComponents(eligible, connectivity=8)
+            label = int(labels[seed[1], seed[0]])
         self._magic_stroke_rect = rect
         self._show_magic_scope(rect)
-        return rect, labels, int(labels[point[1] - y1, point[0] - x1])
+        return rect, labels, label
 
     def _advance_magic_stroke(self, point: tuple[int, int] | None) -> None:
         if self._magic_stroke_rect is None:
@@ -1421,7 +1428,7 @@ class MaskEditorView(ImageView):
             self._advance_magic_fast(point)
             return
         self._magic_stroke_last_point = point
-        component = self._magic_component_at(point)
+        component = self._magic_component_at(point, seeded=True)
         if component is None:
             self._clear_magic_candidate()
             if self._magic_scope_item is not None:
@@ -1549,9 +1556,8 @@ class MaskEditorView(ImageView):
         # During a sweep, show confirmed pixels themselves. Computing each new
         # patch's operation delta in isolation can mark an earlier confirmed
         # part as removed, even though release applies the union once.
-        ys, xs = np.where(fresh)
-        left, right = int(xs.min()), int(xs.max()) + 1
-        top, bottom = int(ys.min()), int(ys.max()) + 1
+        left, top, width, height = cv2.boundingRect(fresh.view(np.uint8))
+        right, bottom = left + width, top + height
         local = fresh[top:bottom, left:right]
         overlay = np.zeros((*local.shape, 4), dtype=np.uint8)
         overlay[local] = (*MAGIC_PREVIEW_COLOR_BGR, MAGIC_PREVIEW_ALPHA)
@@ -1579,11 +1585,10 @@ class MaskEditorView(ImageView):
     def _apply_magic_stroke_selection(self, selection: np.ndarray, allowed: np.ndarray) -> bool:
         if self.mask is None:
             return False
-        ys, xs = np.where(allowed)
-        if xs.size == 0:
+        x1, y1, width, height = cv2.boundingRect(allowed.view(np.uint8))
+        if width == 0 or height == 0:
             return False
-        x1, x2 = int(xs.min()), int(xs.max()) + 1
-        y1, y2 = int(ys.min()), int(ys.max()) + 1
+        x2, y2 = x1 + width, y1 + height
         rect = (x1, y1, x2, y2)
         original = self.mask
         crop = original[y1:y2, x1:x2]
@@ -1611,11 +1616,10 @@ class MaskEditorView(ImageView):
     def _show_magic_candidate(
         self, rect: tuple[int, int, int, int], mask: np.ndarray,
     ) -> None:
-        ys, xs = np.where(mask)
-        if xs.size == 0:
+        x1, y1, width, height = cv2.boundingRect(mask.view(np.uint8))
+        if width == 0 or height == 0:
             return
-        x1, x2 = int(xs.min()), int(xs.max()) + 1
-        y1, y2 = int(ys.min()), int(ys.max()) + 1
+        x2, y2 = x1 + width, y1 + height
         crop = mask[y1:y2, x1:x2]
         overlay = np.zeros((*crop.shape, 4), dtype=np.uint8)
         overlay[crop] = (255, 225, 150, 72)
@@ -1658,12 +1662,14 @@ class MaskEditorView(ImageView):
         expand_px = int(self.magic_expand_px)
         if expand_px <= 0 or np.all(selection):
             return selection
-        ys, xs = np.where(selection)
+        left, top, selected_width, selected_height = cv2.boundingRect(selection.view(np.uint8))
+        if selected_width == 0 or selected_height == 0:
+            return selection
         height, width = selection.shape[:2]
-        x1 = max(0, int(xs.min()) - expand_px)
-        x2 = min(width - 1, int(xs.max()) + expand_px)
-        y1 = max(0, int(ys.min()) - expand_px)
-        y2 = min(height - 1, int(ys.max()) + expand_px)
+        x1 = max(0, left - expand_px)
+        x2 = min(width - 1, left + selected_width - 1 + expand_px)
+        y1 = max(0, top - expand_px)
+        y2 = min(height - 1, top + selected_height - 1 + expand_px)
         roi = selection[y1:y2 + 1, x1:x2 + 1]
         if expand_px <= 16:
             kernel_size = expand_px * 2 + 1
@@ -1744,9 +1750,8 @@ class MaskEditorView(ImageView):
             if self._magic_preview_item is not None:
                 self._magic_preview_item.setVisible(False)
             return
-        ys, xs = np.where(visible_selection)
-        x1, x2 = int(xs.min()), int(xs.max())
-        y1, y2 = int(ys.min()), int(ys.max())
+        x1, y1, width, height = cv2.boundingRect(visible_selection.view(np.uint8))
+        x2, y2 = x1 + width - 1, y1 + height - 1
         cropped_selection = visible_selection[y1:y2 + 1, x1:x2 + 1]
         cropped_additions = additions[y1:y2 + 1, x1:x2 + 1]
         cropped_removals = removals[y1:y2 + 1, x1:x2 + 1]
@@ -5034,17 +5039,19 @@ class MainWindow(QMainWindow):
         if row < self.list_widget.count() - 1:
             self.list_widget.setCurrentRow(row + 1)
 
-    def reload_current(self, keep_view: bool = False) -> None:
+    def reload_current(self, keep_view: bool = False, *, reuse_saved_page: bool = False) -> None:
         if self.is_mask_stroke_active or self.is_local_edit_active:
             return
         if not self.current_img_path:
             return
-        base = _optional_imread(self.current_img_path, cv2.IMREAD_UNCHANGED)
+        reuse_saved_page = reuse_saved_page and self.current_base is not None and self.current_page is not None
+        base = self.current_base if reuse_saved_page else _optional_imread(self.current_img_path, cv2.IMREAD_UNCHANGED)
         if base is None:
             return
         try:
-            state = read_page_state(self.paths, self.current_img_path, base.shape[:2])
-            _, masks = _read_edit_masks_for_image(self.paths, self.current_img_path)
+            state = self.current_page if reuse_saved_page else read_page_state(self.paths, self.current_img_path, base.shape[:2])
+            masks = {'manual_solid': state['overlay'][:, :, 3].copy(),
+                     'manual_other': state['other'].copy()}
         except (OSError, ValueError) as exc:
             self.current_page = None
             self.current_base = None
@@ -5060,7 +5067,8 @@ class MainWindow(QMainWindow):
         overlay, other_mask = state['overlay'], state['other']
         self.current_manual_solid = masks['manual_solid']
         self.current_manual_other = masks['manual_other']
-        self.current_background_sample = _load_background_sample_cache(self.paths, self.current_img_path, shape)
+        if not reuse_saved_page:
+            self.current_background_sample = _load_background_sample_cache(self.paths, self.current_img_path, shape)
         if self.current_background_sample is None:
             self.queue_background_sample()
         else:
@@ -5688,9 +5696,7 @@ class MainWindow(QMainWindow):
         self.set_current_edit_mask(np.asarray(mask))
         if not self.save_current_edit_mask():
             return
-        if self.mask_view.tool != 'magic':
-            self.refresh_mask_preview(keep_view=True)
-        self.queue_auto_render()
+        self.queue_auto_render(reuse_saved_page=True)
         self.update_edit_buttons()
 
     def prepare_brush_live_preview(self) -> None:
@@ -6014,14 +6020,14 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'background_sample_status'):
             self.background_sample_status.setText('')
 
-    def queue_auto_render(self):
+    def queue_auto_render(self, *, reuse_saved_page: bool = False):
         # Edits already update the authoritative page atomically. Rendering is
         # read-only and never reruns classification or resurrects erased text.
         self.pending_render_img_path = ''
         self.pending_render_mask = None
         self.report = load_report(self.paths)
         self.refresh_list()
-        self.reload_current(keep_view=True)
+        self.reload_current(keep_view=True, reuse_saved_page=reuse_saved_page)
         self.status.showMessage('已儲存兩類選區並更新預覽。')
 
     def start_pending_render(self):
