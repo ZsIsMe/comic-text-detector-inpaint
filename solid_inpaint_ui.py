@@ -3246,7 +3246,8 @@ class DetectorSelectorWidget(QWidget):
 class DetectorSelectionDialog(QDialog):
     """選擇 detector 並重新偵測生成（覆蓋式）。"""
 
-    def __init__(self, settings: QSettings, parent: QWidget | None = None) -> None:
+    def __init__(self, settings: QSettings, parent: QWidget | None = None,
+                 *, solid_settings: dict | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle('偵測並生成')
         layout = QVBoxLayout(self)
@@ -3266,10 +3267,46 @@ class DetectorSelectionDialog(QDialog):
         self.ctbd_config_frame = self.selector.ctbd_config_frame
         self.rfdetr_config_frame = self.selector.rfdetr_config_frame
         self.ysg_config_frame = self.selector.ysg_config_frame
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.addWidget(self.selector)
+        bubble_frame = QFrame()
+        bubble_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        bubble_layout = QVBoxLayout(bubble_frame)
+        bubble_layout.setContentsMargins(20, 14, 20, 16)
+        bubble_title = QLabel('氣泡檢查與填充')
+        bubble_title_font = bubble_title.font()
+        bubble_title_font.setBold(True)
+        bubble_title.setFont(bubble_title_font)
+        bubble_layout.addWidget(bubble_title)
+        values = solid_settings or {'enabled': True, 'shrink_percent': 2.0}
+        self.bubble_enabled = QCheckBox('偵測文字後，檢查並填滿可靠純色氣泡（MangaLens）')
+        self.bubble_enabled.setChecked(values['enabled'])
+        bubble_layout.addWidget(self.bubble_enabled)
+        hint = QLabel('取消勾選後，本次偵測不做氣泡檢查或整區填充；文字範圍仍會正常處理。\n'
+                      '漸層、圖案或背景不足的氣泡保留待修改；人工修改與擦除會保留。')
+        hint.setWordWrap(True)
+        hint.setProperty('secondary', True)
+        bubble_layout.addWidget(hint)
+        row = QHBoxLayout()
+        row.addWidget(QLabel('氣泡內縮（每個氣泡短邊）'))
+        self.bubble_shrink = QDoubleSpinBox()
+        self.bubble_shrink.setRange(0, 10)
+        self.bubble_shrink.setDecimals(1)
+        self.bubble_shrink.setSingleStep(0.5)
+        self.bubble_shrink.setSuffix(' %')
+        self.bubble_shrink.setValue(values['shrink_percent'])
+        self.bubble_shrink.setToolTip('預設 2%；這是邊框保留寬度，不是純色靈敏度。')
+        self.bubble_shrink.setEnabled(self.bubble_enabled.isChecked())
+        self.bubble_enabled.toggled.connect(self.bubble_shrink.setEnabled)
+        row.addWidget(self.bubble_shrink)
+        bubble_layout.addLayout(row)
+        content_layout.addWidget(bubble_frame)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setWidget(self.selector)
+        scroll.setWidget(content)
         layout.addWidget(scroll, 1)
         self.resize(620, min(800, int(self.screen().availableGeometry().height() * 0.9)))
 
@@ -3290,6 +3327,10 @@ class DetectorSelectionDialog(QDialog):
 
     def save_settings(self) -> None:
         self.selector.save_settings()
+
+    def selected_solid_settings(self) -> dict:
+        return {'enabled': self.bubble_enabled.isChecked(),
+                'shrink_percent': self.bubble_shrink.value()}
 
 
 class AddDetectionDialog(QDialog):
@@ -3392,41 +3433,6 @@ class AddDetectionDialog(QDialog):
             if button.isChecked():
                 return scope
         return 'current'
-
-
-class SolidFillSettingsDialog(QDialog):
-    def __init__(self, values: dict, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle('純色填充設定')
-        layout = QVBoxLayout(self)
-        self.enabled = QCheckBox('使用 MangaLens，填滿可靠純色氣泡內部')
-        self.enabled.setChecked(values['enabled'])
-        layout.addWidget(self.enabled)
-        hint = QLabel('清除氣泡內漏檢的小筆畫；漸層、圖案或背景不足時保留待修改。\n'
-                      '「圖像修補」標記會阻止所在氣泡整區填色。')
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-        row = QHBoxLayout()
-        row.addWidget(QLabel('氣泡內縮（每個氣泡短邊）'))
-        self.shrink = QDoubleSpinBox()
-        self.shrink.setRange(0, 10)
-        self.shrink.setDecimals(1)
-        self.shrink.setSingleStep(0.5)
-        self.shrink.setSuffix(' %')
-        self.shrink.setValue(values['shrink_percent'])
-        self.shrink.setToolTip('預設 2%；這是邊框保留寬度，不是純色靈敏度。10% 會留下較寬的未填區域。')
-        self.shrink.setEnabled(self.enabled.isChecked())
-        self.enabled.toggled.connect(self.shrink.setEnabled)
-        row.addWidget(self.shrink)
-        layout.addLayout(row)
-        layout.addWidget(QLabel('重新分類目前文件夾，保留人工修改並重新偵測文字。'))
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Apply).setText('套用並重新分類')
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('取消')
-        buttons.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-        self.resize(460, 230)
 
 
 class CtdSelectionWorker(QObject):
@@ -3853,10 +3859,6 @@ class MainWindow(QMainWindow):
         help_action = QAction('說明', self)
         help_action.triggered.connect(self.show_help)
         toolbar.addAction(help_action)
-
-        solid_settings_action = QAction('純色填充設定', self)
-        solid_settings_action.triggered.connect(self.show_solid_fill_settings)
-        toolbar.addAction(solid_settings_action)
 
         self.navigator_action = QAction('小地圖', self)
         self.navigator_action.setCheckable(True)
@@ -4599,30 +4601,6 @@ class MainWindow(QMainWindow):
         self.save_recent_folders()
         self.update_recent_menu()
 
-    def show_solid_fill_settings(self) -> None:
-        if not self.folder or not self.paths:
-            QMessageBox.information(self, '沒有文件夾', '請先選擇圖片文件夾。')
-            return
-        if self.worker_thread is not None or self.page_worker_thread is not None or self.render_timer.isActive():
-            QMessageBox.information(self, '正在執行', '請等待目前任務完成。')
-            return
-        raw_dir = self.paths.get('raw', self.paths['output'])
-        dialog = SolidFillSettingsDialog(load_solid_settings(raw_dir), self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        if not self.save_all_edit_masks():
-            return
-        try:
-            save_solid_settings(raw_dir, dialog.enabled.isChecked(), dialog.shrink.value())
-        except OSError as exc:
-            QMessageBox.warning(self, '儲存失敗', str(exc))
-            return
-        pages = [p for p in self.imglist if store.has_page(self.paths, p)]
-        if pages:
-            self.start_worker('regenerate', pages)
-        else:
-            self.status.showMessage('純色填充設定已儲存，下次生成時套用。')
-
     def show_convert_masks_dialog(self) -> None:
         if not self.folder or not self.paths or not self.imglist:
             QMessageBox.information(self, '沒有圖片', '請先選擇圖片文件夾。')
@@ -4681,6 +4659,9 @@ class MainWindow(QMainWindow):
         self.recent_menu.addAction(clear_action)
 
     def run_or_load(self) -> None:
+        if self.worker_thread is not None:
+            QMessageBox.information(self, '正在執行', '已有任務在執行中。')
+            return
         if not self.folder:
             self.choose_folder()
             if not self.folder:
@@ -4689,20 +4670,25 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, '正在生成預覽', '請等待當前頁預覽生成完成後再重新偵測。')
             return
 
-        detector_dialog = DetectorSelectionDialog(self.settings, self)
+        detector_dialog = DetectorSelectionDialog(
+            self.settings, self, solid_settings=load_solid_settings(self.paths['raw'])
+        )
         if detector_dialog.exec() != QDialog.DialogCode.Accepted:
             return
         detector_name = detector_dialog.selected_detector()
         detector_params = detector_dialog.selected_detector_params()
-        detector_dialog.save_settings()
+        solid_settings = detector_dialog.selected_solid_settings()
         detector_label = DETECTOR_LABELS.get(detector_name, detector_name)
+        bubble_label = (f'開啟（內縮 {solid_settings["shrink_percent"]:g}%）'
+                        if solid_settings['enabled'] else '關閉')
 
         if self.has_existing_masks():
             reply = QMessageBox.warning(
                 self,
                 '確認重新偵測',
                 '當前文件夾已存在 mask。\n\n'
-                f'這次將使用：{detector_label}\n\n'
+                f'這次將使用：{detector_label}\n'
+                f'氣泡檢查與填充：{bubble_label}\n\n'
                 '重新偵測會更新未經人工修改的區域。\n'
                 '人工分類、填色與擦除會保留。\n\n'
                 '確定要繼續嗎？',
@@ -4711,13 +4697,16 @@ class MainWindow(QMainWindow):
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
-        self.status.showMessage(f'準備使用 {detector_label}...')
-        self.start_worker(
+        started = self.start_worker(
             'detect',
             self.imglist,
             detector_name=detector_name,
             detector_params=detector_params,
+            solid_settings=solid_settings,
         )
+        if started:
+            detector_dialog.save_settings()
+            self.status.showMessage(f'使用 {detector_label}；氣泡檢查與填充：{bubble_label}...')
 
     def run_add_detection(self) -> None:
         if not self.folder:
@@ -4866,15 +4855,23 @@ class MainWindow(QMainWindow):
         detector_name: str = DEFAULT_DETECTOR,
         detector_params: dict | None = None,
         target_mode: str = 'manual_other',
-    ) -> None:
+        solid_settings: dict | None = None,
+    ) -> bool:
         if self.worker_thread is not None:
             QMessageBox.information(self, '正在執行', '已有任務在執行中。')
-            return
+            return False
         if self.page_worker_thread is not None:
             QMessageBox.information(self, '正在生成預覽', '請等待當前頁預覽生成完成。')
-            return
+            return False
         if not self.save_all_edit_masks():
-            return
+            return False
+        if solid_settings is not None:
+            try:
+                save_solid_settings(self.paths['raw'], solid_settings['enabled'],
+                                    solid_settings['shrink_percent'])
+            except (OSError, ValueError) as exc:
+                QMessageBox.warning(self, '儲存失敗', str(exc))
+                return False
         self.progress.setValue(0)
         self.worker_thread = QThread()
         self.worker = FolderWorker(
@@ -4897,6 +4894,7 @@ class MainWindow(QMainWindow):
         self.worker_thread.finished.connect(self.cleanup_worker)
         self.mask_view.setEnabled(False)
         self.worker_thread.start()
+        return True
 
     def start_convert_worker(self, image_paths: list[str], target_mode: str) -> None:
         if self.worker_thread is not None:
