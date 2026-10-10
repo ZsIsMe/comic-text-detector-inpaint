@@ -518,7 +518,7 @@ class EditorTests(unittest.TestCase):
         selections = []
         view.selectionCreated.connect(lambda selection: selections.append(selection))
         for mode in ('transfer_from_other', 'ctd_detect_selection',
-                     'local_edit_selection'):
+                     'rfdetr_detect_selection', 'local_edit_selection'):
             view.set_selection_combine_mode(mode)
             view._start_magic_stroke((39, 39))
             view._advance_magic_stroke((49, 39))
@@ -1163,3 +1163,150 @@ class EditorTests(unittest.TestCase):
         redone = read_page_state(self.paths, self.path)
         np.testing.assert_array_equal(redone['overlay'], after['overlay'])
         np.testing.assert_array_equal(redone['other'], after['other'])
+
+    def test_rfdetr_selection_worker_uses_saved_model_and_crops_to_selection(self):
+        from solid_inpaint_ui import CtdSelectionWorker, DETECTOR_RFDETR
+        image = np.full((100, 100, 3), 175, np.uint8)
+        selection = np.zeros((100, 100), bool)
+        selection[40, 42] = True
+        selection[44, 48] = True
+        params = {'device': 'mps', 'inpaint_mask_dilate': 7, 'mask_mode': 'text'}
+        calls = []
+
+        def detector(crop, **kwargs):
+            calls.append((crop.shape, kwargs))
+            return None, np.full(crop.shape[:2], 255, np.uint8), None
+
+        worker = CtdSelectionWorker(7, self.path, image, selection, DETECTOR_RFDETR, params)
+        params['device'] = 'cpu'
+        results = []
+        worker.finished.connect(lambda *args: results.append(args))
+        with patch('solid_inpaint_ui.create_detector', return_value=detector) as factory:
+            worker.run()
+        factory.assert_called_once_with(DETECTOR_RFDETR,
+            {'device': 'mps', 'inpaint_mask_dilate': 7, 'mask_mode': 'text'})
+        self.assertEqual(calls[0][0], (37, 39, 3))
+        self.assertEqual(calls[0][1]['keep_undetected_mask'], True)
+        self.assertEqual(len(results), 1)
+        request_id, path, detected, count = results[0]
+        self.assertEqual((request_id, path, count), (7, self.path, 2))
+        np.testing.assert_array_equal(detected > 0, selection)
+
+        ctd = CtdSelectionWorker(8, self.path, image, selection)
+        with patch('solid_inpaint_ui.create_detector', return_value=detector) as factory:
+            ctd.run()
+        factory.assert_called_once_with()
+
+    def test_rfdetr_selection_reads_saved_settings_with_fallbacks(self):
+        from solid_inpaint_ui import _saved_rfdetr_detector_params
+        settings = self.window.settings
+        expected_default = {'device': 'auto', 'inpaint_mask_dilate': 2,
+                            'mask_mode': 'text_onomatopoeia'}
+        self.assertEqual(_saved_rfdetr_detector_params(settings), expected_default)
+        settings.setValue('detector/last_name', 'ctbd')
+        settings.setValue('detector/rfdetr/device', 'mps')
+        settings.setValue('detector/rfdetr/inpaint_mask_dilate', 7)
+        settings.setValue('detector/rfdetr/mask_mode', 'text')
+        self.assertEqual(_saved_rfdetr_detector_params(settings),
+            {'device': 'mps', 'inpaint_mask_dilate': 7, 'mask_mode': 'text'})
+        settings.setValue('detector/rfdetr/device', 'cuda')
+        settings.setValue('detector/rfdetr/inpaint_mask_dilate', 'bad')
+        settings.setValue('detector/rfdetr/mask_mode', 'invalid')
+        self.assertEqual(_saved_rfdetr_detector_params(settings), expected_default)
+        settings.setValue('detector/rfdetr/inpaint_mask_dilate', -5)
+        self.assertEqual(_saved_rfdetr_detector_params(settings)['inpaint_mask_dilate'], 0)
+        settings.setValue('detector/rfdetr/inpaint_mask_dilate', 999)
+        self.assertEqual(_saved_rfdetr_detector_params(settings)['inpaint_mask_dilate'], 64)
+
+    def test_rfdetr_selection_button_tool_rules_and_dispatch(self):
+        from PySide6.QtCore import Qt
+        w = self.window
+        selection = np.zeros_like(self.mask, bool); selection[70:72, 85:87] = True
+        for tool in ('rect', 'magic', 'lasso'):
+            w.set_edit_tool(tool)
+            w.selection_rfdetr_btn.click()
+            self.assertTrue(w.selection_rfdetr_btn.isChecked())
+            self.assertEqual(w.selection_combine_mode, 'rfdetr_detect_selection')
+            self.assertEqual(w.mask_view.selection_combine_mode, 'rfdetr_detect_selection')
+            self.assertTrue(w.mask_view._should_emit_selection(Qt.MouseButton.LeftButton))
+            with patch.object(w, 'start_rfdetr_selection_detection') as start:
+                w.on_selection_created(selection)
+            np.testing.assert_array_equal(start.call_args.args[0], selection)
+        w.set_edit_tool('brush')
+        self.assertEqual(w.selection_combine_mode, 'add')
+        self.assertTrue(w.selection_rfdetr_btn.isHidden())
+        self.assertFalse(w.selection_mode_allowed_for_tool('rfdetr_detect_selection', 'brush'))
+
+    def test_rfdetr_selection_start_uses_saved_params_and_shared_worker_slot(self):
+        from solid_inpaint_ui import DETECTOR_RFDETR, QThread
+        w = self.window
+        w.settings.setValue('detector/last_name', 'ctbd')
+        w.settings.setValue('detector/rfdetr/device', 'cpu')
+        w.settings.setValue('detector/rfdetr/inpaint_mask_dilate', 5)
+        w.settings.setValue('detector/rfdetr/mask_mode', 'onomatopoeia')
+        selection = np.zeros_like(self.mask, bool); selection[70:72, 85:87] = True
+        with patch.object(QThread, 'start'):
+            w.start_rfdetr_selection_detection(selection)
+        worker = w.ctd_selection_worker
+        self.assertEqual(worker.detector_name, DETECTOR_RFDETR)
+        self.assertEqual(worker.detector_params,
+            {'device': 'cpu', 'inpaint_mask_dilate': 5, 'mask_mode': 'onomatopoeia'})
+        self.assertEqual(w.ctd_selection_detector_label, 'RF-DETR')
+        request_id = w.ctd_selection_request_id
+        with patch('solid_inpaint_ui.QMessageBox.information') as info:
+            w.start_ctd_selection_detection(selection)
+        self.assertEqual(w.ctd_selection_request_id, request_id)
+        self.assertIn('RF-DETR', info.call_args.args[2])
+        w.cleanup_ctd_selection_worker()
+
+    def test_rfdetr_selection_result_saves_other_and_undo_restores_solid(self):
+        w = self.window
+        before = read_page_state(self.paths, self.path)
+        w.set_edit_mode('manual_other')
+        w.ctd_selection_request_id = 17
+        w.ctd_selection_edit_mode = 'manual_other'
+        w.ctd_selection_detector_label = 'RF-DETR'
+        detected = np.zeros_like(self.mask)
+        detected[70:74, 86:90] = 255
+        w.on_ctd_selection_finished(17, self.path, detected, 16)
+        after = read_page_state(self.paths, self.path)
+        self.assertTrue(np.all(after['other'][70:74, 86:90] == 255))
+        self.assertFalse(np.any(after['overlay'][70:74, 86:90, 3]))
+        self.assertTrue(np.all(after['edited'][70:74, 86:90] == 255))
+        self.assertIn('RF-DETR', w.status.currentMessage())
+        w.undo_mask()
+        undone = read_page_state(self.paths, self.path)
+        np.testing.assert_array_equal(undone['overlay'], before['overlay'])
+        np.testing.assert_array_equal(undone['other'], before['other'])
+        w.redo_mask()
+        redone = read_page_state(self.paths, self.path)
+        np.testing.assert_array_equal(redone['overlay'], after['overlay'])
+        np.testing.assert_array_equal(redone['other'], after['other'])
+        undo_count = len(w.undo_stack)
+        w.on_ctd_selection_finished(17, self.path, detected, 16)
+        self.assertEqual(len(w.undo_stack), undo_count)
+        self.assertIn('RF-DETR 檢測結果已在目前 mask 中', w.status.currentMessage())
+
+    def test_rfdetr_selection_ignores_stale_or_invalid_results(self):
+        w = self.window
+        before = read_page_state(self.paths, self.path)
+        detected = np.zeros_like(self.mask); detected[70:72, 86:88] = 255
+        w.ctd_selection_request_id = 31
+        w.ctd_selection_edit_mode = 'manual_solid'
+        w.ctd_selection_detector_label = 'RF-DETR'
+        initial_undo = len(w.undo_stack)
+        w.on_ctd_selection_finished(30, self.path, detected, 4)
+        w.on_ctd_selection_finished(31, '/different/page.png', detected, 4)
+        w.set_edit_mode('manual_other')
+        w.on_ctd_selection_finished(31, self.path, detected, 4)
+        self.assertIn('RF-DETR', w.status.currentMessage())
+        w.ctd_selection_edit_mode = 'manual_other'
+        w.on_ctd_selection_finished(31, self.path, np.zeros((5, 5), np.uint8), 4)
+        w.on_ctd_selection_finished(31, self.path, np.zeros_like(self.mask), 0)
+        self.assertEqual(len(w.undo_stack), initial_undo)
+        w.on_ctd_selection_failed(30, self.path, 'stale')
+        w.on_ctd_selection_failed(31, self.path, 'model error')
+        self.assertIn('RF-DETR 選區檢測失敗：model error', w.status.currentMessage())
+        after = read_page_state(self.paths, self.path)
+        for key in before:
+            np.testing.assert_array_equal(after[key], before[key])
