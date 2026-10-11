@@ -5,7 +5,8 @@ import unittest
 from unittest.mock import patch
 
 import numpy as np
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtCore import QRectF, Qt
+from PySide6.QtGui import QCloseEvent, QImage, QPainter
 from PySide6.QtWidgets import QMessageBox
 
 import project_store as store
@@ -276,6 +277,36 @@ class AsyncEditorTests(unittest.TestCase):
         self.assertTrue(w.flush_pending_edits())
         self.assertIn(ui.STATUS_OTHER, item.text())
         self.assertEqual(w.report['pages']['01.png']['other_pixels'], 25)
+
+    def test_drag_rectangle_stays_visible_over_previously_committed_tiles(self):
+        w = self.window
+        view = w.mask_view
+        w.set_edit_tool('rect')
+        mask = w.current_manual_other.copy()
+        mask[10:20, 10:20] = 255
+        self.emit_edit(mask)
+        self.assertTrue(w.flush_pending_edits())
+        self.assertTrue(view._committed_mask_overlay.isVisible())
+
+        def render():
+            image = QImage(220, 180, QImage.Format.Format_ARGB32)
+            image.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(image)
+            view.scene().render(painter, QRectF(0, 0, 220, 180), QRectF(0, 0, 220, 180))
+            painter.end()
+            return image
+
+        # The left border crosses the updated opaque tile; the right border
+        # crosses only the original pixmap, reproducing the partial disappearance.
+        for button in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
+            for start, end in (((40, 40), (180, 140)), ((180, 140), (40, 40))):
+                with self.subTest(button=button, start=start):
+                    before = render()
+                    view._update_rubber_band(start, end, button)
+                    after = render()
+                    self.assertNotEqual(after.copy(37, 50, 7, 70), before.copy(37, 50, 7, 70))
+                    self.assertNotEqual(after.copy(177, 50, 7, 70), before.copy(177, 50, 7, 70))
+                    view._clear_rubber_band()
 
 
 if __name__ == '__main__':

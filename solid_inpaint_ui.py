@@ -621,6 +621,7 @@ class PassivePreviewView(ImageView):
 class RubberBandRectItem(QGraphicsRectItem):
     def __init__(self) -> None:
         super().__init__()
+        self.setZValue(11)  # Keep the drag frame above opaque mask preview tiles.
         self.erase_all_style = False
 
     def set_erase_all_style(self, enabled: bool) -> None:
@@ -1285,7 +1286,7 @@ class MaskEditorView(ImageView):
         if self.image_shape is None:
             return
         height, width = self.image_shape
-        self._live_mask_overlay.configure(width, height, renderer)
+        self._live_mask_overlay.configure(width, height, renderer, sparse=True)
 
     def update_live_mask_preview(self, dirty_rect: QRectF) -> None:
         if self._live_mask_overlay.isVisible():
@@ -2639,8 +2640,6 @@ class LocalEditDialog(QDialog):
         self.redo_stack = []
         if self.view.tool != 'brush':
             return
-        preview = self.render_preview(self.current_mask)
-        self.view.set_qimage(_qimage_from_bgr(preview), keep_view=True)
         self.view.start_live_mask_preview(self.render_live_patch)
 
     def render_live_patch(self, x1: int, y1: int, x2: int, y2: int) -> np.ndarray:
@@ -5923,12 +5922,6 @@ class MainWindow(QMainWindow):
     def prepare_brush_live_preview(self) -> None:
         if self.mask_view.tool != 'brush' or self.current_base is None:
             return
-        preview = _editor_mask_preview(
-            self.current_base, self.current_manual_solid, self.current_manual_other,
-            self.alpha, self.current_background_sample if self.show_background_sample else None,
-            solid_color=self.mask_display_color,
-        )
-        self.mask_view.set_qimage(_qimage_from_bgr(preview), keep_view=True)
         self.mask_view.start_live_mask_preview(self.render_brush_live_patch)
 
     def render_brush_live_patch(self, x1: int, y1: int, x2: int, y2: int) -> np.ndarray:
@@ -5953,7 +5946,20 @@ class MainWindow(QMainWindow):
         mask = self.mask_view.mask
         if mask is None:
             return
-        self.set_current_edit_mask(mask)
+        height, width = mask.shape[:2]
+        rect = dirty_rect.intersected(QRectF(0, 0, width, height)).toAlignedRect()
+        if rect.isEmpty():
+            return
+        x1, y1 = max(0, rect.left()), max(0, rect.top())
+        x2, y2 = min(width, rect.right() + 1), min(height, rect.bottom() + 1)
+        roi = np.s_[y1:y2, x1:x2]
+        active, opposite = ((self.current_manual_solid, self.current_manual_other)
+                            if self.edit_mode == 'manual_solid'
+                            else (self.current_manual_other, self.current_manual_solid))
+        if active is None or opposite is None:
+            return
+        active[roi] = np.where(mask[roi] > 0, np.uint8(255), np.uint8(0))
+        opposite[roi][active[roi] > 0] = 0
         self.mask_view.update_live_mask_preview(dirty_rect)
 
     def on_selection_created(self, selection: object) -> None:
