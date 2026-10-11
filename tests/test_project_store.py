@@ -282,7 +282,8 @@ class EditorTests(unittest.TestCase):
         np.testing.assert_array_equal(view.mask, expected)
 
         view.set_local_intersect_dark_refine(True)
-        view.set_local_intersect_min_area(5)
+        view.set_local_intersect_min_area(1)
+        view.set_local_intersect_stroke_width(2)
         view.set_local_intersect_dark_threshold(100)
         view.set_mask(old, old.shape)
         view._apply_selection(selection, Qt.MouseButton.LeftButton)
@@ -318,8 +319,9 @@ class EditorTests(unittest.TestCase):
         view.set_mask(old, old.shape)
         view.set_selection_combine_mode('local_intersect')
         view.set_local_intersect_dark_refine(True)
+        view.set_local_intersect_min_area(1)
         view.set_local_intersect_dark_threshold(100)
-        view.set_local_intersect_min_area(5)
+        view.set_local_intersect_stroke_width(2)
         view.set_edit_clip_rect((10, 10, 20, 20))
         view.set_tool('rect')
         view._apply_selection(selection, Qt.MouseButton.LeftButton)
@@ -353,7 +355,7 @@ class EditorTests(unittest.TestCase):
         w.set_selection_combine_mode('local_intersect')
         w.local_intersect_dark_checkbox.setChecked(True)
         w.local_intersect_dark_threshold_spinbox.setValue(100)
-        w.local_intersect_min_area_spinbox.setValue(5)
+        w.local_intersect_stroke_width_spinbox.setValue(2)
         before = read_page_state(self.paths, self.path)
         self.assertTrue(w.mask_view._apply_rect((80, 60), (99, 99), Qt.MouseButton.LeftButton))
         w.mask_view.editStarted.emit()
@@ -367,6 +369,165 @@ class EditorTests(unittest.TestCase):
         w.redo_mask()
         redone = read_page_state(self.paths, self.path)
         np.testing.assert_array_equal(redone['overlay'], saved['overlay'])
+
+    def test_dark_stroke_width_filters_long_and_connected_thin_lines(self):
+        from PySide6.QtCore import Qt
+        view = self.window.mask_view
+        source = np.full((40, 100, 3), 220, np.uint8)
+        source[5, 2:98] = 0  # Large area, but only one pixel wide.
+        source[15:25, 10:20] = 0
+        source[19, 20:95] = 0  # A thin tail connected to the thick stroke.
+        source[30:32, 3:97] = 0
+        source[33:36, 3:97] = 0
+        diagonal = np.arange(10)
+        source[diagonal + 10, diagonal + 40] = 0
+        selection = np.ones(source.shape[:2], bool)
+        old = np.full(source.shape[:2], 255, np.uint8)
+        view.set_source_image(source)
+        view.set_tool('rect')
+        view.set_selection_combine_mode('local_intersect')
+        view.set_local_intersect_dark_refine(True)
+        view.set_local_intersect_min_area(1)
+        view.set_local_intersect_stroke_width(3)
+        view.set_mask(old, old.shape)
+        view._apply_selection(selection, Qt.MouseButton.LeftButton)
+        expected = np.zeros_like(old)
+        expected[15:25, 10:20] = 255
+        expected[33:36, 3:97] = 255
+        np.testing.assert_array_equal(view.mask, expected)
+
+    def test_dark_stroke_even_width_preserves_position_at_roi_edges(self):
+        view = self.window.mask_view
+        # Keep the source crop distinct from local coordinates as in a ROI editor.
+        source = np.full((35, 45, 3), 220, np.uint8)
+        source[7:9, 11:29] = 0
+        source[19:21, 11:29] = 0
+        source[12, 11:29] = 0
+        selection = np.ones((14, 18), bool)
+        view.set_source_image(source)
+        view.set_local_intersect_min_area(1)
+        view.set_local_intersect_stroke_width(2)
+        result = view._dark_strokes_in_selection(selection, (11, 7))
+        expected = np.zeros_like(selection)
+        expected[:2, :] = True
+        expected[-2:, :] = True
+        np.testing.assert_array_equal(result, expected)
+
+        # A clipped one-pixel strip at the top cannot borrow pixels outside the ROI.
+        source[6:8, 11:29] = 0
+        source[8, 11:29] = 220
+        view.set_source_image(source)
+        result = view._dark_strokes_in_selection(selection, (11, 7))
+        expected[:2, :] = False
+        np.testing.assert_array_equal(result, expected)
+
+        # A larger even round kernel must also retain its original alignment.
+        source[:] = 220
+        source[10:14, 14:26] = 0
+        view.set_source_image(source)
+        view.set_local_intersect_stroke_width(4)
+        result = view._dark_strokes_in_selection(selection, (11, 7))
+        ys, xs = np.nonzero(result)
+        self.assertEqual((ys.min(), ys.max(), xs.min(), xs.max()), (3, 6, 3, 14))
+        self.assertEqual(float(ys.mean()), 4.5)
+        self.assertEqual(float(xs.mean()), 8.5)
+        self.assertTrue(np.all(result[4:6, 3:15]))
+        self.assertFalse(np.any(result & (source[7:21, 11:29, 0] != 0)))
+
+    def test_dark_stroke_width_one_keeps_dots_and_selection_boundary(self):
+        view = self.window.mask_view
+        source = np.full((12, 16, 3), 220, np.uint8)
+        source[0, :] = 80
+        source[2:10, 5] = 80
+        source[8, 13] = 80
+        selection = np.zeros(source.shape[:2], bool)
+        selection[:10, 3:14] = True
+        selection[6, 5] = False
+        view.set_source_image(source)
+        view.set_local_intersect_dark_threshold(100)
+        view.set_local_intersect_min_area(1)
+        view.set_local_intersect_stroke_width(1)
+        result = view._dark_strokes_in_selection(selection, (0, 0))
+        np.testing.assert_array_equal(result, selection & (source[:, :, 0] <= 100))
+
+    def test_dark_stroke_width_controls_match_view_and_checkbox(self):
+        from PySide6.QtWidgets import QLabel
+        w = self.window
+        spinbox = w.local_intersect_stroke_width_spinbox
+        self.assertEqual((spinbox.minimum(), spinbox.maximum(), spinbox.value()), (1, 100, 3))
+        self.assertEqual(spinbox.suffix(), ' px')
+        self.assertEqual(w.mask_view.local_intersect_stroke_width, 3)
+        self.assertIn('筆畫寬度', [label.text() for label in w.local_intersect_dark_controls.findChildren(QLabel)])
+        self.assertFalse(spinbox.isEnabled())
+        w.local_intersect_dark_checkbox.setChecked(True)
+        self.assertTrue(spinbox.isEnabled())
+        spinbox.setValue(4)
+        self.assertEqual(w.mask_view.local_intersect_stroke_width, 4)
+        w.local_intersect_dark_checkbox.setChecked(False)
+        self.assertFalse(spinbox.isEnabled())
+        self.assertFalse(w.mask_view.local_intersect_dark_refine)
+
+    def test_dark_filters_apply_width_then_component_area(self):
+        view = self.window.mask_view
+        source = np.full((32, 80, 3), 220, np.uint8)
+        source[5, 2:75] = 0  # Passes area alone, fails width.
+        source[12:15, 3:6] = 0  # Passes width, fails minimum area.
+        source[20:24, 8:18] = 0  # Passes both.
+        source[22, 18:75] = 0  # Area cannot resurrect its removed thin tail.
+        view.set_source_image(source)
+        view.set_local_intersect_stroke_width(3)
+        view.set_local_intersect_min_area(30)
+        selection = np.ones(source.shape[:2], bool)
+        expected = np.zeros_like(selection)
+        expected[20:24, 8:18] = True
+        np.testing.assert_array_equal(view._dark_strokes_in_selection(selection, (0, 0)), expected)
+        view.set_local_intersect_stroke_width(1)
+        expected[5, 2:75] = True
+        expected[22, 18:75] = True
+        np.testing.assert_array_equal(view._dark_strokes_in_selection(selection, (0, 0)), expected)
+        view.set_local_intersect_min_area(1)
+        np.testing.assert_array_equal(view._dark_strokes_in_selection(selection, (0, 0)), source[:, :, 0] == 0)
+
+    def test_dark_filter_hover_previews_update_clamp_and_hide(self):
+        from PySide6.QtCore import QEvent, QPointF, Qt
+        from PySide6.QtGui import QEnterEvent, QTransform
+        from PySide6.QtWidgets import QApplication
+        w = self.window
+        w.mask_view.setTransform(QTransform().scale(2, 2))
+        area = w.local_intersect_min_area_spinbox
+        self.assertEqual((area.minimum(), area.maximum(), area.value()), (1, 100000, 30))
+        self.assertFalse(area.isEnabled())
+        for button, spinbox, kind in (
+            (w.local_intersect_stroke_width_help, w.local_intersect_stroke_width_spinbox, 'width'),
+            (w.local_intersect_min_area_help, area, 'area'),
+        ):
+            self.assertTrue(button.isEnabled())
+            self.assertEqual(button.toolTip(), '')
+            QApplication.sendEvent(button, QEnterEvent(QPointF(), QPointF(), QPointF()))
+            preview = button.preview
+            self.assertTrue(preview.isVisible())
+            self.assertEqual(preview.kind, kind)
+            self.assertEqual(preview.canvas_scale, 2)
+            self.assertEqual(preview.display_scale, 2)
+            self.assertEqual(preview.focusPolicy(), Qt.FocusPolicy.NoFocus)
+            self.assertTrue(preview.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents))
+            spinbox.setValue(spinbox.maximum())
+            self.assertEqual(preview.value, spinbox.maximum())
+            w.mask_view.setTransform(QTransform().scale(100, 100))
+            w.mask_view.viewChanged.emit()
+            self.assertLess(preview.display_scale, preview.canvas_scale)
+            available = button.screen().availableGeometry()
+            self.assertTrue(available.contains(preview.geometry()))
+            QApplication.sendEvent(button, QEvent(QEvent.Type.Leave))
+            self.assertFalse(preview.isVisible())
+            preview.show_preview()
+            QApplication.sendEvent(button, QEvent(QEvent.Type.Hide))
+            self.assertFalse(preview.isVisible())
+            w.mask_view.setTransform(QTransform().scale(2, 2))
+        w.local_intersect_dark_checkbox.setChecked(True)
+        self.assertTrue(area.isEnabled())
+        area.setValue(31)
+        self.assertEqual(w.mask_view.local_intersect_min_area, 31)
 
     def test_magic_drag_samples_path_once_and_saves_one_undo(self):
         from PySide6.QtCore import QPointF, Qt

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import os.path as osp
+import math
 import subprocess
 import sys
 import time
@@ -326,6 +327,111 @@ def _editor_mask_preview(
     return _overlay_mask_on_bgr(
         preview, sample, SAMPLE_RING_DISPLAY_ALPHA, SAMPLE_RING_DISPLAY_COLOR_BGR,
     )
+
+
+class DarkFilterPreview(QWidget):
+    """Non-interactive, canvas-scaled illustration for a dark-stroke filter."""
+
+    def __init__(self, owner: QWidget, kind: str, value_getter, scale_getter):
+        super().__init__(owner, Qt.WindowType.ToolTip)
+        self.kind = kind
+        self.value_getter = value_getter
+        self.scale_getter = scale_getter
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+    def refresh(self) -> None:
+        self.value = self.value_getter()
+        self.canvas_scale = max(0.001, abs(float(self.scale_getter())))
+        self.source_extent = (2 * math.sqrt(self.value / math.pi)
+                              if self.kind == 'area' else max(40, 5 * self.value))
+        screen = self.parentWidget().screen() or QApplication.primaryScreen()
+        available = screen.availableGeometry()
+        max_extent = max(1, min(available.width() - 64, available.height() - 160, 420))
+        self.display_scale = min(self.canvas_scale, max_extent / self.source_extent)
+        self.preview_extent = self.source_extent * self.display_scale
+        self.resize(min(available.width(), max(290, math.ceil(self.preview_extent) + 40)),
+                    min(available.height(), max(190, math.ceil(self.preview_extent) + 120)))
+        self.update()
+        if self.isVisible():
+            self.place_near_owner()
+
+    def place_near_owner(self) -> None:
+        owner = self.parentWidget()
+        available = (owner.screen() or QApplication.primaryScreen()).availableGeometry()
+        point = owner.mapToGlobal(QPoint(0, owner.height() + 4))
+        if point.y() + self.height() > available.bottom() + 1:
+            point.setY(owner.mapToGlobal(QPoint(0, 0)).y() - self.height() - 4)
+        point.setX(max(available.left(), min(point.x(), available.right() - self.width() + 1)))
+        point.setY(max(available.top(), min(point.y(), available.bottom() - self.height() + 1)))
+        self.move(point)
+
+    def show_preview(self) -> None:
+        self.refresh()
+        self.place_near_owner()
+        self.show()
+
+    def refresh_if_visible(self) -> None:
+        if self.isVisible():
+            self.refresh()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor('#f4f4f4'))
+        painter.setPen(QPen(QColor('#8b8b8b'), 1))
+        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
+        painter.setPen(QColor('#202020'))
+        title = (f'最小面積：{self.value} px²' if self.kind == 'area'
+                 else f'筆畫寬度：{self.value} px')
+        painter.drawText(QRectF(12, 8, self.width() - 24, 24), Qt.AlignmentFlag.AlignCenter, title)
+        description = ('圓點面積等於門檻；更小的區塊會被過濾' if self.kind == 'area'
+                       else '十字臂厚等於門檻；更細的筆畫會被過濾')
+        painter.drawText(QRectF(12, 32, self.width() - 24, 24), Qt.AlignmentFlag.AlignCenter, description)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor('#151515'))
+        extent = self.preview_extent
+        cx, cy = self.width() / 2, (56 + self.height() - 56) / 2
+        if self.kind == 'area':
+            painter.drawEllipse(QRectF(cx - extent / 2, cy - extent / 2, extent, extent))
+        else:
+            thickness = self.value * self.display_scale
+            painter.drawRect(QRectF(cx - extent / 2, cy - thickness / 2, extent, thickness))
+            painter.drawRect(QRectF(cx - thickness / 2, cy - extent / 2, thickness, extent))
+        painter.setPen(QColor('#202020'))
+        painter.drawText(QRectF(12, self.height() - 52, self.width() - 24, 24),
+                         Qt.AlignmentFlag.AlignCenter, f'畫布縮放：{self.canvas_scale * 100:.1f}%')
+        actual = (f'示意縮放：{self.display_scale * 100:.1f}%（縮小以適應螢幕）'
+                  if self.display_scale < self.canvas_scale else '示意與畫布同大小')
+        painter.drawText(QRectF(12, self.height() - 28, self.width() - 24, 24),
+                         Qt.AlignmentFlag.AlignCenter, actual)
+
+
+class DarkFilterHelpButton(QToolButton):
+    def __init__(self, parent: QWidget, kind: str, spinbox: QSpinBox, scale_getter):
+        super().__init__(parent)
+        self.setText('?')
+        self.setAccessibleName('最小面積示意' if kind == 'area' else '筆畫寬度示意')
+        self.setFixedSize(20, 20)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setStyleSheet('QToolButton { border: 1px solid #aaa; border-radius: 10px;'
+                          ' color: #eee; background: #282d33; padding: 0px; }'
+                          'QToolButton:hover { background: #ddd; color: #111; }')
+        self.preview = DarkFilterPreview(self, kind, spinbox.value, scale_getter)
+        spinbox.valueChanged.connect(self.preview.refresh)
+
+    def enterEvent(self, event) -> None:
+        self.preview.show_preview()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self.preview.hide()
+        super().leaveEvent(event)
+
+    def hideEvent(self, event) -> None:
+        self.preview.hide()
+        super().hideEvent(event)
 
 
 class ImageView(QGraphicsView):
@@ -668,6 +774,7 @@ class MaskEditorView(ImageView):
         self.local_intersect_offset_px = DEFAULT_LOCAL_INTERSECT_OFFSET_PX
         self.local_intersect_dark_refine = False
         self.local_intersect_dark_threshold = 128
+        self.local_intersect_stroke_width = 3
         self.local_intersect_min_area = 30
         self.edit_clip_rect: tuple[int, int, int, int] | None = None
         self.mask: np.ndarray | None = None
@@ -827,8 +934,11 @@ class MaskEditorView(ImageView):
     def set_local_intersect_dark_threshold(self, threshold: int) -> None:
         self.local_intersect_dark_threshold = max(0, min(255, int(threshold)))
 
+    def set_local_intersect_stroke_width(self, width: int) -> None:
+        self.local_intersect_stroke_width = max(1, min(100, int(width)))
+
     def set_local_intersect_min_area(self, area: int) -> None:
-        self.local_intersect_min_area = max(1, int(area))
+        self.local_intersect_min_area = max(1, min(100000, int(area)))
 
     def set_edit_clip_rect(self, rect: tuple[int, int, int, int] | None) -> None:
         if rect == self.edit_clip_rect:
@@ -1922,7 +2032,7 @@ class MaskEditorView(ImageView):
         local_result = touched_components & selection
         refine = self.tool == 'rect' and self.local_intersect_dark_refine
         if refine:
-            dark_selection = self._dark_components_in_selection(selection, source_origin)
+            dark_selection = self._dark_strokes_in_selection(selection, source_origin)
             if dark_selection is None or not np.any(local_result & dark_selection):
                 return
             local_result &= dark_selection
@@ -1934,7 +2044,7 @@ class MaskEditorView(ImageView):
         next_mask |= local_result
         self.mask[:, :] = np.where(next_mask, 255, 0).astype(np.uint8)
 
-    def _dark_components_in_selection(
+    def _dark_strokes_in_selection(
         self,
         selection: np.ndarray,
         source_origin: tuple[int, int],
@@ -1953,11 +2063,30 @@ class MaskEditorView(ImageView):
         gray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
         dark = ((gray <= self.local_intersect_dark_threshold)
                 & selection[y1:y2, x1:x2]).astype(np.uint8)
-        count, labels, stats, _ = cv2.connectedComponentsWithStats(dark, connectivity=8)
-        keep = np.zeros(count, dtype=bool)
-        keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= self.local_intersect_min_area
+        width = self.local_intersect_stroke_width
+        if width > 1:
+            # Sample a round footprint at pixel centers. Even sizes use opposing
+            # anchors for erosion/dilation so the result stays at its source position.
+            axis = np.arange(width, dtype=np.float32) - (width - 1) / 2
+            kernel = (axis[:, None] ** 2 + axis[None, :] ** 2
+                      <= (width / 2) ** 2).astype(np.uint8)
+            eroded = cv2.erode(
+                dark, kernel, anchor=(width // 2, width // 2),
+                borderType=cv2.BORDER_CONSTANT, borderValue=0,
+            )
+            opened = cv2.dilate(
+                eroded, kernel[::-1, ::-1].copy(),
+                anchor=((width - 1) // 2, (width - 1) // 2),
+                borderType=cv2.BORDER_CONSTANT, borderValue=0,
+            )
+            dark &= opened
+        if self.local_intersect_min_area > 1:
+            count, labels, stats, _ = cv2.connectedComponentsWithStats(dark, connectivity=8)
+            keep = np.zeros(count, dtype=bool)
+            keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= self.local_intersect_min_area
+            dark = keep[labels].astype(np.uint8)
         result = np.zeros(selection.shape, dtype=bool)
-        result[y1:y2, x1:x2] = keep[labels]
+        result[y1:y2, x1:x2] = dark > 0
         return result
 
     def _apply_selection_inner(self, selection: np.ndarray) -> None:
@@ -4095,7 +4224,7 @@ class MainWindow(QMainWindow):
         dark_layout.setContentsMargins(0, 0, 0, 0)
         dark_layout.setSpacing(4)
         self.local_intersect_dark_checkbox = QCheckBox('擷取深色筆畫')
-        self.local_intersect_dark_checkbox.setToolTip('矩形內依原圖亮度擷取深色區塊，過濾小網點，再收窄目前選區')
+        self.local_intersect_dark_checkbox.setToolTip('矩形內依原圖亮度擷取深色筆畫，先依筆畫寬度過濾細線，再依最小面積過濾小區塊，最後收窄目前選區')
         self.local_intersect_dark_checkbox.toggled.connect(
             lambda enabled: self.mask_view.set_local_intersect_dark_refine(enabled)
         )
@@ -4114,20 +4243,44 @@ class MainWindow(QMainWindow):
             self.local_intersect_dark_threshold_spinbox.setEnabled
         )
         dark_layout.addWidget(self.local_intersect_dark_threshold_spinbox)
+        dark_layout.addWidget(QLabel('筆畫寬度'))
+        self.local_intersect_stroke_width_spinbox = QSpinBox()
+        self.local_intersect_stroke_width_spinbox.setRange(1, 100)
+        self.local_intersect_stroke_width_spinbox.setValue(3)
+        self.local_intersect_stroke_width_spinbox.setSuffix(' px')
+        self.local_intersect_stroke_width_spinbox.setFixedWidth(112)
+        self.local_intersect_stroke_width_spinbox.setEnabled(False)
+        self.local_intersect_stroke_width_spinbox.setToolTip('以原圖像素指定最小筆畫寬度；越大會過濾越多細線、細筆畫及網點。1 px 不過濾；細文字或標點可能需要調低')
+        self.local_intersect_stroke_width_spinbox.valueChanged.connect(
+            lambda value: self.mask_view.set_local_intersect_stroke_width(value)
+        )
+        self.local_intersect_dark_checkbox.toggled.connect(
+            self.local_intersect_stroke_width_spinbox.setEnabled
+        )
+        dark_layout.addWidget(self.local_intersect_stroke_width_spinbox)
+        self.local_intersect_stroke_width_help = DarkFilterHelpButton(
+            self.local_intersect_dark_controls, 'width', self.local_intersect_stroke_width_spinbox,
+            lambda: self.mask_view.transform().m11(),
+        )
+        dark_layout.addWidget(self.local_intersect_stroke_width_help)
         dark_layout.addWidget(QLabel('最小面積'))
         self.local_intersect_min_area_spinbox = QSpinBox()
         self.local_intersect_min_area_spinbox.setRange(1, 100000)
         self.local_intersect_min_area_spinbox.setValue(30)
+        self.local_intersect_min_area_spinbox.setSuffix(' px²')
         self.local_intersect_min_area_spinbox.setFixedWidth(112)
         self.local_intersect_min_area_spinbox.setEnabled(False)
-        self.local_intersect_min_area_spinbox.setToolTip('忽略小於此像素面積的深色連通區塊；小文字或標點可能需要補選')
+        self.local_intersect_min_area_spinbox.setToolTip('筆畫寬度過濾後，忽略小於此原圖像素面積的深色連通區塊；1 px² 不過濾面積')
         self.local_intersect_min_area_spinbox.valueChanged.connect(
             lambda value: self.mask_view.set_local_intersect_min_area(value)
         )
-        self.local_intersect_dark_checkbox.toggled.connect(
-            self.local_intersect_min_area_spinbox.setEnabled
-        )
+        self.local_intersect_dark_checkbox.toggled.connect(self.local_intersect_min_area_spinbox.setEnabled)
         dark_layout.addWidget(self.local_intersect_min_area_spinbox)
+        self.local_intersect_min_area_help = DarkFilterHelpButton(
+            self.local_intersect_dark_controls, 'area', self.local_intersect_min_area_spinbox,
+            lambda: self.mask_view.transform().m11(),
+        )
+        dark_layout.addWidget(self.local_intersect_min_area_help)
         dark_layout.addStretch()
         edit_toolbar.addWidget(self.rect_btn)
         edit_toolbar.addWidget(self.brush_btn)
@@ -4266,6 +4419,8 @@ class MainWindow(QMainWindow):
         self.mask_view.eraseAllMasksRequested.connect(self.on_erase_all_masks_requested)
         self.mask_view.viewChanged.connect(self.sync_preview_view)
         self.mask_view.viewChanged.connect(self.update_navigator_viewport)
+        self.mask_view.viewChanged.connect(self.local_intersect_stroke_width_help.preview.refresh_if_visible)
+        self.mask_view.viewChanged.connect(self.local_intersect_min_area_help.preview.refresh_if_visible)
         self.mask_view.viewportResized.connect(self.sync_preview_view)
         self.mask_view.viewportResized.connect(self.update_navigator_viewport)
         views_grid.addWidget(self.mask_view, 1, 0)
@@ -6088,6 +6243,8 @@ class MainWindow(QMainWindow):
             '套索 Backspace：退回上一點；Esc：取消目前套索\n'
             '局部視窗：矩形框選區域後，在獨立放大視窗編輯副本；選「調整邊框」才可拖動藍色 ROI 邊界，套用後才回寫主頁\n'
             '局部交集：只裁切本次選區碰到的既有 mask 區塊\n'
+            '擷取深色筆畫：矩形專用，依原圖灰階門檻擷取；筆畫寬度以原圖 px 計，先過濾細線，再以最小面積過濾小區塊，兩項設為 1 可停用對應過濾\n'
+            '筆畫寬度 / 最小面積旁的問號：懸停顯示十字 / 圓點門檻示意，按目前畫布縮放顯示；過大時縮小並標明實際比例\n'
             '交集偏移：局部交集結果正數擴展，負數收縮，0 保持原大小\n'
             '選區內部：魔法棒專用，提取本次選區包圍住的內部孔洞\n'
             '添加＋內部：魔法棒專用，同時添加本次選區和其內部孔洞\n'
