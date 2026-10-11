@@ -5577,7 +5577,7 @@ class MainWindow(QMainWindow):
             return self.mask_display_color
         return EDIT_MODE_COLORS[self.edit_mode]
 
-    def set_edit_mode(self, mode: str, reset_lower: bool = True) -> None:
+    def set_edit_mode(self, mode: str) -> None:
         if mode not in EDIT_MODE_LABELS:
             return
         self.edit_mode = mode
@@ -5592,8 +5592,6 @@ class MainWindow(QMainWindow):
         self.refresh_mask_preview(keep_view=True)
         self.update_edit_buttons()
         self.status.showMessage(f'正在編輯：{EDIT_MODE_LABELS[mode]}')
-        if reset_lower:
-            self.set_edit_tool('rect', reset_selection=True)
 
     def set_edit_tool(self, tool: str, reset_selection: bool = True) -> None:
         self.mask_view.set_tool(tool)
@@ -5941,7 +5939,7 @@ class MainWindow(QMainWindow):
             magic_scope_px=self.mask_view.magic_scope_px,
             magic_dwell_ms=self.mask_view.magic_dwell_ms,
         )
-        dialog.modeChanged.connect(lambda mode: self.set_edit_mode(mode, reset_lower=False))
+        dialog.modeChanged.connect(self.set_edit_mode)
         dialog.magicToleranceChanged.connect(self.magic_tolerance_slider.setValue)
         dialog.magicExpandChanged.connect(self.magic_expand_slider.setValue)
         dialog.magicScopeChanged.connect(self.magic_scope_spinbox.setValue)
