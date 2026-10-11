@@ -81,10 +81,65 @@ class ProjectTests(unittest.TestCase):
         state['overlay'][40:80, 70:90] = (90, 100, 110, 255)
         store.save_page(self.paths, self.path, state)
         solid = state['overlay'][:, :, 3].copy();solid[40:80, 60:70] = 255
-        page, _ = save_page_edits(self.path, self.paths, solid, state['other'])
+        with patch('detect_solid_inpaint_folder._manual_solid_overlay', side_effect=AssertionError('unneeded color sampling')):
+            page, _ = save_page_edits(self.path, self.paths, solid, state['other'])
         np.testing.assert_array_equal(page['overlay'][50, 60], [200, 210, 220, 255])
         np.testing.assert_array_equal(page['overlay'][50, 69], [90, 100, 110, 255])
         np.testing.assert_array_equal(page['overlay'][40:80, 40:60], state['overlay'][40:80, 40:60])
+
+    def test_cached_source_matches_disk_color_read_for_gray_bgr_and_bgra(self):
+        import detect_solid_inpaint_folder as fill
+        gray = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
+        bgra = cv2.cvtColor(self.image, cv2.COLOR_BGR2BGRA)
+        bgra[:, :, 3] = 17
+        gray16 = gray.astype(np.uint16) * 256 + 137
+        bgra16 = bgra.astype(np.uint16) * 256 + 91
+        for source in (gray, self.image, bgra, gray16, bgra16):
+            with self.subTest(channels=source.shape):
+                cv2.imwrite(self.path, source)
+                empty = store.empty_page(self.mask.shape)
+                with patch.object(fill, 'imread', wraps=fill.imread) as read:
+                    expected, expected_summary = save_page_edits(
+                        self.path, self.paths, self.mask, np.zeros_like(self.mask), state=empty)
+                    read.assert_called_once_with(self.path, cv2.IMREAD_COLOR)
+                before = source.copy()
+                with patch.object(fill, 'imread', side_effect=AssertionError('cached source was reread')):
+                    actual, actual_summary = save_page_edits(
+                        self.path, self.paths, self.mask, np.zeros_like(self.mask),
+                        state=empty, source_image=source)
+                for key in expected:
+                    np.testing.assert_array_equal(actual[key], expected[key])
+                self.assertEqual(actual_summary, expected_summary)
+                np.testing.assert_array_equal(source, before)
+
+    def test_cached_source_rejects_wrong_selection_dimensions_before_saving(self):
+        state = store.empty_page(self.mask.shape)
+        store.save_page(self.paths, self.path, state)
+        before = store.project_path(self.paths['raw']).read_bytes()
+        with self.assertRaisesRegex(ValueError, '尺寸'):
+            save_page_edits(self.path, self.paths, self.mask, np.zeros_like(self.mask),
+                            state=state, source_image=self.image[:-1])
+        self.assertEqual(store.project_path(self.paths['raw']).read_bytes(), before)
+
+    def test_page_normalization_preserves_partial_alpha_and_does_not_mutate_input(self):
+        rng = np.random.default_rng(10)
+        page = store.empty_page(self.mask.shape)
+        page['overlay'][:, :, :3] = rng.integers(0, 256, (*self.mask.shape, 3), dtype=np.uint8)
+        page['overlay'][10:15, 20:25, 3] = 127
+        page['other'] = np.zeros(self.mask.shape, np.int16)
+        page['other'][30:40, 30:40] = 2
+        page['other'][1, 1] = -1
+        page['edited'] = rng.integers(-1, 3, self.mask.shape, dtype=np.int16)
+        before = {key: value.copy() for key, value in page.items()}
+        store.save_page(self.paths, self.path, page)
+        actual = read_page_state(self.paths, self.path)
+        expected_overlay = before['overlay'].copy()
+        expected_overlay[expected_overlay[:, :, 3] == 0] = 0
+        np.testing.assert_array_equal(actual['overlay'], expected_overlay)
+        for key in ('other', 'edited'):
+            np.testing.assert_array_equal(actual[key], np.where(before[key] > 0, 255, 0).astype(np.uint8))
+        for key in before:
+            np.testing.assert_array_equal(page[key], before[key])
 
     def test_invalid_overlap_and_unavailable_color_do_not_overwrite_page(self):
         self.classify()
@@ -253,10 +308,25 @@ class EditorTests(unittest.TestCase):
                 patch.object(ui, '_load_background_sample_cache', side_effect=AssertionError('cache reread')):
             w.queue_auto_render(reuse_saved_page=True)
         np.testing.assert_array_equal(w.current_manual_other, mask)
+
         with patch.object(ui, 'read_page_state', wraps=ui.read_page_state) as read:
             w.reload_current()
             self.assertEqual(read.call_count, 1)
         np.testing.assert_array_equal(w.current_manual_other, mask)
+
+    def test_edit_saves_in_both_modes_use_cached_source_without_disk_read(self):
+        w = self.window
+        for mode in ('manual_other', 'manual_solid'):
+            with self.subTest(mode=mode):
+                w.set_edit_mode(mode)
+                mask = w.current_edit_mask().copy()
+                mask[10:25, 10:25] = 255
+                with patch('detect_solid_inpaint_folder.imread', side_effect=AssertionError('original image reread')):
+                    w.on_mask_edited(mask)
+                    self.assertTrue(w.flush_pending_edits())
+                saved = read_page_state(self.paths, self.path)
+                result = saved['other'] if mode == 'manual_other' else saved['overlay'][:, :, 3]
+                self.assertTrue(np.all(result[10:25, 10:25] == 255))
 
     def test_rect_local_intersection_extracts_dark_components_and_skips_dots(self):
         from PySide6.QtCore import Qt
@@ -360,13 +430,16 @@ class EditorTests(unittest.TestCase):
         self.assertTrue(w.mask_view._apply_rect((80, 60), (99, 99), Qt.MouseButton.LeftButton))
         w.mask_view.editStarted.emit()
         w.mask_view.maskEdited.emit(w.mask_view.mask.copy())
+        self.assertTrue(w.flush_pending_edits())
         saved = read_page_state(self.paths, self.path)
         self.assertEqual(np.count_nonzero(saved['overlay'][:, :, 3]), 50)
         self.assertTrue(np.all(saved['overlay'][70:80, 85:90, 3] == 255))
         w.undo_mask()
+        self.assertTrue(w.flush_pending_edits())
         undone = read_page_state(self.paths, self.path)
         np.testing.assert_array_equal(undone['overlay'], before['overlay'])
         w.redo_mask()
+        self.assertTrue(w.flush_pending_edits())
         redone = read_page_state(self.paths, self.path)
         np.testing.assert_array_equal(redone['overlay'], saved['overlay'])
 
@@ -555,12 +628,15 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(len(w.undo_stack), before_undo)
         self.assertFalse(np.any(w.current_manual_other))
         QTest.mouseRelease(viewport, Qt.MouseButton.LeftButton, pos=end)
+        self.assertTrue(w.flush_pending_edits())
         self.assertEqual(len(w.undo_stack), before_undo + 1)
         saved = read_page_state(self.paths, self.path)['other']
         self.assertEqual(np.count_nonzero(saved), 30)
         w.undo_mask()
+        self.assertTrue(w.flush_pending_edits())
         self.assertFalse(np.any(read_page_state(self.paths, self.path)['other']))
         w.redo_mask()
+        self.assertTrue(w.flush_pending_edits())
         np.testing.assert_array_equal(read_page_state(self.paths, self.path)['other'], saved)
 
     def test_magic_drag_to_outside_roi_still_samples_up_to_boundary(self):
@@ -586,6 +662,7 @@ class EditorTests(unittest.TestCase):
         QTest.mousePress(viewport, Qt.MouseButton.LeftButton, pos=start)
         QTest.mouseMove(viewport, outside)
         QTest.mouseRelease(viewport, Qt.MouseButton.LeftButton, pos=outside)
+        self.assertTrue(w.flush_pending_edits())
         saved = read_page_state(self.paths, self.path)['other']
         self.assertTrue(np.all(saved[68:73, 84:87] == 255))
         self.assertTrue(np.all(saved[68:73, 97:100] == 255))
@@ -853,12 +930,15 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(len(w.undo_stack), before_undo)
         QTest.qWait(75)
         QTest.mouseRelease(viewport, Qt.MouseButton.LeftButton, pos=second)
+        self.assertTrue(w.flush_pending_edits())
         saved = read_page_state(self.paths, self.path)['other']
         self.assertEqual(np.count_nonzero(saved), 30)
         self.assertEqual(len(w.undo_stack), before_undo + 1)
         w.undo_mask()
+        self.assertTrue(w.flush_pending_edits())
         self.assertFalse(np.any(read_page_state(self.paths, self.path)['other']))
         w.redo_mask()
+        self.assertTrue(w.flush_pending_edits())
         np.testing.assert_array_equal(read_page_state(self.paths, self.path)['other'], saved)
 
     def test_magic_dwell_leave_and_lifecycle_cancel_timer(self):
@@ -875,16 +955,21 @@ class EditorTests(unittest.TestCase):
         view.set_magic_dwell_ms(50)
         view.set_magic_scope_px(32)
         view.set_magic_tolerance(0)
-        view._start_magic_stroke((20, 40))
-        view._advance_magic_stroke((60, 40))
-        QTest.qWait(25)
-        view._advance_magic_stroke(None)  # Leave viewport.
-        QTest.qWait(40)
-        view._advance_magic_stroke((60, 40))
-        QTest.qWait(25)
-        self.assertFalse(np.any(view._magic_stroke_covered[38:42, 59:63]))
-        QTest.qWait(40)
-        self.assertTrue(self._wait_for_magic_pixels(view, slice(38, 42), slice(59, 63)))
+        # Wall-clock qWait can overshoot a 50ms dwell on a busy GUI. Advance
+        # its clock explicitly to verify that leaving resets the countdown.
+        with patch('solid_inpaint_ui.time.monotonic_ns', return_value=1_000_000_000) as clock:
+            view._start_magic_stroke((20, 40))
+            view._advance_magic_stroke((60, 40))
+            clock.return_value += 25_000_000
+            view._advance_magic_stroke(None)  # Leave viewport.
+            clock.return_value += 40_000_000
+            view._advance_magic_stroke((60, 40))
+            clock.return_value += 25_000_000
+            view._confirm_magic_candidate()
+            self.assertFalse(np.any(view._magic_stroke_covered[38:42, 59:63]))
+            clock.return_value += 40_000_000
+            view._confirm_magic_candidate()
+            self.assertTrue(np.any(view._magic_stroke_covered[38:42, 59:63]))
         view.cancel_magic_stroke()
 
         for cancel in (
@@ -957,6 +1042,7 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(w.current_manual_other[30, 35], 255)
         self.assertTrue(w.save_all_edit_masks())
         w.undo_mask()
+        self.assertTrue(w.flush_pending_edits())
         np.testing.assert_array_equal(w.current_manual_solid, before)
         self.assertFalse(np.any(w.current_manual_other))
 
@@ -992,15 +1078,48 @@ class EditorTests(unittest.TestCase):
         self.assertTrue(np.all(read_page_state(self.paths, self.path)['other'][70:80, 83:90] == 255))
         w.set_edit_mode('manual_solid')
         w.undo_mask()
+        self.assertTrue(w.flush_pending_edits())
         np.testing.assert_array_equal(read_page_state(self.paths, self.path)['overlay'], original)
         w.redo_mask()
+        self.assertTrue(w.flush_pending_edits())
         self.assertTrue(np.all(read_page_state(self.paths, self.path)['other'][70:80, 83:90] == 255))
 
     def test_erase_all_does_not_modify_cache_or_reappear_on_reload(self):
+        import solid_inpaint_ui as ui
         w = self.window
+        original = read_page_state(self.paths, self.path)
+        original['overlay'][75:80, 90:95] = 0
+        original['other'][75:80, 90:95] = 255
+        store.save_page(self.paths, self.path, original)
+        w.reload_current()
         before = store.read_cache_file(store.cache_path(self.paths, self.path))
         selection = np.zeros_like(self.mask, bool);selection[65:95, 82:98] = True
-        w.on_erase_all_masks_requested(selection)
+        undo_count = len(w.undo_stack)
+        with patch.object(ui, '_optional_imread', side_effect=AssertionError('image reread')), \
+                patch.object(ui, 'read_page_state', side_effect=AssertionError('page reread')), \
+                patch.object(ui, '_load_background_sample_cache', side_effect=AssertionError('cache reread')), \
+                patch.object(w, 'refresh_mask_preview', wraps=w.refresh_mask_preview) as refresh:
+            w.on_erase_all_masks_requested(selection)
+            self.assertTrue(w.flush_pending_edits())
+            self.assertEqual(refresh.call_count, 0)
+        self.assertEqual(len(w.undo_stack), undo_count + 1)
+        erased = read_page_state(self.paths, self.path)
+        self.assertFalse(np.any(erased['overlay'][selection]))
+        self.assertFalse(np.any(erased['other'][selection]))
+        changed = selection & ((original['overlay'][:, :, 3] > 0) | (original['other'] > 0))
+        self.assertTrue(np.all(erased['edited'][changed] == 255))
+        np.testing.assert_array_equal(erased['overlay'][~selection], original['overlay'][~selection])
+        np.testing.assert_array_equal(erased['other'][~selection], original['other'][~selection])
+        w.undo_mask()
+        self.assertTrue(w.flush_pending_edits())
+        undone = read_page_state(self.paths, self.path)
+        for key in original:
+            np.testing.assert_array_equal(undone[key], original[key])
+        w.redo_mask()
+        self.assertTrue(w.flush_pending_edits())
+        redone = read_page_state(self.paths, self.path)
+        for key in erased:
+            np.testing.assert_array_equal(redone[key], erased[key])
         w.reload_current()
         self.assertFalse(np.any(w.current_manual_solid[selection]))
         self.assertFalse(np.any(w.current_manual_other[selection]))
@@ -1008,6 +1127,20 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(set(after), set(before))
         for key in before:
             np.testing.assert_array_equal(after[key], before[key])
+
+    def test_erase_all_without_hit_does_not_save_refresh_or_push_undo(self):
+        w = self.window
+        selection = np.zeros_like(self.mask, bool)
+        selection[:10, :10] = True
+        before = store.page_path(self.paths, self.path).read_bytes()
+        undo_count, redo_count = len(w.undo_stack), len(w.redo_stack)
+        with patch.object(w, 'save_all_edit_masks', side_effect=AssertionError('unneeded save')), \
+                patch.object(w, 'push_undo_snapshot', side_effect=AssertionError('unneeded undo')), \
+                patch.object(w, 'refresh_mask_preview', side_effect=AssertionError('unneeded refresh')):
+            w.on_erase_all_masks_requested(selection)
+            self.assertTrue(w.flush_pending_edits())
+        self.assertEqual((len(w.undo_stack), len(w.redo_stack)), (undo_count, redo_count))
+        self.assertEqual(store.page_path(self.paths, self.path).read_bytes(), before)
 
     def test_export_uses_authoritative_page_without_png_intermediates(self):
         with patch('solid_inpaint_ui.QMessageBox.information'):
@@ -1347,10 +1480,12 @@ class EditorTests(unittest.TestCase):
         self.assertFalse(np.any(after['other'][62:66, 82:86]))
         self.assertTrue(np.all(after['edited'][62:66, 82:86] == 255))
         w.undo_mask()
+        self.assertTrue(w.flush_pending_edits())
         undone = read_page_state(self.paths, self.path)
         np.testing.assert_array_equal(undone['overlay'], before['overlay'])
         np.testing.assert_array_equal(undone['other'], before['other'])
         w.redo_mask()
+        self.assertTrue(w.flush_pending_edits())
         redone = read_page_state(self.paths, self.path)
         np.testing.assert_array_equal(redone['overlay'], after['overlay'])
         np.testing.assert_array_equal(redone['other'], after['other'])

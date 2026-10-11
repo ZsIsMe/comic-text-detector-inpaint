@@ -6,6 +6,8 @@ from __future__ import annotations
 import os
 import os.path as osp
 import math
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import sys
 import time
@@ -85,6 +87,7 @@ from detect_solid_inpaint_folder import (
     write_report,
     read_page_state,
     save_page_edits,
+    prepare_page_edits,
     export_psd_assets,
 )
 from utils.io_utils import imread, imwrite
@@ -683,6 +686,7 @@ class LiveMaskOverlayItem(QGraphicsItem):
         self.image_height = 0
         self.renderer = None
         self.tiles: dict[tuple[int, int], QImage] = {}
+        self.sparse_tiles: set[tuple[int, int]] | None = None
         self.setZValue(2)
         self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self.setVisible(False)
@@ -690,12 +694,13 @@ class LiveMaskOverlayItem(QGraphicsItem):
     def boundingRect(self) -> QRectF:
         return QRectF(0, 0, self.image_width, self.image_height)
 
-    def configure(self, width: int, height: int, renderer) -> None:
+    def configure(self, width: int, height: int, renderer, *, sparse: bool = False) -> None:
         self.prepareGeometryChange()
         self.image_width = max(0, int(width))
         self.image_height = max(0, int(height))
         self.renderer = renderer
         self.tiles.clear()
+        self.sparse_tiles = set() if sparse else None
         self.setVisible(self.image_width > 0 and self.image_height > 0)
         self.update()
 
@@ -716,10 +721,14 @@ class LiveMaskOverlayItem(QGraphicsItem):
         for ty in range(ty1, ty2 + 1):
             for tx in range(tx1, tx2 + 1):
                 self.tiles.pop((tx, ty), None)
+                if self.sparse_tiles is not None:
+                    self.sparse_tiles.add((tx, ty))
         self.update(rect)
 
     def _tile_image(self, tx: int, ty: int) -> QImage | None:
         key = (tx, ty)
+        if self.sparse_tiles is not None and key not in self.sparse_tiles:
+            return None
         cached = self.tiles.get(key)
         if cached is not None:
             return cached
@@ -790,6 +799,9 @@ class MaskEditorView(ImageView):
         self._pan_last_pos: QPoint | None = None
         self._rubber_band: RubberBandRectItem | None = None
         self._live_mask_overlay = LiveMaskOverlayItem()
+        self._committed_mask_overlay = LiveMaskOverlayItem()
+        self._committed_mask_overlay.setZValue(1)
+        self.scene().addItem(self._committed_mask_overlay)
         self.scene().addItem(self._live_mask_overlay)
         self._lasso_points: list[tuple[int, int]] = []
         self._lasso_hover_point: tuple[int, int] | None = None
@@ -858,7 +870,7 @@ class MaskEditorView(ImageView):
         if mask is None:
             self.mask = np.zeros(shape, dtype=np.uint8)
         else:
-            self.mask = np.where(mask > 0, 255, 0).astype(np.uint8)
+            self.mask = np.where(mask > 0, np.uint8(255), np.uint8(0))
 
     def set_source_image(self, image: np.ndarray | None) -> None:
         self.cancel_magic_stroke()
@@ -3818,6 +3830,29 @@ class FloatingNavigator(QWidget):
         self.viewportCenterRequested.emit(image_point[0], image_point[1])
 
 
+class EditResultBridge(QObject):
+    completed = Signal(object)
+
+
+def _persist_edit_and_preview(paths, image_path, revision, job_id, page, base, settings, cancel_preview):
+    result = {'path': image_path, 'raw': paths['raw'], 'revision': revision,
+              'job_id': job_id, 'settings': settings, 'saved': False, 'preview': None, 'error': None}
+    try:
+        result['summary'] = store.save_page(paths, image_path, page)
+        result['saved'] = True
+        if not cancel_preview.is_set():
+            preview = _compose_overlay_preview(base, page['overlay'])
+            show_other, radius, color, alpha = settings
+            if show_other:
+                ring = _expanded_mask_ring(page['other'], radius)
+                preview = _overlay_mask_on_bgr(preview, ring, alpha * OTHER_MASK_PREVIEW_RING_ALPHA_RATIO, color)
+                preview = _overlay_mask_on_bgr(preview, page['other'], alpha, color)
+            result['preview'] = _qimage_from_bgr(preview)
+    except Exception as exc:
+        result['error'] = str(exc)
+    return result
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -3832,6 +3867,18 @@ class MainWindow(QMainWindow):
         self.current_img_path = ''
         self.current_base: np.ndarray | None = None
         self.current_page: dict | None = None
+        self._edit_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='page-save')
+        self._edit_bridge = EditResultBridge(self)
+        self._edit_bridge.completed.connect(self._on_edit_result, Qt.ConnectionType.QueuedConnection)
+        self._edit_revision = 0
+        self._edit_job_id = 0
+        self._last_handled_edit_job_id = -1
+        self._saved_edit_revision = 0
+        self._pending_edit_future = None
+        self._pending_edit_identity = None
+        self._pending_preview_cancel = None
+        self._last_edit_error = None
+        self._edit_executor_closed = False
         self.current_manual_solid: np.ndarray | None = None
         self.current_manual_other: np.ndarray | None = None
         self.current_background_sample: np.ndarray | None = None
@@ -4535,6 +4582,8 @@ class MainWindow(QMainWindow):
         if self.worker_thread is not None:
             self.status.showMessage("請等待目前任務完成再切換文件夾。")
             return
+        if not self.flush_pending_edits():
+            return
         if not osp.isdir(folder):
             QMessageBox.warning(self, '文件夾不存在', folder)
             self.remove_recent_folder(folder)
@@ -4545,7 +4594,17 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, '無法開啟專案', str(exc))
             return
         self.folder = folder
+        self.current_img_path = ''
+        self.current_base = None
         self.current_page = None
+        self.current_manual_solid = None
+        self.current_manual_other = None
+        self.current_background_sample = None
+        self._pending_edit_future = None
+        self.mask_view.setEnabled(False)
+        self.mask_view._committed_mask_overlay.clear()
+        self.mask_view.set_qimage(None)
+        self.preview_view.set_qimage(None)
         self.paths = paths
         self.imglist = image_files_in_folder(folder)
         self.report = load_report(self.paths)
@@ -5197,6 +5256,8 @@ class MainWindow(QMainWindow):
             return
         if not self.current_img_path:
             return
+        if not reuse_saved_page and not self.flush_pending_edits():
+            return
         reuse_saved_page = reuse_saved_page and self.current_base is not None and self.current_page is not None
         base = self.current_base if reuse_saved_page else _optional_imread(self.current_img_path, cv2.IMREAD_UNCHANGED)
         if base is None:
@@ -5311,6 +5372,8 @@ class MainWindow(QMainWindow):
         color_bgr: tuple[int, int, int],
         alpha: float,
     ) -> None:
+        if not self.flush_pending_edits():
+            raise OSError('目前編輯尚未成功儲存。')
         base = _optional_imread(img_path, cv2.IMREAD_UNCHANGED)
         if base is None:
             raise FileNotFoundError('無法讀取原圖')
@@ -5461,6 +5524,7 @@ class MainWindow(QMainWindow):
             if getattr(self, 'navigator', None) is not None:
                 self.navigator.set_qimage(None)
             return
+        self.mask_view._committed_mask_overlay.clear()
         mask_preview = _editor_mask_preview(
             self.current_base, self.current_manual_solid, self.current_manual_other,
             self.alpha, self.current_background_sample if self.show_background_sample else None,
@@ -5549,12 +5613,20 @@ class MainWindow(QMainWindow):
                 'edited': self.current_page['edited'].copy()}
 
     def restore_masks_snapshot(self, snapshot):
+        changed = ((self.current_manual_solid > 0) != (snapshot['manual_solid'] > 0))
+        changed |= ((self.current_manual_other > 0) != (snapshot['manual_other'] > 0))
+        rows, cols = np.flatnonzero(np.any(changed, axis=1)), np.flatnonzero(np.any(changed, axis=0))
+        dirty_bbox = ((int(cols[0]), int(rows[0]), int(cols[-1]) + 1, int(rows[-1]) + 1)
+                      if rows.size else None)
         self.current_manual_solid = snapshot['manual_solid'].copy()
         self.current_manual_other = snapshot['manual_other'].copy()
         self.current_page = {'overlay': snapshot['overlay'].copy(),
                              'other': snapshot['manual_other'].copy(),
                              'edited': snapshot['edited'].copy()}
-        store.save_page(self.paths, self.current_img_path, self.current_page)
+        self._edit_revision += 1
+        self._update_committed_left(dirty_bbox)
+        self._enqueue_current_page()
+        self.status.showMessage('已更新左側選區，正在儲存及生成右側預覽。')
 
     def mask_for_mode(self, mode: str) -> np.ndarray | None:
         if mode == 'manual_solid':
@@ -5564,7 +5636,7 @@ class MainWindow(QMainWindow):
         return None
 
     def set_current_edit_mask(self, mask):
-        mask = np.where(mask > 0, 255, 0).astype(np.uint8)
+        mask = np.where(mask > 0, np.uint8(255), np.uint8(0))
         if self.edit_mode == 'manual_solid':
             self.current_manual_solid = mask
             self.current_manual_other[mask > 0] = 0
@@ -5843,11 +5915,9 @@ class MainWindow(QMainWindow):
         self.resize_fit_timer.stop()
 
     def on_mask_edited(self, mask: object) -> None:
-        self.mask_view.stop_live_mask_preview()
         self.set_current_edit_mask(np.asarray(mask))
-        if not self.save_current_edit_mask():
+        if not self._commit_current_masks():
             return
-        self.queue_auto_render(reuse_saved_page=True)
         self.update_edit_buttons()
 
     def prepare_brush_live_preview(self) -> None:
@@ -5995,12 +6065,8 @@ class MainWindow(QMainWindow):
             if mask is not None:
                 mask[selection_mask] = 0
         self.queue_background_sample()
-        if not self.save_all_edit_masks():
+        if not self._commit_current_masks():
             return
-        if self.current_base is not None:
-            self.mask_view.set_mask(self.current_edit_mask(), self.current_base.shape[:2])
-        self.refresh_mask_preview(keep_view=True)
-        self.queue_auto_render()
         self.update_edit_buttons()
         self.status.showMessage('已清除右鍵矩形內所有 mask。')
 
@@ -6102,13 +6168,7 @@ class MainWindow(QMainWindow):
             return
         self.redo_stack.append(self.current_masks_snapshot())
         self.restore_masks_snapshot(self.undo_stack.pop())
-        if self.current_base is not None:
-            self.mask_view.set_mask(self.current_edit_mask(), self.current_base.shape[:2])
         self.queue_background_sample()
-        if not self.save_all_edit_masks():
-            return
-        self.refresh_mask_preview(keep_view=True)
-        self.queue_auto_render()
         self.update_edit_buttons()
 
     def redo_mask(self) -> None:
@@ -6118,13 +6178,7 @@ class MainWindow(QMainWindow):
             return
         self.undo_stack.append(self.current_masks_snapshot())
         self.restore_masks_snapshot(self.redo_stack.pop())
-        if self.current_base is not None:
-            self.mask_view.set_mask(self.current_edit_mask(), self.current_base.shape[:2])
         self.queue_background_sample()
-        if not self.save_all_edit_masks():
-            return
-        self.refresh_mask_preview(keep_view=True)
-        self.queue_auto_render()
         self.update_edit_buttons()
 
     def update_edit_buttons(self) -> None:
@@ -6134,15 +6188,130 @@ class MainWindow(QMainWindow):
     def save_current_edit_mask(self):
         return self.save_all_edit_masks()
 
-    def save_all_edit_masks(self):
+    def _current_dirty_bbox(self):
+        if self.current_page is None or self.current_manual_solid is None:
+            return None
+        changed = ((self.current_manual_solid > 0) != (self.current_page['overlay'][:, :, 3] > 0))
+        changed |= (self.current_manual_other > 0) != (self.current_page['other'] > 0)
+        rows, cols = np.flatnonzero(np.any(changed, axis=1)), np.flatnonzero(np.any(changed, axis=0))
+        if not rows.size:
+            return None
+        return int(cols[0]), int(rows[0]), int(cols[-1]) + 1, int(rows[-1]) + 1
+
+    def render_committed_mask_patch(self, x1, y1, x2, y2):
+        roi = np.s_[y1:y2, x1:x2]
+        preview = _editor_mask_preview(
+            self.current_base[roi], self.current_manual_solid[roi], self.current_manual_other[roi],
+            self.alpha, self.current_background_sample[roi]
+            if self.show_background_sample and self.current_background_sample is not None else None,
+            solid_color=self.mask_display_color,
+        )
+        return cv2.cvtColor(preview, cv2.COLOR_BGR2BGRA)
+
+    def _update_committed_left(self, dirty_bbox):
+        if self.current_base is None or dirty_bbox is None:
+            return
+        item = self.mask_view._committed_mask_overlay
+        height, width = self.current_base.shape[:2]
+        if item.renderer is None:
+            item.configure(width, height, self.render_committed_mask_patch, sparse=True)
+        x1, y1, x2, y2 = dirty_bbox
+        item.invalidate(QRectF(x1, y1, x2 - x1, y2 - y1))
+        self.mask_view.stop_live_mask_preview()
+        # The editor already owns the final selection; no flood-fill or pixmap
+        # rebuild is needed. Right-clear and undo also update this mutable mask.
+        self.mask_view.mask = self.current_edit_mask().copy()
+
+    def _preview_settings(self):
+        return (self.show_other_mask, self.other_mask_preview_expand_px,
+                self.other_mask_display_color, self.other_mask_display_alpha)
+
+    def _enqueue_current_page(self):
+        if not self.current_img_path or self.current_page is None or self._edit_executor_closed:
+            return
+        if self._pending_preview_cancel is not None:
+            self._pending_preview_cancel.set()
+        if self._pending_edit_future is not None:
+            self._pending_edit_future.cancel()
+        page = self.current_page
+        for array in page.values():
+            array.setflags(write=False)
+        paths, path = dict(self.paths), self.current_img_path
+        revision, settings = self._edit_revision, self._preview_settings()
+        self._edit_job_id += 1
+        job_id = self._edit_job_id
+        cancel_preview = threading.Event()
+        self._pending_preview_cancel = cancel_preview
+        self._pending_edit_identity = (paths['raw'], path, revision)
+        self._last_edit_error = None
+        future = self._edit_executor.submit(
+            _persist_edit_and_preview, paths, path, revision, job_id, page, self.current_base,
+            settings, cancel_preview,
+        )
+        self._pending_edit_future = future
+        bridge = self._edit_bridge
+        def finished(job):
+            if job.cancelled():
+                return
+            try:
+                bridge.completed.emit(job.result())
+            except RuntimeError:
+                # A successfully flushed, closing window can already be deleted.
+                pass
+        future.add_done_callback(finished)
+
+    def _on_edit_result(self, result):
+        if (result['path'] != self.current_img_path or result['raw'] != self.paths.get('raw')
+                or result['revision'] != self._edit_revision
+                or result['job_id'] != self._edit_job_id
+                or result['job_id'] == self._last_handled_edit_job_id):
+            return
+        self._last_handled_edit_job_id = result['job_id']
+        if result['saved']:
+            self._saved_edit_revision = result['revision']
+            self._last_edit_error = None
+            self._update_saved_page_summary(result['summary'])
+            if result['settings'] == self._preview_settings() and result['preview'] is not None:
+                self.preview_view.set_qimage(result['preview'], keep_view=True)
+                self.sync_preview_view()
+            if result['error']:
+                self.status.showMessage(f'選區已儲存，右側預覽失敗：{result["error"]}')
+            else:
+                self.status.showMessage('已儲存兩類選區並更新右側預覽。')
+        else:
+            self._last_edit_error = result['error'] or '無法儲存頁面。'
+            self.status.showMessage(f'儲存失敗：{self._last_edit_error}；修改仍保留在記憶體，可重試儲存。')
+
+    def _update_saved_page_summary(self, summary):
+        name = osp.basename(self.current_img_path)
+        pages = self.report.setdefault('pages', {})
+        pages[name] = dict(summary)
+        status = STATUS_OTHER if summary.get('other_pixels', 0) else STATUS_OK
+        for row in range(self.list_widget.count()):
+            item = self.list_widget.item(row)
+            if item.data(Qt.ItemDataRole.UserRole) == self.current_img_path:
+                item.setText(f'{name}    {status}')
+                item.setForeground(QColor('#d59a45' if status == STATUS_OTHER else '#57b66f'))
+                break
+        other_count = sum(bool(info.get('other_pixels', 0)) and 'error' not in info for info in pages.values())
+        failed_count = sum('error' in info for info in pages.values())
+        self.summary_label.setText(f'共 {len(self.imglist)} 張    OTHER {other_count}    失敗 {failed_count}')
+        self.report['summary'] = {
+            'total': max(len(self.imglist), len(pages)),
+            'processed': sum(bool(info.get('processed')) and 'error' not in info for info in pages.values()),
+            'failed': failed_count, 'with_other_mask': other_count,
+        }
+
+    def _commit_current_masks(self):
         if not self.current_img_path or self.current_page is None:
             return True
-        if (np.array_equal(self.current_manual_solid, self.current_page['overlay'][:, :, 3])
-                and np.array_equal(self.current_manual_other, self.current_page['other'])):
+        dirty_bbox = self._current_dirty_bbox()
+        if dirty_bbox is None:
+            self.mask_view.stop_live_mask_preview()
             return True
         try:
-            page, _ = save_page_edits(self.current_img_path, self.paths,
-                self.current_manual_solid, self.current_manual_other, state=self.current_page)
+            page = prepare_page_edits(self.current_base, self.current_manual_solid,
+                self.current_manual_other, state=self.current_page, dirty_bbox=dirty_bbox)
         except (OSError, ValueError) as exc:
             if '取色' not in str(exc):
                 QMessageBox.warning(self, '儲存失敗', str(exc))
@@ -6156,14 +6325,48 @@ class MainWindow(QMainWindow):
                 self.status.showMessage('已取消新增純色選區。')
                 return False
             try:
-                page, _ = save_page_edits(self.current_img_path, self.paths,
-                    self.current_manual_solid, self.current_manual_other, state=self.current_page,
+                page = prepare_page_edits(self.current_base, self.current_manual_solid,
+                    self.current_manual_other, state=self.current_page, dirty_bbox=dirty_bbox,
                     fill_color=(color.blue(), color.green(), color.red()))
             except (OSError, ValueError) as save_error:
                 QMessageBox.warning(self, '儲存失敗', str(save_error))
                 return False
         self.current_page = page
+        self._edit_revision += 1
+        self._update_committed_left(dirty_bbox)
+        self._enqueue_current_page()
+        self.status.showMessage('已更新左側選區，正在儲存及生成右側預覽。')
         return True
+
+    def flush_pending_edits(self):
+        if not self._commit_current_masks():
+            return False
+        if self._last_edit_error and self.current_page is not None:
+            self._enqueue_current_page()
+        future = self._pending_edit_future
+        if future is None:
+            return True
+        if future.cancelled():
+            return False
+        result = future.result()
+        self._on_edit_result(result)
+        if not result['saved']:
+            QMessageBox.warning(self, '儲存失敗', f'{result["error"]}\n修改保留在記憶體，請重試後再離開。')
+            return False
+        return True
+
+    def save_all_edit_masks(self):
+        # Equal in-memory masks can still have a pending save. Every boundary
+        # must wait for the latest snapshot, including an undo or a retry.
+        return self.flush_pending_edits()
+
+    def closeEvent(self, event):
+        if not self.flush_pending_edits():
+            event.ignore()
+            return
+        self._edit_executor.shutdown(wait=True)
+        self._edit_executor_closed = True
+        super().closeEvent(event)
 
     def queue_background_sample(self) -> None:
         # Background samples are produced during detection and cached by source.
@@ -6190,6 +6393,9 @@ class MainWindow(QMainWindow):
             return
         if not self.paths or not self.imglist:
             return
+        if not self.flush_pending_edits():
+            return
+        self.report = load_report(self.paths)
         if self.pdf_worker_thread is not None:
             QMessageBox.information(self, '正在生成 PDF', 'PDF 已在生成中。')
             return
@@ -6289,6 +6495,8 @@ class MainWindow(QMainWindow):
         self._open_path(self.paths['output'])
 
     def open_workflow_compare(self) -> None:
+        if not self.flush_pending_edits():
+            return
         from workflow_compare_ui import WorkflowCompareWindow
 
         if self.workflow_compare_window is not None:

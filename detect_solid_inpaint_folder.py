@@ -823,27 +823,27 @@ def _manual_solid_overlay(
     filled_regions = 0
 
     for box in boxes:
-        local_solid = _mask_for_box(solid_mask, box)
+        roi, local_solid, _ = _block_roi(solid_mask, box, SAMPLE_RING_PX * 2)
+        local_exclude = exclude_mask[roi]
         if not np.any(local_solid):
             continue
         expanded = cv2.dilate(local_solid, ring_kernel, iterations=1)
         sample_ring = cv2.bitwise_and(expanded, cv2.bitwise_not(local_solid))
-        sample_ring = cv2.bitwise_and(sample_ring, cv2.bitwise_not(exclude_mask))
+        sample_ring = cv2.bitwise_and(sample_ring, cv2.bitwise_not(local_exclude))
         active_sample = sample_ring > 0
         if int(np.count_nonzero(active_sample)) < MIN_SAMPLE_PIXELS:
             expanded = cv2.dilate(local_solid, _kernel(SAMPLE_RING_PX * 2), iterations=1)
             sample_ring = cv2.bitwise_and(expanded, cv2.bitwise_not(local_solid))
-            sample_ring = cv2.bitwise_and(sample_ring, cv2.bitwise_not(exclude_mask))
+            sample_ring = cv2.bitwise_and(sample_ring, cv2.bitwise_not(local_exclude))
             active_sample = sample_ring > 0
         if int(np.count_nonzero(active_sample)) < MIN_SAMPLE_PIXELS:
             continue
 
-        fill_bgr = _dominant_bgr(color_img[active_sample])
+        fill_bgr = _dominant_bgr(color_img[roi][active_sample])
         active = local_solid > 0
-        overlay[active, 0] = fill_bgr[0]
-        overlay[active, 1] = fill_bgr[1]
-        overlay[active, 2] = fill_bgr[2]
-        overlay[active, 3] = 255
+        local_overlay = overlay[roi]
+        local_overlay[active, :3] = fill_bgr
+        local_overlay[active, 3] = 255
         filled_regions += 1
 
     return overlay, filled_regions, int(np.count_nonzero(overlay[:, :, 3] > 0))
@@ -1078,17 +1078,50 @@ def _extend_saved_colors(overlay, added, retained):
     return remaining
 
 
-def save_page_edits(img_path, paths, solid, other, *, state=None, edited=None, fill_color=None):
-    image = imread(img_path, cv2.IMREAD_COLOR)
-    if image is None:
-        raise FileNotFoundError(f'無法讀取原圖：{img_path}')
-    old = read_page_state(paths, img_path, image.shape[:2]) if state is None else state
-    solid, other = np.asarray(solid) > 0, np.asarray(other) > 0
-    if solid.shape != image.shape[:2] or other.shape != solid.shape:
+def _edit_color_source(image):
+    image = np.asarray(image)
+    if image.dtype == np.uint16:
+        # IMREAD_COLOR reduces a 16-bit source to its high byte; the GUI cache
+        # retains the original depth because it uses IMREAD_UNCHANGED.
+        image = (image >> 8).astype(np.uint8)
+    elif image.dtype != np.uint8:
+        raise ValueError('原圖像素格式不支援。')
+    if image.ndim == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    elif image.ndim == 3 and image.shape[2] in (3, 4):
+        image = image[:, :, :3]
+    else:
+        raise ValueError('原圖必須是灰階、BGR 或 BGRA 圖像。')
+    return image
+
+
+def prepare_page_edits(source_image, solid, other, *, state, edited=None, fill_color=None,
+                       dirty_bbox=None):
+    """Prepare an authoritative snapshot in memory, without reading or writing files.
+
+    A dirty box includes every changed pixel. Its halo retains neighbouring saved
+    colours and the complete fallback sampling ring. Inputs are never mutated.
+    """
+    source_image = np.asarray(source_image)
+    solid, other = np.asarray(solid), np.asarray(other)
+    shape = source_image.shape[:2]
+    if solid.shape != shape or other.shape != shape:
         raise ValueError('選區尺寸與原圖不一致。')
+    if state['overlay'].shape != (*shape, 4) or state['other'].shape != shape or state['edited'].shape != shape:
+        raise ValueError('頁面資料尺寸與原圖不一致。')
+    height, width = shape
+    if dirty_bbox is None:
+        roi = np.s_[:, :]
+    else:
+        x1, y1, x2, y2 = _expand_box(dirty_bbox, BLOCK_PADDING_PX + SAMPLE_RING_PX * 2 + 1, width, height)
+        roi = np.s_[y1:y2, x1:x2]
+    image = _edit_color_source(source_image[roi])
+    solid, other = solid[roi] > 0, other[roi] > 0
     if np.any(solid & other):
         raise ValueError('兩類選區不能重疊。')
-    overlay = old['overlay'].copy()
+    page = {'overlay': state['overlay'].copy(), 'other': state['other'].copy(),
+            'edited': state['edited'].copy() if edited is None else edited.copy()}
+    overlay = page['overlay'][roi]
     was_solid = overlay[:, :, 3] > 0
     added = solid & ~was_solid
     if np.any(added):
@@ -1097,16 +1130,28 @@ def save_page_edits(img_path, paths, solid, other, *, state=None, edited=None, f
             overlay[added, 3] = 255
         else:
             remaining = _extend_saved_colors(overlay, added, was_solid & solid)
-            exclude = np.where(solid | other, 255, 0).astype(np.uint8)
-            new_overlay, _, _ = _manual_solid_overlay(image, remaining.astype(np.uint8)*255, exclude)
-            if not np.all(new_overlay[:, :, 3][remaining] > 0):
-                raise ValueError('新增純色選區沒有足夠背景可取色，請指定填色顏色。')
-            overlay[remaining] = new_overlay[remaining]
-    overlay[~solid] = 0
-    changed = (solid != was_solid) | (other != (old['other'] > 0))
-    locks = old['edited'].copy() if edited is None else edited.copy()
-    locks[changed] = 255
-    page = {'overlay': overlay, 'other': other.astype(np.uint8)*255, 'edited': locks}
+            if np.any(remaining):
+                exclude = np.where(solid | other, np.uint8(255), np.uint8(0))
+                new_overlay, _, _ = _manual_solid_overlay(image, remaining.astype(np.uint8)*255, exclude)
+                if not np.all(new_overlay[:, :, 3][remaining] > 0):
+                    raise ValueError('新增純色選區沒有足夠背景可取色，請指定填色顏色。')
+                overlay[remaining] = new_overlay[remaining]
+    np.multiply(overlay, solid[:, :, None], out=overlay)
+    changed = (solid != was_solid) | (other != (state['other'][roi] > 0))
+    page['edited'][roi][changed] = 255
+    page['other'][roi] = np.where(other, np.uint8(255), np.uint8(0))
+    return page
+
+
+def save_page_edits(img_path, paths, solid, other, *, state=None, edited=None, fill_color=None,
+                    source_image=None):
+    image = imread(img_path, cv2.IMREAD_COLOR) if source_image is None else np.asarray(source_image)
+    if image is not None and image.dtype not in (np.uint8, np.uint16):
+        image = imread(img_path, cv2.IMREAD_COLOR)
+    if image is None:
+        raise FileNotFoundError(f'無法讀取原圖：{img_path}')
+    old = read_page_state(paths, img_path, image.shape[:2]) if state is None else state
+    page = prepare_page_edits(image, solid, other, state=old, edited=edited, fill_color=fill_color)
     summary = store.save_page(paths, img_path, page)
     return page, summary
 

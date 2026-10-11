@@ -161,13 +161,13 @@ def page_summary(page):
 
 def save_page(paths, image, page, summary=None):
     overlay = np.asarray(page['overlay'], dtype=np.uint8).copy()
-    other = np.where(page['other'] > 0, 255, 0).astype(np.uint8)
-    edited = np.where(page['edited'] > 0, 255, 0).astype(np.uint8)
+    other = np.where(page['other'] > 0, np.uint8(255), np.uint8(0))
+    edited = np.where(page['edited'] > 0, np.uint8(255), np.uint8(0))
     if overlay.shape != (*other.shape, 4) or edited.shape != other.shape:
         raise ValueError('頁面資料尺寸不一致。')
     if np.any((overlay[:, :, 3] > 0) & (other > 0)):
         raise ValueError('純色填充和圖像修補不能重疊。')
-    overlay[overlay[:, :, 3] == 0] = 0
+    np.multiply(overlay, (overlay[:, :, 3] > 0)[:, :, None], out=overlay)
     state = {'overlay': overlay, 'other': other, 'edited': edited}
     has_data = any(np.any(value) for value in state.values())
     signature = source_signature(image)
