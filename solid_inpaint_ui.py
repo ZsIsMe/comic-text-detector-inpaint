@@ -564,8 +564,11 @@ class ImageView(QGraphicsView):
         pixel_delta = event.pixelDelta()
         angle_delta = event.angleDelta()
         modifiers = event.modifiers()
-        if modifiers & Qt.KeyboardModifier.AltModifier:
-            zoom_delta = pixel_delta.y() if not pixel_delta.isNull() else angle_delta.y()
+        alt_pressed = bool(modifiers & Qt.KeyboardModifier.AltModifier)
+        if not alt_pressed:
+            alt_pressed = bool(QApplication.queryKeyboardModifiers() & Qt.KeyboardModifier.AltModifier)
+        if alt_pressed:
+            zoom_delta = pixel_delta.y() or angle_delta.y() or pixel_delta.x() or angle_delta.x()
             if zoom_delta != 0:
                 factor = VIEW_ZOOM_STEP if zoom_delta > 0 else 1 / VIEW_ZOOM_STEP
                 self.zoom_by(factor, anchor_pos=event.position().toPoint())
