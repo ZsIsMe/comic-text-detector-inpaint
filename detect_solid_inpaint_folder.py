@@ -717,6 +717,7 @@ def _solid_overlay_from_mask(
     repair_kernel = _kernel(REPAIR_EXPAND_PX)
     ring_kernel = _kernel(SAMPLE_RING_PX)
     overlay = np.zeros((height, width, 4), dtype=np.uint8)
+    solid_seeds = np.zeros_like(overlay)
     other_mask = np.zeros((height, width), dtype=np.uint8)
     background_sample_mask = np.zeros((height, width), dtype=np.uint8)
     debug_blocks = []
@@ -737,6 +738,9 @@ def _solid_overlay_from_mask(
             local_overlay = overlay[roi]
             local_overlay[active, :3] = quality.fill_bgr
             local_overlay[active, 3] = 255
+            local_seeds = solid_seeds[roi]
+            local_seeds[local_text > 0, :3] = quality.fill_bgr
+            local_seeds[local_text > 0, 3] = 255
         else:
             other_mask[roi] |= repair_area
 
@@ -745,47 +749,13 @@ def _solid_overlay_from_mask(
         debug_blocks.append(block_debug)
 
     bubble_records = []
-    ignored_boundary_noise = np.zeros(text_mask.shape, np.uint8)
     if bubble_polygons:
-        bubble_overlay, veto, bubble_sample, bubble_records = fill_bubbles(
-            color_img, text_mask, bubble_polygons, bubble_shrink_ratio, protected,
-            jpeg_source=jpeg_source,
+        bubble_overlay, bubble_records = fill_bubbles(
+            text_mask, solid_seeds, bubble_polygons, bubble_shrink_ratio, protected,
         )
-        # Bubble validation owns its interior, including rejected expansion
-        # and the narrow rim intentionally excluded by erosion.
-        inside = veto > 0
-        overlay[inside] = 0
-        repair = cv2.dilate(text_mask, repair_kernel)
-        other_mask[inside & (repair > 0)] = 255
         accepted = bubble_overlay[:, :, 3] > 0
         overlay[accepted] = bubble_overlay[accepted]
         other_mask[accepted] = 0
-        background_sample_mask[inside] = bubble_sample[inside]
-        # An accepted bubble may contain tiny detector islands on its outline.
-        # Keep the source mask and artwork, but do not report these deliberately
-        # ignored islands as an unfilled paragraph. Never waive manual OTHER.
-        for record in bubble_records:
-            if not record['accepted']:
-                continue
-            for x, y, w, h in record.get('ignored_boundary_components', []):
-                roi, island, _ = _block_roi(text_mask, [x, y, x+w, y+h], REPAIR_EXPAND_PX)
-                ignored_boundary_noise[roi] |= cv2.dilate(island, repair_kernel)
-        near_fill = cv2.dilate(accepted.astype(np.uint8), _kernel(3)) > 0
-        n, labels, stats, _ = cv2.connectedComponentsWithStats(other_mask, connectivity=8)
-        tiny_edges = []
-        for idx in range(1, n):
-            x, y, w, h, size = stats[idx]
-            if size > 4:
-                continue
-            active = labels[y:y+h, x:x+w] == idx
-            if np.all(near_fill[y:y+h, x:x+w][active]):
-                tiny_edges.append(idx)
-        if sum(stats[idx, cv2.CC_STAT_AREA] for idx in tiny_edges) <= min(64, max(4, np.count_nonzero(accepted)*0.0005)):
-            ignored_boundary_noise[np.isin(labels, tiny_edges)] = 255
-        if protected is not None:
-            ignored_boundary_noise[protected > 0] = 0
-        overlay[ignored_boundary_noise > 0] = 0
-        other_mask[ignored_boundary_noise > 0] = 0
     if protected is not None:
         overlay[protected > 0] = 0
         other_mask[(protected > 0) & (cv2.dilate(text_mask, repair_kernel) > 0)] = 255
@@ -793,15 +763,14 @@ def _solid_overlay_from_mask(
         record['local_is_solid'] = record['is_solid']
         roi, local_text, _ = _block_roi(text_mask, box, REPAIR_EXPAND_PX)
         block_repair = cv2.dilate(local_text, repair_kernel) > 0
-        ignored = ignored_boundary_noise[roi] > 0
-        record['ignored_boundary_pixels'] = int(np.count_nonzero(block_repair & ignored))
-        record['is_solid'] = bool(np.all(((overlay[roi][:, :, 3] > 0) | ignored)[block_repair]))
+        record['ignored_boundary_pixels'] = 0
+        record['is_solid'] = bool(np.all((overlay[roi][:, :, 3] > 0)[block_repair]))
     summary = {
         'blocks': len(boxes),
         'auto_blocks': sum(1 for item in debug_blocks if item['is_solid']),
         'other_blocks': sum(1 for item in debug_blocks if not item['is_solid']),
         'other_pixels': int(np.count_nonzero(other_mask)),
-        'ignored_boundary_pixels': int(np.count_nonzero(ignored_boundary_noise)),
+        'ignored_boundary_pixels': 0,
         'blocks_debug': debug_blocks,
         'solid_bubbles': sum(item['accepted'] for item in bubble_records),
         'bubbles_debug': bubble_records,
@@ -1202,15 +1171,6 @@ def regenerate_image_from_mask(img_path, paths, mask=None, *, reclassify=False):
     locked = old['edited'] > 0
     overlay[locked] = old['overlay'][locked]
     other[locked] = old['other'][locked]
-    # A manual OTHER region protects its entire detected bubble from automatic
-    # expansion, while retaining previously accepted colours elsewhere.
-    if np.any(old['other'][locked]):
-        protected = np.where(locked & (old['other'] > 0), 255, 0).astype(np.uint8)
-        overlay, other, sample, diagnostics = _solid_overlay_from_mask(
-            image, mask, polygons, settings['shrink_percent']/100, protected,
-            jpeg_source=jpeg_source)
-        overlay[locked] = old['overlay'][locked]
-        other[locked] = old['other'][locked]
     page = {'overlay': overlay, 'other': other, 'edited': old['edited']}
     diagnostics['bubble_detection'] = bubble_status
     if np.any(mask) or cache_path.exists():
