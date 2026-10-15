@@ -28,7 +28,8 @@ class UnifiedDetectionTests(unittest.TestCase):
         dialog.exec.return_value = QDialog.DialogCode.Accepted if accepted else QDialog.DialogCode.Rejected
         dialog.selected_detector.return_value = ui.DETECTOR_YSGYOLO
         dialog.selected_detector_params.return_value = {'device': 'cpu'}
-        dialog.selected_solid_settings.return_value = {'enabled': False, 'shrink_percent': 4.5}
+        dialog.selected_solid_settings.return_value = {'enabled': False, 'shrink_percent': 4.5,
+                                                        'direct_white': False}
         dialog.selected_page_range.return_value = (1, len(self.w.imglist))
         return dialog
 
@@ -42,11 +43,21 @@ class UnifiedDetectionTests(unittest.TestCase):
         dialog = ui.DetectorSelectionDialog(self.w.settings, self.w,
             solid_settings={'enabled': False, 'shrink_percent': 6.0}, image_paths=self.w.imglist)
         self.assertFalse(dialog.bubble_shrink.isEnabled())
+        self.assertFalse(dialog.bubble_direct_white.isEnabled())
+        self.assertTrue(dialog.bubble_direct_white.isChecked())
         for button in dialog.buttons.values():
             button.setChecked(True)
-            self.assertEqual(dialog.selected_solid_settings(), {'enabled': False, 'shrink_percent': 6.0})
+            self.assertEqual(dialog.selected_solid_settings(),
+                             {'enabled': False, 'shrink_percent': 6.0, 'direct_white': True})
         dialog.bubble_enabled.setChecked(True)
         self.assertTrue(dialog.bubble_shrink.isEnabled())
+        self.assertTrue(dialog.bubble_direct_white.isEnabled())
+        dialog.bubble_direct_white.setChecked(False)
+        dialog.bubble_enabled.setChecked(False)
+        self.assertFalse(dialog.bubble_direct_white.isEnabled())
+        self.assertFalse(dialog.selected_solid_settings()['direct_white'])
+        dialog.bubble_enabled.setChecked(True)
+        self.assertFalse(dialog.bubble_direct_white.isChecked())
         self.assertFalse(any(action.text() == '純色填充設定' for action in self.w.findChildren(QAction)))
         dialog.close()
 
@@ -98,7 +109,8 @@ class UnifiedDetectionTests(unittest.TestCase):
         with patch.object(ui, 'DetectorSelectionDialog', return_value=dialog), patch.object(self.w, 'start_worker', return_value=True) as start, patch.object(ui.QMessageBox, 'warning', return_value=QMessageBox.StandardButton.Yes):
             self.w.run_or_load()
         self.assertEqual(start.call_args.args[0], 'detect')
-        self.assertEqual(start.call_args.kwargs['solid_settings'], {'enabled': False, 'shrink_percent': 4.5})
+        self.assertEqual(start.call_args.kwargs['solid_settings'],
+                         {'enabled': False, 'shrink_percent': 4.5, 'direct_white': False})
         dialog.save_settings.assert_called_once()
 
     def test_selected_inclusive_range_reaches_worker_and_confirmation(self):
@@ -114,6 +126,25 @@ class UnifiedDetectionTests(unittest.TestCase):
         existing.assert_called_once_with(selected)
         self.assertEqual(start.call_args.args[:2], ('detect', selected))
         self.assertIn('第 2–3 頁', warning.call_args.args[2])
+        self.assertIn('關閉', warning.call_args.args[2])
+
+    def test_confirmation_names_saved_bubble_mode(self):
+        dialog = self.dialog()
+        dialog.selected_solid_settings.return_value = {
+            'enabled': True, 'shrink_percent': 2.0, 'direct_white': False}
+        with patch.object(ui, 'DetectorSelectionDialog', return_value=dialog), \
+                patch.object(self.w, 'start_worker', return_value=True), \
+                patch.object(self.w, 'has_existing_masks', return_value=True), \
+                patch.object(ui.QMessageBox, 'warning', return_value=QMessageBox.StandardButton.Yes) as warning:
+            self.w.run_or_load()
+        self.assertIn('依純色文字底色填充', warning.call_args.args[2])
+        dialog.selected_solid_settings.return_value['direct_white'] = True
+        with patch.object(ui, 'DetectorSelectionDialog', return_value=dialog), \
+                patch.object(self.w, 'start_worker', return_value=True), \
+                patch.object(self.w, 'has_existing_masks', return_value=True), \
+                patch.object(ui.QMessageBox, 'warning', return_value=QMessageBox.StandardButton.Yes) as warning:
+            self.w.run_or_load()
+        self.assertIn('直接對氣泡塗白', warning.call_args.args[2])
 
     def test_unprocessed_subset_does_not_warn_about_other_saved_pages(self):
         self.add_pages()
@@ -179,7 +210,7 @@ class UnifiedDetectionTests(unittest.TestCase):
         process.assert_not_called()
 
     def test_batch_persists_disabled_and_bypasses_cached_bubbles(self):
-        options = {'enabled': False, 'shrink_percent': 4.5}
+        options = {'enabled': False, 'shrink_percent': 4.5, 'direct_white': False}
         try:
             with patch.object(ui, 'QThread') as thread, patch.object(ui, 'FolderWorker'):
                 self.assertTrue(self.w.start_worker('detect', self.w.imglist, solid_settings=options))

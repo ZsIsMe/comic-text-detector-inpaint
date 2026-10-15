@@ -219,6 +219,37 @@ class SolidBubbleTests(unittest.TestCase):
         self.assertFalse(np.any(output))
         self.assertFalse(records[0]['accepted'])
 
+    def test_direct_white_fills_b_only_and_empty_text_without_sampling_background(self):
+        image, mask, polys = scene((90, 110, 130))
+        image_before = image.copy()
+        seeds = np.zeros((*mask.shape, 4), np.uint8)
+        for text in (mask, np.zeros_like(mask)):
+            with self.subTest(text_pixels=int(np.count_nonzero(text))):
+                output, records = bubble.fill_bubbles(text, seeds, polys, direct_white=True)
+                self.assertTrue(records[0]['accepted'])
+                self.assertEqual(records[0]['reason'], 'direct_white')
+                self.assertEqual(records[0]['fill_bgr'], [255, 255, 255])
+                np.testing.assert_array_equal(output[40, 40], [255, 255, 255, 255])
+                self.assertEqual(output[10, 10, 3], 0)
+        np.testing.assert_array_equal(image, image_before)
+
+    def test_direct_white_keeps_polygon_inset_overlap_seam_and_protected_pixels(self):
+        mask = np.zeros((180, 200), np.uint8)
+        seeds = np.zeros((*mask.shape, 4), np.uint8)
+        polygons = [np.array([[20, 20], [112, 20], [112, 159], [20, 159]], np.float32),
+                    np.array([[87, 20], [179, 20], [179, 159], [87, 159]], np.float32)]
+        protected = np.zeros_like(mask)
+        protected[70:75, 50:55] = 255
+        output, records = bubble.fill_bubbles(mask, seeds, polygons,
+            protected=protected, direct_white=True)
+        self.assertEqual(sum(r['accepted'] for r in records), 2)
+        self.assertEqual(output[80, 50, 3], 255)
+        self.assertEqual(output[80, 150, 3], 255)
+        self.assertFalse(np.any(output[80, 85:115, 3]))
+        self.assertFalse(np.any(output[protected > 0, 3]))
+        self.assertEqual(output[20, 50, 3], 0)
+        self.assertEqual(output[10, 50, 3], 0)
+
     def test_spatial_spread_remains_available_to_local_classifier(self):
         image = np.full((40, 40, 3), 200, np.uint8)
         sample = np.ones((40, 40), bool)
@@ -238,11 +269,58 @@ class SolidBubbleTests(unittest.TestCase):
 class BubbleIntegrationTests(unittest.TestCase):
     def test_settings_persist_and_invalid_values_are_safe(self):
         with tempfile.TemporaryDirectory() as directory:
-            self.assertEqual(bubble.load_settings(directory), {'enabled': True, 'shrink_percent': 2.0})
-            bubble.save_settings(directory, False, 3.5)
-            self.assertEqual(bubble.load_settings(directory), {'enabled': False, 'shrink_percent': 3.5})
-            store.update_project(directory, settings={'solid_fill': {'enabled':'false', 'shrink_percent':'NaN'}})
-            self.assertEqual(bubble.load_settings(directory), {'enabled': True, 'shrink_percent': 2.0})
+            self.assertEqual(bubble.load_settings(directory),
+                             {'enabled': True, 'shrink_percent': 2.0, 'direct_white': True})
+            store.update_project(directory, settings={'solid_fill': {'enabled': True, 'shrink_percent': 3.0}})
+            self.assertTrue(bubble.load_settings(directory)['direct_white'])
+            bubble.save_settings(directory, False, 3.5, direct_white=False)
+            self.assertEqual(bubble.load_settings(directory),
+                             {'enabled': False, 'shrink_percent': 3.5, 'direct_white': False})
+            bubble.save_settings(directory, True, 2.0, direct_white=False)
+            self.assertFalse(bubble.load_settings(directory)['direct_white'])
+            store.update_project(directory, settings={'solid_fill': {
+                'enabled': 'false', 'shrink_percent': 'NaN', 'direct_white': 'false'}})
+            self.assertEqual(bubble.load_settings(directory),
+                             {'enabled': True, 'shrink_percent': 2.0, 'direct_white': True})
+
+    def test_direct_white_clears_auto_other_but_keeps_uncovered_other(self):
+        from detect_solid_inpaint_folder import SolidQuality
+        image, mask, polys = scene((100, 110, 120))
+        outside = np.zeros_like(mask)
+        outside[70:80, 2:12] = 255
+        mask |= outside
+        failed = SolidQuality(False, 0, (0, 0, 0), 100, 0, 0, 100, 0, 100, 100, 'full')
+        with patch('detect_solid_inpaint_folder._best_quality', return_value=failed):
+            output, other, _, report = _solid_overlay_from_mask(
+                image, mask, polys, bubble_direct_white=True)
+        self.assertEqual(report['solid_bubbles'], 1)
+        np.testing.assert_array_equal(output[40, 40], [255, 255, 255, 255])
+        self.assertEqual(other[80, 85], 0)
+        self.assertEqual(output[75, 5, 3], 0)
+        self.assertEqual(other[75, 5], 255)
+
+    def test_regeneration_direct_white_detects_bubbles_without_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = np.full((180, 200, 3), (70, 90, 110), np.uint8)
+            path = str(Path(directory)/'page.png')
+            cv2.imwrite(path, image)
+            paths = _ensure_dirs(directory)
+            _, mask, polygons = scene()
+            mask[:] = 0
+            with patch('detect_solid_inpaint_folder.detect_bubbles', return_value=(polygons, 'detected')) as detect:
+                report = regenerate_image_from_mask(path, paths, mask)
+            detect.assert_called_once()
+            self.assertEqual(report['bubble_detection']['status'], 'detected')
+            self.assertEqual(report['solid_bubbles'], 1)
+            state = read_page_state(paths, path)
+            np.testing.assert_array_equal(state['overlay'][40, 40], [255, 255, 255, 255])
+            self.assertEqual(state['overlay'][10, 10, 3], 0)
+            bubble.save_settings(paths['raw'], True, 2, direct_white=False)
+            with patch('detect_solid_inpaint_folder.detect_bubbles') as detect:
+                report = regenerate_image_from_mask(path, paths, mask)
+            detect.assert_not_called()
+            self.assertEqual(report['bubble_detection']['status'], 'no_text')
+            self.assertEqual(report['solid_bubbles'], 0)
 
     def test_regeneration_omits_text_mask_and_restores_manual_other_and_erasure(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -263,7 +341,10 @@ class BubbleIntegrationTests(unittest.TestCase):
                 erased = np.zeros_like(mask)
                 erased[45:48, 45:48] = 255
                 solid[erased > 0] = 0
-                save_page_edits(path, paths, solid, protected)
+                manual_solid = np.zeros_like(mask)
+                manual_solid[8:12, 8:12] = 255
+                solid[manual_solid > 0] = 255
+                save_page_edits(path, paths, solid, protected, fill_color=(18, 30, 42))
                 report = regenerate_image_from_mask(path, paths, mask)
                 self.assertEqual(report['solid_bubbles'], 1)
                 result = read_page_state(paths, path)
@@ -271,6 +352,8 @@ class BubbleIntegrationTests(unittest.TestCase):
                 self.assertTrue(np.all(result['other'][protected > 0] == 255))
                 self.assertFalse(np.any(result['overlay'][erased > 0, 3]))
                 self.assertFalse(np.any(result['other'][erased > 0]))
+                self.assertTrue(np.all(result['overlay'][manual_solid > 0, :3] == [18, 30, 42]))
+                self.assertTrue(np.all(result['overlay'][manual_solid > 0, 3] == 255))
                 self.assertEqual(result['overlay'][40, 40, 3], 255)
 
     def test_disabled_or_missing_model_falls_back_and_reports_reason(self):

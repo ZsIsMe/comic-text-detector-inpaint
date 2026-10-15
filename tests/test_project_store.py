@@ -156,9 +156,9 @@ class ProjectTests(unittest.TestCase):
         np.testing.assert_array_equal(page['overlay'][0, 0], [80, 90, 100, 255])
 
     def test_empty_page_has_no_archives_but_erase_lock_is_saved(self):
-        with patch('detect_solid_inpaint_folder.detect_bubbles') as detect:
+        with patch('detect_solid_inpaint_folder.detect_bubbles', return_value=([], 'detected')) as detect:
             regenerate_image_from_mask(self.path, self.paths, self.mask*0)
-        detect.assert_not_called()
+        detect.assert_called_once()
         self.assertTrue(store.has_page(self.paths, self.path))
         self.assertFalse(list(Path(self.paths['raw']).rglob('*.npz')))
         self.classify()

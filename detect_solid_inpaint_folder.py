@@ -706,6 +706,7 @@ def _solid_overlay_from_mask(
     bubble_shrink_ratio: float = 0.02,
     protected: np.ndarray | None = None,
     jpeg_source: bool = False,
+    bubble_direct_white: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     if len(img.shape) == 2:
         color_img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
@@ -752,6 +753,7 @@ def _solid_overlay_from_mask(
     if bubble_polygons:
         bubble_overlay, bubble_records = fill_bubbles(
             text_mask, solid_seeds, bubble_polygons, bubble_shrink_ratio, protected,
+            direct_white=bubble_direct_white,
         )
         accepted = bubble_overlay[:, :, 3] > 0
         overlay[accepted] = bubble_overlay[accepted]
@@ -1167,7 +1169,7 @@ def regenerate_image_from_mask(img_path, paths, mask=None, *, reclassify=False):
     jpeg_source = Path(img_path).suffix.lower() in ('.jpg', '.jpeg')
     overlay, other, sample, diagnostics = _solid_overlay_from_mask(
         image, mask, polygons, settings['shrink_percent']/100,
-        jpeg_source=jpeg_source)
+        jpeg_source=jpeg_source, bubble_direct_white=settings['direct_white'])
     locked = old['edited'] > 0
     overlay[locked] = old['overlay'][locked]
     other[locked] = old['other'][locked]
@@ -1185,7 +1187,7 @@ def bubble_context(detect_img, mask, paths, img_path):
     settings = load_settings(paths['raw'])
     polygons = []
     status = {'status': 'disabled' if not settings['enabled'] else 'no_text'}
-    if settings['enabled'] and np.any(mask):
+    if settings['enabled'] and (settings['direct_white'] or np.any(mask)):
         try:
             polygons, source = detect_bubbles(detect_img, store.cache_path(paths, img_path))
             status = {'status': source, 'instances': len(polygons)}

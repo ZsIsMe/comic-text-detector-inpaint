@@ -3526,13 +3526,18 @@ class DetectorSelectionDialog(QDialog):
         bubble_title_font.setBold(True)
         bubble_title.setFont(bubble_title_font)
         bubble_layout.addWidget(bubble_title)
-        values = solid_settings or {'enabled': True, 'shrink_percent': 2.0}
-        self.bubble_enabled = QCheckBox('將氣泡內的純色文字擴大為整泡填色（MangaLens）')
+        values = solid_settings or {'enabled': True, 'shrink_percent': 2.0, 'direct_white': True}
+        self.bubble_enabled = QCheckBox('啟用氣泡填充（MangaLens）')
         self.bubble_enabled.setChecked(values['enabled'])
         bubble_layout.addWidget(self.bubble_enabled)
-        hint = QLabel('先將文字分類為純色填充或圖像修補，再由 MangaLens 取得氣泡輪廓。\n'
-                      '氣泡內只要有純色文字，就以其底色填滿內縮後的氣泡；不再次判斷背景。'
-                      '取消勾選時只處理文字範圍。人工修改與擦除會保留。')
+        self.bubble_direct_white = QCheckBox('直接對氣泡塗白')
+        self.bubble_direct_white.setChecked(values.get('direct_white', True))
+        self.bubble_direct_white.setEnabled(self.bubble_enabled.isChecked())
+        self.bubble_enabled.toggled.connect(self.bubble_direct_white.setEnabled)
+        bubble_layout.addWidget(self.bubble_direct_white)
+        hint = QLabel('勾選「直接對氣泡塗白」時，MangaLens 偵測到的氣泡會直接塗白，即使沒有文字或只有圖像修補文字。\n'
+                      '取消此子選項時，只有氣泡內已有純色填充文字，才以該文字的底色填滿氣泡。'
+                      '兩種模式都保留內縮邊框及人工修改與擦除。')
         hint.setWordWrap(True)
         hint.setProperty('secondary', True)
         bubble_layout.addWidget(hint)
@@ -3601,7 +3606,8 @@ class DetectorSelectionDialog(QDialog):
 
     def selected_solid_settings(self) -> dict:
         return {'enabled': self.bubble_enabled.isChecked(),
-                'shrink_percent': self.bubble_shrink.value()}
+                'shrink_percent': self.bubble_shrink.value(),
+                'direct_white': self.bubble_direct_white.isChecked()}
 
 
 class AddDetectionDialog(QDialog):
@@ -5037,8 +5043,11 @@ class MainWindow(QMainWindow):
         detector_params = detector_dialog.selected_detector_params()
         solid_settings = detector_dialog.selected_solid_settings()
         detector_label = DETECTOR_LABELS.get(detector_name, detector_name)
-        bubble_label = (f'開啟（內縮 {solid_settings["shrink_percent"]:g}%）'
-                        if solid_settings['enabled'] else '關閉')
+        bubble_label = (
+            f'{"直接對氣泡塗白" if solid_settings.get("direct_white", True) else "依純色文字底色填充"}'
+            f'（內縮 {solid_settings["shrink_percent"]:g}%）'
+            if solid_settings['enabled'] else '關閉'
+        )
 
         if self.has_existing_masks(image_paths):
             reply = QMessageBox.warning(
@@ -5227,7 +5236,8 @@ class MainWindow(QMainWindow):
         if solid_settings is not None:
             try:
                 save_solid_settings(self.paths['raw'], solid_settings['enabled'],
-                                    solid_settings['shrink_percent'])
+                                    solid_settings['shrink_percent'],
+                                    solid_settings.get('direct_white', True))
             except (OSError, ValueError) as exc:
                 QMessageBox.warning(self, '儲存失敗', str(exc))
                 return False

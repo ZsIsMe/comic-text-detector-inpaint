@@ -1,4 +1,4 @@
-"""MangaLens bubble geometry for expanding independently verified solid text.
+"""MangaLens bubble geometry for white fills or verified solid text expansion.
 
 The polygon/2% inset approach follows manga-translator-ui's ballon_fill.py and
 mangalens_detector.py (GPL-3.0; see vendor/LICENSE-BallonsTranslator).
@@ -24,11 +24,13 @@ _model_lock = threading.Lock()
 
 
 def load_settings(raw_dir: str | Path) -> dict:
-    defaults = {'enabled': True, 'shrink_percent': 2.0}
+    defaults = {'enabled': True, 'shrink_percent': 2.0, 'direct_white': True}
     try:
         data = store.load_project(raw_dir).get('settings', {}).get('solid_fill', {})
         enabled = data.get('enabled', True)
         defaults['enabled'] = enabled if isinstance(enabled, bool) else True
+        direct_white = data.get('direct_white', True)
+        defaults['direct_white'] = direct_white if isinstance(direct_white, bool) else True
         percent = float(data.get('shrink_percent', 2.0))
         if np.isfinite(percent):
             defaults['shrink_percent'] = max(0.0, min(percent, 10.0))
@@ -37,11 +39,13 @@ def load_settings(raw_dir: str | Path) -> dict:
     return defaults
 
 
-def save_settings(raw_dir: str | Path, enabled: bool, shrink_percent: float) -> None:
+def save_settings(raw_dir: str | Path, enabled: bool, shrink_percent: float,
+                  direct_white: bool = True) -> None:
     if not np.isfinite(shrink_percent) or not 0 <= shrink_percent <= 10:
         raise ValueError('氣泡內縮比例必須介於 0–10%。')
     settings = store.load_project(raw_dir).get('settings', {})
-    settings['solid_fill'] = {'enabled': bool(enabled), 'shrink_percent': float(shrink_percent)}
+    settings['solid_fill'] = {'enabled': bool(enabled), 'shrink_percent': float(shrink_percent),
+                              'direct_white': bool(direct_white)}
     store.update_project(raw_dir, settings=settings)
 
 
@@ -173,12 +177,14 @@ def spatial_spread(image: np.ndarray, sample: np.ndarray) -> tuple[float, int]:
 
 def fill_bubbles(text_mask: np.ndarray, solid_seeds: np.ndarray,
                  polygons: list[np.ndarray], shrink_ratio: float = 0.02,
-                 protected: np.ndarray | None = None) -> tuple[np.ndarray, list[dict]]:
-    """Expand verified solid text inside MangaLens polygons using its chosen BGR.
+                 protected: np.ndarray | None = None,
+                 direct_white: bool = False) -> tuple[np.ndarray, list[dict]]:
+    """Fill MangaLens polygons white, or expand verified solid text using its BGR.
 
     solid_seeds contains only text pixels already classified as solid, with the
-    local classifier's colour in BGRA. Bubble pixels are never sampled or
-    classified again. Overlap seams and protected manual edits stay untouched.
+    local classifier's colour in BGRA. The direct white mode needs no text.
+    Bubble pixels are never sampled or classified again. Overlap seams and
+    protected manual edits stay untouched.
     """
     shape = text_mask.shape
     if solid_seeds.shape != (*shape, 4):
@@ -225,7 +231,7 @@ def fill_bubbles(text_mask: np.ndarray, solid_seeds: np.ndarray,
                   'seed_pixels': seed_pixels,
                   'overlap_pixels': int(np.count_nonzero(seam[roi] & local_region)),
                   'accepted': False}
-        if seed_pixels == 0:
+        if seed_pixels == 0 and not direct_white:
             record['reason'] = 'no_solid_text_seed'
             records.append(record)
             continue
@@ -237,17 +243,22 @@ def fill_bubbles(text_mask: np.ndarray, solid_seeds: np.ndarray,
             record['reason'] = 'empty_inset'
             records.append(record)
             continue
-        colors, counts = np.unique(solid_seeds[roi][qualified, :3], axis=0, return_counts=True)
-        # np.unique sorts colours lexicographically; argmax makes ties stable.
-        color_index = int(np.argmax(counts))
-        color = colors[color_index]
+        if direct_white:
+            color = np.array([255, 255, 255], dtype=np.uint8)
+        else:
+            colors, counts = np.unique(solid_seeds[roi][qualified, :3], axis=0, return_counts=True)
+            # np.unique sorts colours lexicographically; argmax makes ties stable.
+            color_index = int(np.argmax(counts))
+            color = colors[color_index]
         view = overlay[roi]
         view[safe, :3] = color
         view[safe, 3] = 255
-        record.update(accepted=True, reason='solid_text_seed',
+        record.update(accepted=True,
+                      reason='direct_white' if direct_white else 'solid_text_seed',
                       fill_bgr=color.astype(int).tolist(),
-                      seed_color_pixels=int(counts[color_index]),
-                      seed_colors=int(len(colors)),
                       filled_pixels=int(np.count_nonzero(safe)))
+        if not direct_white:
+            record.update(seed_color_pixels=int(counts[color_index]),
+                          seed_colors=int(len(colors)))
         records.append(record)
     return overlay, records
