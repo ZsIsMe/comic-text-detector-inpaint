@@ -7,6 +7,7 @@ All writes replace complete files atomically; cache updates preserve other keys.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import tempfile
@@ -159,6 +160,74 @@ def page_summary(page):
             'edited_pixels': int(np.count_nonzero(page['edited']))}
 
 
+def page_state_digest(page, signature):
+    """Identify the exact saved page decision, including its source image."""
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(b'solid-inpaint-reviewed-v1\0')
+    digest.update(str(signature).encode('utf-8'))
+    for name in ('overlay', 'other', 'edited'):
+        value = np.ascontiguousarray(page[name])
+        digest.update(name.encode('ascii'))
+        digest.update(str(value.shape).encode('ascii'))
+        digest.update(value.dtype.str.encode('ascii'))
+        digest.update(memoryview(value))
+    return digest.hexdigest()
+
+
+def is_page_reviewed(info):
+    """A review is current only while its saved page decision is unchanged."""
+    digest = info.get('state_digest')
+    return bool(info.get('processed') and 'error' not in info
+                and isinstance(digest, str) and digest
+                and info.get('reviewed_digest') == digest)
+
+
+def set_page_reviewed(paths, image, reviewed=True, page_state=None):
+    """Mark an already saved page reviewed, or return it to the review queue."""
+    with _lock:
+        project = load_project(paths['raw'])
+        pages = project.get('pages', {})
+        name = Path(image).name
+        info = dict(pages.get(name, {}))
+        if not info.get('processed') or 'error' in info:
+            raise ValueError(f'頁面尚未成功偵測或保存：{name}')
+        if reviewed:
+            signature = source_signature(image)
+            if info.get('source_signature') != signature:
+                raise ValueError('原圖已變更，請重新偵測。')
+            digest = info.get('state_digest')
+            path = page_path(paths, image)
+            if info.get('has_data'):
+                if not path.exists():
+                    raise ValueError(f'正式頁面資料遺失：{path}')
+                saved = read_archive(path)
+                if (int(saved.get('version', -1)) != FORMAT_VERSION
+                        or str(saved.get('source_signature', '')) != signature
+                        or any(key not in saved for key in ('overlay', 'other', 'edited'))):
+                    raise ValueError(f'正式頁面資料與專案記錄不一致：{path}')
+                saved_digest = page_state_digest(saved, signature)
+            else:
+                if path.exists():
+                    raise ValueError(f'正式頁面資料與專案記錄不一致：{path}')
+                if page_state is None:
+                    if not isinstance(digest, str) or not digest:
+                        raise ValueError('舊空白頁缺少狀態，請先載入該頁。')
+                    saved_digest = digest
+                else:
+                    if any(np.any(page_state[key]) for key in ('overlay', 'other', 'edited')):
+                        raise ValueError('空白頁的正式資料與目前選區不一致。')
+                    saved_digest = page_state_digest(page_state, signature)
+            if isinstance(digest, str) and digest and digest != saved_digest:
+                raise ValueError(f'正式頁面資料與專案記錄不一致：{path}')
+            info['state_digest'] = saved_digest
+            info['reviewed_digest'] = saved_digest
+        else:
+            info.pop('reviewed_digest', None)
+        pages[name] = info
+        update_project(paths['raw'], pages=pages)
+        return info
+
+
 def save_page(paths, image, page, summary=None):
     overlay = np.asarray(page['overlay'], dtype=np.uint8).copy()
     other = np.where(page['other'] > 0, np.uint8(255), np.uint8(0))
@@ -171,6 +240,7 @@ def save_page(paths, image, page, summary=None):
     state = {'overlay': overlay, 'other': other, 'edited': edited}
     has_data = any(np.any(value) for value in state.values())
     signature = source_signature(image)
+    state_digest = page_state_digest(state, signature)
     with _lock:
         path = page_path(paths, image)
         # Empty processed pages need only a compact project entry. Erased pages
@@ -181,12 +251,19 @@ def save_page(paths, image, page, summary=None):
             path.unlink()
         project = load_project(paths['raw'])
         pages = project.get('pages', {})
+        name = Path(image).name
+        old_info = pages.get(name, {})
         info = dict(summary or {})
-        info.update(page_summary(state), source_signature=signature, has_data=has_data)
+        # Review belongs to the current project entry, never to a stale worker summary.
+        info.pop('reviewed_digest', None)
+        if old_info.get('reviewed_digest'):
+            info['reviewed_digest'] = old_info['reviewed_digest']
+        info.update(page_summary(state), source_signature=signature, has_data=has_data,
+                    state_digest=state_digest)
         # Per-block diagnostics belong to disposable cache, not project.json.
         info = {key: value for key, value in info.items()
                 if key not in ('blocks_debug', 'bubbles_debug', 'solid_fill_settings')}
         info.pop('error', None)
-        pages[Path(image).name] = info
+        pages[name] = info
         update_project(paths['raw'], pages=pages)
     return info

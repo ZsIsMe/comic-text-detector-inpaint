@@ -27,6 +27,9 @@ bootstrap.py
 solid_inpaint_ui.py
   PySide6 圖形界面。提供資料夾選擇、偵測生成、mask 預覽與手動編輯、PDF 預覽等功能。
 
+solid_inpaint_control.py / solid_inpaint_mcp.py
+  GUI 內的本機 Qt socket 控制端與可選的 MCP stdio 橋接。開專案、偵測、導航和保存沿用 GUI；MCP SDK 只在橋接程序需要，安裝與工具契約見 docs/mcp.md。
+
 workflow_compare_ui.py
   獨立的多工作流比較與合成視窗。讀取 export_pair 與 inpaint_workflows，按各工作流結果和底圖的差異生成專屬 Mask，以同步比較滑桿、矩形或筆刷指定來源，最左側顯示當頁成品並輸出 result；不依賴 other_mask。
 
@@ -172,6 +175,10 @@ other_mask 顯示
 ```
 
 手動編輯只更新正式的兩類選區、顏色與修改記錄，預覽不重新分類。
+
+AI 監修介面獨立顯示目前頁、保存狀態與編輯模式，支援路徑輸入、頁碼／完整檔名跳轉、F3 左鍵恢復原圖及「完成本頁並到下一頁」。校對標記存於專案頁面 metadata，與偵測成功及 OTHER 分開；以正式頁面內容摘要判斷標記是否仍有效。切工具保留相容模式，文字輸入不觸發 A／D 翻頁。
+
+開專案、切頁和開始偵測可優先使用已接入的 MCP。影像判斷及精確選區仍透過 Computer Use；未接入時使用路徑輸入及跳頁控制。MCP 操作遇到模態視窗、筆畫或局部副本編輯時回報 busy，保存失敗不得假報成功或切頁；不要繞過 GUI 直接改寫專案檔。
 
 若要用另一個文件夾的 mask 取代目前 mask，可在 GUI 的「使用傳入 Mask 運行」中選「取代目前 Mask」，再選擇傳入 Mask 文件夾。同名 PNG 用於重新分類，保留人工修改與擦除；缺少同名 PNG 的頁面保持原狀。
 

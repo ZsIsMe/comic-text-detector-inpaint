@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QGraphicsView,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -140,6 +141,12 @@ EDIT_MODE_LABELS = {
 }
 
 
+def _set_state_label(label: QLabel, value: str) -> None:
+    """Expose changing QLabel text to native accessibility clients."""
+    label.setText(value)
+    label.setAccessibleName(value)
+
+
 def swap_existing_class_pixels(solid: np.ndarray, other: np.ndarray,
                                selection: np.ndarray) -> bool:
     """Swap only existing A/B pixels in selection; leave blanks untouched."""
@@ -159,6 +166,7 @@ def swap_existing_class_pixels(solid: np.ndarray, other: np.ndarray,
 SELECTION_COMBINE_LABELS = {
     'add': '添加',
     'subtract': '減去',
+    'restore_original': '恢復原圖（清除兩類）',
     'local_intersect': '局部交集',
     'selection_inner': '選區內部',
     'add_selection_inner': '添加＋內部',
@@ -1444,7 +1452,7 @@ class MaskEditorView(ImageView):
             self._lasso_preview.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
             self.scene().addItem(self._lasso_preview)
         operation = self.selection_combine_mode
-        if operation == 'subtract':
+        if operation in ('subtract', 'restore_original'):
             pen = self._rect_pen_remove
         elif operation == 'ctd_detect_selection':
             pen = self._rect_pen_detect
@@ -2071,6 +2079,7 @@ class MaskEditorView(ImageView):
                 'transfer_from_other',
                 'ctd_detect_selection',
                 'local_edit_selection',
+                'restore_original',
             )
         )
 
@@ -2222,7 +2231,7 @@ class MaskEditorView(ImageView):
         self._rubber_band.set_erase_all_style(False)
         self._rubber_band.setBrush(self._rect_brush_default)
         operation = self._selection_operation_for_button(button)
-        if operation == 'subtract':
+        if operation in ('subtract', 'restore_original'):
             self._rubber_band.setPen(self._rect_pen_remove)
         elif operation in ('ctd_detect_selection', 'local_edit_selection'):
             self._rubber_band.setPen(self._rect_pen_detect)
@@ -2374,6 +2383,9 @@ class LocalEditDialog(QDialog):
         self._updating_roi_controls = False
 
         layout = QVBoxLayout(self)
+        self.roi_state_label = QLabel('局部副本，尚未套用')
+        self.roi_state_label.setAccessibleName(self.roi_state_label.text())
+        layout.addWidget(self.roi_state_label)
         mode_toolbar = QHBoxLayout()
         self.solid_btn = QPushButton('F1 純色填充')
         self.other_btn = QPushButton('F2 圖像修補')
@@ -2605,8 +2617,16 @@ class LocalEditDialog(QDialog):
             self.roi_y_spin.setValue(y1)
             self.roi_width_spin.setValue(x2 - x1)
             self.roi_height_spin.setValue(y2 - y1)
+            self.update_roi_state_label()
         finally:
             self._updating_roi_controls = False
+
+    def update_roi_state_label(self) -> None:
+        x1, y1, x2, y2 = self.roi_box
+        _set_state_label(self.roi_state_label,
+            f'局部副本，尚未套用 · {EDIT_MODE_LABELS[self.edit_mode]} · '
+            f'ROI X {x1} Y {y1} · {x2 - x1} × {y2 - y1} px'
+        )
 
     def on_roi_controls_changed(self) -> None:
         if self._updating_roi_controls:
@@ -2757,6 +2777,7 @@ class LocalEditDialog(QDialog):
         self.solid_btn.setChecked(mode == 'manual_solid')
         self.other_btn.setChecked(mode == 'manual_other')
         self.refresh_preview(keep_view=True)
+        self.update_roi_state_label()
         self.modeChanged.emit(mode)
 
     def on_magic_tolerance_changed(self, value: int) -> None:
@@ -4031,6 +4052,9 @@ class MainWindow(QMainWindow):
         self._pending_edit_identity = None
         self._pending_preview_cancel = None
         self._last_edit_error = None
+        self._last_control_error = ''
+        self.control_server = None
+        self._control_worker_silent = False
         self._edit_executor_closed = False
         self.current_manual_solid: np.ndarray | None = None
         self.current_manual_other: np.ndarray | None = None
@@ -4089,6 +4113,12 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._apply_style()
+        try:
+            from solid_inpaint_control import start_control
+            self.control_server = start_control(self)
+        except Exception as exc:
+            self._last_control_error = str(exc)
+            self.status.showMessage(f'本機控制入口無法啟動：{exc}')
         self.startup_restore_timer.start(0)
 
     def _build_ui(self) -> None:
@@ -4109,14 +4139,10 @@ class MainWindow(QMainWindow):
         self.update_recent_menu()
 
         prev_action = QAction('上一頁', self)
-        prev_action.setShortcuts([QKeySequence('A')])
-        prev_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
         prev_action.triggered.connect(self.previous_image)
         toolbar.addAction(prev_action)
 
         next_action = QAction('下一頁', self)
-        next_action.setShortcuts([QKeySequence('D')])
-        next_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
         next_action.triggered.connect(self.next_image)
         toolbar.addAction(next_action)
 
@@ -4140,57 +4166,8 @@ class MainWindow(QMainWindow):
         zoom_out_action.triggered.connect(lambda: self.mask_view.zoom_by(1 / VIEW_ZOOM_STEP, keep_center=True))
         self.addAction(zoom_out_action)
 
-        brush_down_action = QAction('縮小筆刷', self)
-        brush_down_action.setShortcut(QKeySequence('['))
-        brush_down_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
-        brush_down_action.triggered.connect(lambda: self.change_brush_radius(-4))
-        self.addAction(brush_down_action)
-
-        brush_up_action = QAction('放大筆刷', self)
-        brush_up_action.setShortcut(QKeySequence(']'))
-        brush_up_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
-        brush_up_action.triggered.connect(lambda: self.change_brush_radius(4))
-        self.addAction(brush_up_action)
-
-        pan_left_action = QAction('左移畫布', self)
-        pan_left_action.setShortcut(QKeySequence('Left'))
-        pan_left_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
-        pan_left_action.triggered.connect(lambda: self.mask_view.pan_by(-VIEW_KEY_PAN_STEP, 0))
-        self.addAction(pan_left_action)
-
-        pan_right_action = QAction('右移畫布', self)
-        pan_right_action.setShortcut(QKeySequence('Right'))
-        pan_right_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
-        pan_right_action.triggered.connect(lambda: self.mask_view.pan_by(VIEW_KEY_PAN_STEP, 0))
-        self.addAction(pan_right_action)
-
-        pan_up_action = QAction('上移畫布', self)
-        pan_up_action.setShortcut(QKeySequence('Up'))
-        pan_up_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
-        pan_up_action.triggered.connect(lambda: self.mask_view.pan_by(0, -VIEW_KEY_PAN_STEP))
-        self.addAction(pan_up_action)
-
-        pan_down_action = QAction('下移畫布', self)
-        pan_down_action.setShortcut(QKeySequence('Down'))
-        pan_down_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
-        pan_down_action.triggered.connect(lambda: self.mask_view.pan_by(0, VIEW_KEY_PAN_STEP))
-        self.addAction(pan_down_action)
-
-        open_output_action = QAction('打開輸出', self)
-        open_output_action.triggered.connect(self.open_output)
-        toolbar.addAction(open_output_action)
-
-        generate_pdf_action = QAction('生成 PDF', self)
-        generate_pdf_action.triggered.connect(self.generate_pdf)
-        toolbar.addAction(generate_pdf_action)
-
-        open_pdf_action = QAction('打開 PDF', self)
-        open_pdf_action.triggered.connect(self.open_pdf)
-        toolbar.addAction(open_pdf_action)
-
         help_action = QAction('說明', self)
         help_action.triggered.connect(self.show_help)
-        toolbar.addAction(help_action)
 
         self.navigator_action = QAction('小地圖', self)
         self.navigator_action.setCheckable(True)
@@ -4198,27 +4175,20 @@ class MainWindow(QMainWindow):
         self.navigator_action.triggered.connect(self.set_navigator_visible)
         toolbar.addAction(self.navigator_action)
 
-        self.export_colored_btn = QPushButton('導出右圖')
-        self.export_colored_btn.setToolTip('導出右側去字預覽與 other_mask 紫色標記；不包含淡紫色擴展外圈')
-        self.export_colored_btn.clicked.connect(self.export_colored_preview)
-        toolbar.addWidget(self.export_colored_btn)
-
-        self.export_refinement_btn = QPushButton('導出待精修')
-        self.export_refinement_btn.setToolTip(
-            '導出到 ctd_inpainted/export_pair：根目錄為去字合成圖，'
-            '並包含 other_mask 與 colored 文件夾'
-        )
-        self.export_refinement_btn.clicked.connect(self.export_refinement_package)
-        toolbar.addWidget(self.export_refinement_btn)
+        more_menu = QMenu(self)
+        more_menu.addAction('打開輸出', self.open_output)
+        more_menu.addAction('生成 PDF', self.generate_pdf)
+        more_menu.addAction('打開 PDF', self.open_pdf)
+        more_menu.addSeparator()
+        more_menu.addAction('導出右圖', self.export_colored_preview)
+        more_menu.addAction('導出待精修', self.export_refinement_package)
 
         psd_action = QAction('導出 PSD 素材', self)
         psd_action.triggered.connect(self.export_psd_materials)
-        toolbar.addAction(psd_action)
-
-        self.workflow_compare_btn = QPushButton('工作流比較')
-        self.workflow_compare_btn.setToolTip('在獨立視窗比較多組修補結果，按 Mask 分區合成並輸出')
-        self.workflow_compare_btn.clicked.connect(self.open_workflow_compare)
-        toolbar.addWidget(self.workflow_compare_btn)
+        more_menu.addAction(psd_action)
+        more_menu.addAction('工作流比較', self.open_workflow_compare)
+        more_menu.addSeparator()
+        more_menu.addAction(help_action)
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -4230,26 +4200,18 @@ class MainWindow(QMainWindow):
         self.detect_button.clicked.connect(self.run_or_load)
         toolbar.addWidget(self.detect_button)
 
-        self.add_detect_button = QToolButton()
-        self.add_detect_button.setText('添加偵測')
-        self.add_detect_button.setToolTip(
-            '在不覆蓋現有 mask 的狀況下，把新偵測到的文字區域加入所選層'
-            '（純色填充 / 圖像修補），可選當前頁或全部頁面。'
-        )
-        self.add_detect_button.clicked.connect(self.run_add_detection)
-        toolbar.addWidget(self.add_detect_button)
-
-        self.imported_mask_button = QToolButton()
-        self.imported_mask_button.setText('使用傳入 Mask 運行')
-        self.imported_mask_button.setToolTip('選擇以傳入 Mask 取代目前 Mask，或取兩者交集後運行')
-        self.imported_mask_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        self.imported_mask_menu = QMenu(self.imported_mask_button)
+        more_menu.addAction('添加偵測', self.run_add_detection)
+        self.imported_mask_menu = more_menu.addMenu('使用傳入 Mask 運行')
         replace_mask_action = self.imported_mask_menu.addAction('取代目前 Mask')
         replace_mask_action.triggered.connect(lambda: self.run_with_imported_masks('replace'))
         intersect_masks_action = self.imported_mask_menu.addAction('取兩者交集')
         intersect_masks_action.triggered.connect(lambda: self.run_with_imported_masks('intersect'))
-        self.imported_mask_button.setMenu(self.imported_mask_menu)
-        toolbar.addWidget(self.imported_mask_button)
+        self.more_button = QToolButton()
+        self.more_button.setText('更多')
+        self.more_button.setAccessibleName('更多操作與導出')
+        self.more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.more_button.setMenu(more_menu)
+        toolbar.addWidget(self.more_button)
 
         root = QWidget()
         root_layout = QVBoxLayout(root)
@@ -4258,7 +4220,10 @@ class MainWindow(QMainWindow):
 
         top_row = QHBoxLayout()
         self.folder_label = QLabel('未選擇文件夾')
+        self.folder_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.folder_label.setAccessibleName('目前專案資料夾')
         self.progress_label = QLabel('')
+        self.progress_label.setAccessibleName('偵測任務：尚未開始')
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
@@ -4266,6 +4231,25 @@ class MainWindow(QMainWindow):
         top_row.addWidget(self.progress_label, 2)
         top_row.addWidget(self.progress, 3)
         root_layout.addLayout(top_row)
+
+        project_row = QHBoxLayout()
+        self.folder_path_input = QLineEdit()
+        self.folder_path_input.setPlaceholderText('貼上圖片資料夾完整路徑')
+        self.folder_path_input.setAccessibleName('圖片資料夾路徑')
+        self.folder_path_input.returnPressed.connect(self.open_typed_folder)
+        open_path_btn = QPushButton('打開路徑')
+        open_path_btn.clicked.connect(self.open_typed_folder)
+        project_row.addWidget(self.folder_path_input, 1)
+        project_row.addWidget(open_path_btn)
+        self.current_page_label = QLabel('目前頁：未選擇')
+        self.current_page_label.setAccessibleName(self.current_page_label.text())
+        self.current_page_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        project_row.addWidget(self.current_page_label, 1)
+        self.save_state_label = QLabel('保存狀態：無專案')
+        self.save_state_label.setAccessibleName(self.save_state_label.text())
+        self.save_state_label.setFixedWidth(180)
+        project_row.addWidget(self.save_state_label)
+        root_layout.addLayout(project_row)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         root_layout.addWidget(splitter, 1)
@@ -4275,10 +4259,39 @@ class MainWindow(QMainWindow):
         left_layout.setContentsMargins(10, 10, 10, 10)
         left_layout.addWidget(QLabel('圖片列表'))
         self.summary_label = QLabel('共 0 張')
+        self.summary_label.setWordWrap(True)
+        self.summary_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         left_layout.addWidget(self.summary_label)
+        jump_row = QHBoxLayout()
+        self.page_jump_input = QLineEdit()
+        self.page_jump_input.setPlaceholderText('頁碼或完整檔名')
+        self.page_jump_input.setAccessibleName('跳轉頁碼或檔名')
+        self.page_jump_input.returnPressed.connect(self.jump_to_page)
+        self.page_jump_btn = QPushButton('跳轉')
+        self.page_jump_btn.setAccessibleName('跳轉指定頁面')
+        self.page_jump_btn.clicked.connect(self.jump_to_page)
+        jump_row.addWidget(self.page_jump_input, 1)
+        jump_row.addWidget(self.page_jump_btn)
+        left_layout.addLayout(jump_row)
         self.list_widget = QListWidget()
+        self.list_widget.setAccessibleName('圖片頁面列表')
+        self.list_widget.setAccessibleDescription('依順序列出檔名、偵測與人工校對狀態')
         self.list_widget.currentRowChanged.connect(self.on_image_selected)
         left_layout.addWidget(self.list_widget, 1)
+        review_row = QHBoxLayout()
+        self.review_btn = QPushButton('標記已校對')
+        self.review_btn.setAccessibleName('標記目前頁已校對')
+        self.review_btn.clicked.connect(lambda: self.set_current_reviewed(True))
+        self.review_pending_btn = QPushButton('待回看')
+        self.review_pending_btn.setAccessibleName('標記目前頁待回看')
+        self.review_pending_btn.clicked.connect(lambda: self.set_current_reviewed(False))
+        review_row.addWidget(self.review_btn)
+        review_row.addWidget(self.review_pending_btn)
+        left_layout.addLayout(review_row)
+        self.review_next_btn = QPushButton('完成本頁並到下一頁')
+        self.review_next_btn.setAccessibleName('完成目前頁校對並到下一頁')
+        self.review_next_btn.clicked.connect(self.complete_page_and_next)
+        left_layout.addWidget(self.review_next_btn)
         splitter.addWidget(left_panel)
 
         workspace_panel = QFrame()
@@ -4288,6 +4301,8 @@ class MainWindow(QMainWindow):
         workspace_layout.setSpacing(8)
 
         mode_toolbar = QHBoxLayout()
+        self.edit_state_label = QLabel('模式：純色填充 · 矩形 · 添加')
+        self.edit_state_label.setAccessibleName(self.edit_state_label.text())
         self.edit_manual_solid_btn = QPushButton('F1 純色填充')
         self.edit_manual_solid_btn.setCheckable(True)
         self.edit_manual_solid_btn.setChecked(True)
@@ -4306,6 +4321,7 @@ class MainWindow(QMainWindow):
         mode_toolbar.addWidget(self.convert_masks_btn)
         mode_toolbar.addWidget(self.selection_local_edit_btn)
         mode_toolbar.addStretch()
+        mode_toolbar.addWidget(self.edit_state_label)
         workspace_layout.addLayout(mode_toolbar)
 
         edit_toolbar = QHBoxLayout()
@@ -4329,6 +4345,10 @@ class MainWindow(QMainWindow):
         self.selection_subtract_btn = QPushButton('F10 減去')
         self.selection_subtract_btn.setCheckable(True)
         self.selection_subtract_btn.setToolTip('筆刷、矩形、魔法棒和套索從目前 mask 減去；右鍵矩形會清除所有 mask')
+        self.restore_original_btn = QPushButton('F3 恢復原圖')
+        self.restore_original_btn.setCheckable(True)
+        self.restore_original_btn.setAccessibleName('恢復原圖，左鍵清除兩類選區')
+        self.restore_original_btn.setToolTip('選矩形或套索，用左鍵清除範圍內兩類選區；可撤銷')
         self.selection_intersect_btn = QPushButton('F11 局部交集')
         self.selection_intersect_btn.setCheckable(True)
         self.selection_intersect_btn.setToolTip('只裁切本次選區碰到的既有 mask 區塊，不影響其他區塊')
@@ -4348,6 +4368,7 @@ class MainWindow(QMainWindow):
         self.selection_combine_group.setExclusive(True)
         self.selection_combine_group.addButton(self.selection_add_btn)
         self.selection_combine_group.addButton(self.selection_subtract_btn)
+        self.selection_combine_group.addButton(self.restore_original_btn)
         self.selection_combine_group.addButton(self.selection_intersect_btn)
         self.selection_combine_group.addButton(self.selection_inner_btn)
         self.selection_combine_group.addButton(self.selection_add_inner_btn)
@@ -4356,6 +4377,7 @@ class MainWindow(QMainWindow):
         self.selection_combine_group.addButton(self.selection_local_edit_btn)
         self.selection_add_btn.clicked.connect(lambda: self.set_selection_combine_mode('add'))
         self.selection_subtract_btn.clicked.connect(lambda: self.set_selection_combine_mode('subtract'))
+        self.restore_original_btn.clicked.connect(lambda: self.set_selection_combine_mode('restore_original'))
         self.selection_intersect_btn.clicked.connect(lambda: self.set_selection_combine_mode('local_intersect'))
         self.selection_inner_btn.clicked.connect(lambda: self.set_selection_combine_mode('selection_inner'))
         self.selection_add_inner_btn.clicked.connect(lambda: self.set_selection_combine_mode('add_selection_inner'))
@@ -4496,6 +4518,7 @@ class MainWindow(QMainWindow):
         selection_combine_layout.setSpacing(8)
         selection_combine_layout.addWidget(self.selection_add_btn)
         selection_combine_layout.addWidget(self.selection_subtract_btn)
+        selection_combine_layout.addWidget(self.restore_original_btn)
         selection_combine_layout.addWidget(self.selection_intersect_btn)
         selection_combine_layout.addWidget(self.selection_inner_btn)
         selection_combine_layout.addWidget(self.selection_add_inner_btn)
@@ -4528,7 +4551,20 @@ class MainWindow(QMainWindow):
         edit_toolbar.addWidget(self.undo_btn)
         edit_toolbar.addWidget(self.redo_btn)
         edit_toolbar.addStretch()
-        workspace_layout.addLayout(edit_toolbar)
+        edit_toolbar_widget = QWidget()
+        edit_toolbar_widget.setLayout(edit_toolbar)
+        self.edit_toolbar_scroll = QScrollArea()
+        self.edit_toolbar_scroll.setWidget(edit_toolbar_widget)
+        self.edit_toolbar_scroll.setWidgetResizable(False)
+        self.edit_toolbar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.edit_toolbar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.edit_toolbar_scroll.setFixedHeight(66)
+        self.edit_toolbar_scroll.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        workspace_layout.addWidget(self.edit_toolbar_scroll)
+        for controls in (self.local_intersect_dark_controls, self.magic_scope_controls):
+            policy = controls.sizePolicy()
+            policy.setRetainSizeWhenHidden(True)
+            controls.setSizePolicy(policy)
         workspace_layout.addWidget(self.local_intersect_dark_controls)
         workspace_layout.addWidget(self.magic_scope_controls)
 
@@ -4598,7 +4634,16 @@ class MainWindow(QMainWindow):
         fit_btn.clicked.connect(self.fit_both_views)
         view_options.addWidget(fit_btn)
         view_options.addStretch()
-        workspace_layout.addLayout(view_options)
+        view_options_widget = QWidget()
+        view_options_widget.setLayout(view_options)
+        view_options_scroll = QScrollArea()
+        view_options_scroll.setWidget(view_options_widget)
+        view_options_scroll.setWidgetResizable(False)
+        view_options_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        view_options_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        view_options_scroll.setFixedHeight(66)
+        view_options_scroll.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        workspace_layout.addWidget(view_options_scroll)
 
         views_grid = QGridLayout()
         views_grid.setContentsMargins(0, 0, 0, 0)
@@ -4610,6 +4655,8 @@ class MainWindow(QMainWindow):
         views_grid.addWidget(QLabel('填色預覽'), 0, 1)
 
         self.mask_view = MaskEditorView()
+        self.mask_view.setAccessibleName('原圖與選區編輯畫布')
+        self.mask_view.setAccessibleDescription('左側畫布；依目前類型、工具及選區模式編輯')
         self.mask_view.set_magic_scope_px(self.magic_scope_px)
         self.mask_view.set_magic_dwell_ms(self.magic_dwell_ms)
         self.mask_view.editStarted.connect(self.push_undo_snapshot)
@@ -4630,6 +4677,7 @@ class MainWindow(QMainWindow):
         views_grid.addWidget(self.mask_view, 1, 0)
 
         self.preview_view = PassivePreviewView()
+        self.preview_view.setAccessibleName('右側去字效果預覽')
         views_grid.addWidget(self.preview_view, 1, 1)
 
         workspace_layout.addLayout(views_grid, 1)
@@ -4653,6 +4701,7 @@ class MainWindow(QMainWindow):
             self.lasso_btn,
             self.selection_add_btn,
             self.selection_subtract_btn,
+            self.restore_original_btn,
             self.selection_intersect_btn,
             self.selection_inner_btn,
             self.selection_add_inner_btn,
@@ -4664,8 +4713,6 @@ class MainWindow(QMainWindow):
             self.brush_down_btn,
             self.brush_up_btn,
             self.other_mask_color_button,
-            self.export_colored_btn,
-            self.export_refinement_btn,
             fit_btn,
         ):
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -4730,26 +4777,56 @@ class MainWindow(QMainWindow):
             return
         self.load_folder(folder)
 
+    def open_typed_folder(self) -> None:
+        folder = self.folder_path_input.text().strip()
+        if folder and self.load_folder(osp.abspath(osp.expanduser(folder))):
+            if self.imglist:
+                self.mask_view.setFocus()
+
+    def jump_to_page(self) -> None:
+        request = self.page_jump_input.text().strip()
+        if not request or not self.imglist:
+            return
+        if request.isdecimal():
+            page_number = int(request)
+            row = page_number - 1 if 1 <= page_number <= len(self.imglist) else -1
+        else:
+            row = next((index for index, image in enumerate(self.imglist)
+                        if osp.basename(image) == request), -1)
+        if row < 0:
+            self.status.showMessage(f'找不到頁碼或完整檔名：{request}')
+            return
+        self.list_widget.setCurrentRow(row)
+        if self.current_img_path == self.imglist[row]:
+            self.page_jump_input.clear()
+            self.mask_view.setFocus()
+
     def load_latest_recent_folder(self) -> None:
         if self.folder or not self.recent_folders:
             return
         self.load_folder(self.recent_folders[0])
 
-    def load_folder(self, folder: str) -> None:
+    def load_folder(self, folder: str, *, silent: bool = False) -> bool:
+        self._last_control_error = ''
         if self.worker_thread is not None:
-            self.status.showMessage("請等待目前任務完成再切換文件夾。")
-            return
-        if not self.flush_pending_edits():
-            return
+            self._last_control_error = '請等待目前任務完成再切換文件夾。'
+            self.status.showMessage(self._last_control_error)
+            return False
+        if not (self.flush_pending_edits(silent=True) if silent else self.flush_pending_edits()):
+            return False
         if not osp.isdir(folder):
-            QMessageBox.warning(self, '文件夾不存在', folder)
+            self._last_control_error = f'文件夾不存在：{folder}'
+            if not silent:
+                QMessageBox.warning(self, '文件夾不存在', folder)
             self.remove_recent_folder(folder)
-            return
+            return False
         try:
             paths = _ensure_dirs(folder)
         except (OSError, ValueError) as exc:
-            QMessageBox.warning(self, '無法開啟專案', str(exc))
-            return
+            self._last_control_error = str(exc)
+            if not silent:
+                QMessageBox.warning(self, '無法開啟專案', str(exc))
+            return False
         self.folder = folder
         self.current_img_path = ''
         self.current_base = None
@@ -4766,10 +4843,17 @@ class MainWindow(QMainWindow):
         self.imglist = image_files_in_folder(folder)
         self.report = load_report(self.paths)
         self.folder_label.setText(folder)
+        self.folder_label.setAccessibleName(f'目前專案資料夾：{folder}')
+        self.folder_label.setToolTip(folder)
+        self.folder_path_input.setText(folder)
         self.add_recent_folder(folder)
         self.refresh_list()
         if self.imglist:
             self.list_widget.setCurrentRow(self.saved_progress_row(folder))
+            self.mask_view.setFocus()
+        else:
+            self.update_current_page_status()
+        return True
 
     def _load_recent_folders(self) -> list[str]:
         value = self.settings.value('recent_folders', [])
@@ -5240,14 +5324,21 @@ class MainWindow(QMainWindow):
         detector_params: dict | None = None,
         target_mode: str = 'manual_other',
         solid_settings: dict | None = None,
+        silent: bool = False,
+        on_worker_ready=None,
     ) -> bool:
+        self._last_control_error = ''
         if self.worker_thread is not None:
-            QMessageBox.information(self, '正在執行', '已有任務在執行中。')
+            self._last_control_error = '已有任務在執行中。'
+            if not silent:
+                QMessageBox.information(self, '正在執行', self._last_control_error)
             return False
         if self.page_worker_thread is not None:
-            QMessageBox.information(self, '正在生成預覽', '請等待當前頁預覽生成完成。')
+            self._last_control_error = '請等待當前頁預覽生成完成。'
+            if not silent:
+                QMessageBox.information(self, '正在生成預覽', self._last_control_error)
             return False
-        if not self.save_all_edit_masks():
+        if not (self.save_all_edit_masks(silent=True) if silent else self.save_all_edit_masks()):
             return False
         if solid_settings is not None:
             try:
@@ -5255,9 +5346,12 @@ class MainWindow(QMainWindow):
                                     solid_settings['shrink_percent'],
                                     solid_settings.get('direct_white', True))
             except (OSError, ValueError) as exc:
-                QMessageBox.warning(self, '儲存失敗', str(exc))
+                self._last_control_error = str(exc)
+                if not silent:
+                    QMessageBox.warning(self, '儲存失敗', str(exc))
                 return False
         self.progress.setValue(0)
+        self._control_worker_silent = silent
         self.worker_thread = QThread()
         self.worker = FolderWorker(
             self.folder,
@@ -5277,6 +5371,17 @@ class MainWindow(QMainWindow):
         self.worker.finished.connect(self.worker_thread.quit)
         self.worker.failed.connect(self.worker_thread.quit)
         self.worker_thread.finished.connect(self.cleanup_worker)
+        if on_worker_ready is not None:
+            try:
+                on_worker_ready(self.worker)
+            except Exception as exc:
+                self._last_control_error = f'無法準備任務回報：{exc}'
+                self.worker = None
+                self.worker_thread = None
+                self._control_worker_silent = False
+                if not silent:
+                    QMessageBox.warning(self, '無法啟動任務', self._last_control_error)
+                return False
         self.mask_view.setEnabled(False)
         self.worker_thread.start()
         return True
@@ -5307,7 +5412,7 @@ class MainWindow(QMainWindow):
     def on_worker_progress(self, current: int, total: int, name: str) -> None:
         percent = int(current * 100 / max(1, total))
         self.progress.setValue(percent)
-        self.progress_label.setText(f'{current} / {total}  {name}')
+        _set_state_label(self.progress_label, f'偵測進度 {current} / {total} · {name}')
 
     def on_worker_finished(self, report: dict) -> None:
         self.undo_stack = []
@@ -5316,6 +5421,8 @@ class MainWindow(QMainWindow):
         self.progress.setValue(100)
         self.refresh_list()
         self.reload_current()
+        _set_state_label(self.progress_label, '偵測任務完成')
+        self.update_current_page_status()
         unavailable = sum(p.get('bubble_detection', {}).get('status') == 'unavailable'
                           for p in report.get('pages', {}).values())
         self.status.showMessage(
@@ -5333,12 +5440,130 @@ class MainWindow(QMainWindow):
         self.status.showMessage('選區轉換完成。')
 
     def on_worker_failed(self, message: str) -> None:
-        QMessageBox.critical(self, '執行失敗', message)
+        _set_state_label(self.progress_label, '偵測任務失敗')
+        if self._control_worker_silent:
+            self._last_control_error = message
+            self.status.showMessage(f'執行失敗：{message}')
+        else:
+            QMessageBox.critical(self, '執行失敗', message)
 
     def cleanup_worker(self) -> None:
         self.mask_view.setEnabled(True)
         self.worker = None
         self.worker_thread = None
+        self._control_worker_silent = False
+        self.update_current_page_status()
+
+    def _page_item_text(self, name: str, info: dict, index: int) -> str:
+        if 'error' in info:
+            detection = STATUS_FAILED
+        elif not info:
+            detection = STATUS_TODO
+        else:
+            detection = STATUS_OTHER if int(info.get('other_pixels', 0)) > 0 else '已偵測'
+        review = '已校對' if store.is_page_reviewed(info) else '待回看'
+        return f'第 {index + 1} 頁  {name}    {detection} · {review}'
+
+    def update_review_summary(self) -> None:
+        pages = self.report.get('pages', {})
+        other_count = sum(int(info.get('other_pixels', 0)) > 0 and 'error' not in info
+                          for info in pages.values())
+        failed_count = sum('error' in info for info in pages.values())
+        reviewed_count = sum(store.is_page_reviewed(pages.get(osp.basename(path), {}))
+                             for path in self.imglist)
+        self.summary_label.setText(
+            f'共 {len(self.imglist)} 張 · 已校對 {reviewed_count} · '
+            f'待回看 {len(self.imglist) - reviewed_count}\n'
+            f'OTHER {other_count} · 失敗 {failed_count}'
+        )
+
+    def update_current_page_status(self) -> None:
+        if not self.current_img_path or self.current_img_path not in self.imglist:
+            _set_state_label(self.current_page_label, '目前頁：未選擇')
+            _set_state_label(self.save_state_label, '保存狀態：無專案')
+            for button in (self.review_btn, self.review_pending_btn, self.review_next_btn):
+                button.setEnabled(False)
+            return
+        name = osp.basename(self.current_img_path)
+        info = self.report.get('pages', {}).get(name, {})
+        reviewed = store.is_page_reviewed(info) and self._edit_revision == self._saved_edit_revision
+        page_number = self.imglist.index(self.current_img_path) + 1
+        _set_state_label(self.current_page_label,
+            f'目前頁：第 {page_number}/{len(self.imglist)} 頁 · {name} · '
+            f'{"已校對" if reviewed else "待回看"}'
+        )
+        self.current_page_label.setToolTip(self.current_page_label.text())
+        if self._last_edit_error:
+            save_state = f'保存狀態：失敗 · {self._last_edit_error}'
+        elif self._edit_revision != self._saved_edit_revision:
+            save_state = '保存狀態：保存中'
+        elif self.current_page is None:
+            save_state = '保存狀態：頁面載入失敗'
+        elif not info.get('processed'):
+            save_state = '保存狀態：尚未偵測'
+        else:
+            save_state = '保存狀態：已保存'
+        _set_state_label(self.save_state_label, save_state)
+        self.save_state_label.setToolTip(save_state)
+        can_review = (self.current_page is not None and bool(info.get('processed'))
+                      and 'error' not in info and self.worker_thread is None)
+        self.review_btn.setEnabled(can_review and not reviewed)
+        self.review_pending_btn.setEnabled(can_review and reviewed)
+        self.review_next_btn.setEnabled(can_review)
+
+    def set_current_reviewed(self, reviewed: bool) -> bool:
+        if not self.current_img_path or self.worker_thread is not None:
+            return False
+        name = osp.basename(self.current_img_path)
+        info = self.report.get('pages', {}).get(name, {})
+        if self.current_page is None or not info.get('processed') or 'error' in info:
+            self.status.showMessage('此頁尚未成功偵測，不能標記已校對。')
+            return False
+        if not self.save_all_edit_masks():
+            self.update_current_page_status()
+            return False
+        try:
+            updated = store.set_page_reviewed(
+                self.paths, self.current_img_path, reviewed, page_state=self.current_page
+            )
+        except (OSError, ValueError) as exc:
+            self.status.showMessage(f'校對標記儲存失敗：{exc}')
+            _set_state_label(self.save_state_label, f'保存狀態：校對標記失敗 · {exc}')
+            return False
+        self.report.setdefault('pages', {})[name] = updated
+        self._update_page_item(self.current_img_path, updated)
+        self.update_review_summary()
+        self.update_current_page_status()
+        self.status.showMessage('已校對。' if reviewed else '已標記待回看。')
+        return True
+
+    def complete_page_and_next(self) -> None:
+        if not self.set_current_reviewed(True):
+            return
+        self.next_image()
+
+    def _update_page_item(self, image_path: str, info: dict) -> None:
+        for row in range(self.list_widget.count()):
+            item = self.list_widget.item(row)
+            if item.data(Qt.ItemDataRole.UserRole) != image_path:
+                continue
+            name = osp.basename(image_path)
+            item.setText(self._page_item_text(name, info, row))
+            item.setData(Qt.ItemDataRole.AccessibleTextRole,
+                f'第 {row + 1}/{len(self.imglist)} 頁，{name}，'
+                f'{"已校對" if store.is_page_reviewed(info) else "待回看"}，'
+                f'{"有待修復選區" if int(info.get("other_pixels", 0)) else "無待修復選區"}'
+            )
+            if 'error' in info:
+                color = '#e06767'
+            elif int(info.get('other_pixels', 0)) > 0:
+                color = '#d59a45'
+            elif store.is_page_reviewed(info):
+                color = '#57b66f'
+            else:
+                color = '#dfe5ea'
+            item.setForeground(QColor(color))
+            return
 
     def refresh_list(self, keep_scroll: bool = True) -> None:
         previous_path = self.current_img_path
@@ -5347,39 +5572,23 @@ class MainWindow(QMainWindow):
         self.suppress_list_selection = True
         self.list_widget.clear()
         pages = self.report.get('pages', {})
-        other_count = 0
-        failed_count = 0
         selected_row = -1
         for img_path in self.imglist:
             name = osp.basename(img_path)
             info = pages.get(name, {})
-            status = STATUS_TODO
-            if 'error' in info:
-                status = STATUS_FAILED
-                failed_count += 1
-            elif info:
-                if int(info.get('other_pixels', 0)) > 0:
-                    status = STATUS_OTHER
-                    other_count += 1
-                else:
-                    status = STATUS_OK
-            item = QListWidgetItem(f'{name}    {status}')
+            item = QListWidgetItem(self._page_item_text(name, info, self.list_widget.count()))
             item.setData(Qt.ItemDataRole.UserRole, img_path)
-            if status == STATUS_OTHER:
-                item.setForeground(QColor('#d59a45'))
-            elif status == STATUS_FAILED:
-                item.setForeground(QColor('#e06767'))
-            elif status == STATUS_OK:
-                item.setForeground(QColor('#57b66f'))
             self.list_widget.addItem(item)
+            self._update_page_item(img_path, info)
             if img_path == previous_path:
                 selected_row = self.list_widget.count() - 1
-        self.summary_label.setText(f'共 {len(self.imglist)} 張    OTHER {other_count}    失敗 {failed_count}')
+        self.update_review_summary()
         if selected_row >= 0:
             self.list_widget.setCurrentRow(selected_row)
         self.suppress_list_selection = False
         if keep_scroll:
             self.restore_list_scroll(vertical_scroll, horizontal_scroll)
+        self.update_current_page_status()
 
     def restore_list_scroll(self, vertical_scroll: int, horizontal_scroll: int) -> None:
         vertical_bar = self.list_widget.verticalScrollBar()
@@ -5403,6 +5612,7 @@ class MainWindow(QMainWindow):
         self.undo_stack = []
         self.redo_stack = []
         self.reload_current()
+        self.update_current_page_status()
 
     def previous_image(self) -> None:
         if not self.imglist:
@@ -5834,18 +6044,16 @@ class MainWindow(QMainWindow):
             self.mask_view.set_mask(edit_mask, self.current_base.shape[:2], reset_brush_line=True)
         self.refresh_mask_preview(keep_view=True)
         self.update_edit_buttons()
+        self.update_edit_state_label()
         self.status.showMessage(f'正在編輯：{EDIT_MODE_LABELS[mode]}')
 
-    def set_edit_tool(self, tool: str, reset_selection: bool = True) -> None:
+    def set_edit_tool(self, tool: str, reset_selection: bool = False) -> None:
         self.mask_view.set_tool(tool)
         self.brush_btn.setChecked(tool == 'brush')
         self.rect_btn.setChecked(tool == 'rect')
         self.magic_btn.setChecked(tool == 'magic')
         self.lasso_btn.setChecked(tool == 'lasso')
-        if (
-            (reset_selection and self.selection_combine_mode != 'add')
-            or not self.selection_mode_allowed_for_tool(self.selection_combine_mode, tool)
-        ):
+        if (reset_selection and self.selection_combine_mode != 'add') or not self.selection_mode_allowed_for_tool(self.selection_combine_mode, tool):
             self.set_selection_combine_mode('add')
         self.selection_combine_controls.setVisible(tool in ('rect', 'magic', 'brush', 'lasso'))
         self.brush_controls.setVisible(tool == 'brush')
@@ -5854,11 +6062,12 @@ class MainWindow(QMainWindow):
         self.update_selection_combine_controls_visibility()
         self.update_local_intersect_controls_visibility()
         self.update_selection_combine_status()
+        self.update_edit_state_label()
 
     def set_selection_combine_mode(self, mode: str) -> None:
         if mode not in SELECTION_COMBINE_LABELS:
             return
-        if mode == 'local_edit_selection' and self.mask_view.tool != 'rect':
+        if mode in ('local_edit_selection', 'restore_original') and not self.selection_mode_allowed_for_tool(mode, self.mask_view.tool):
             self.set_edit_tool('rect')
         if not self.selection_mode_allowed_for_tool(mode, self.mask_view.tool):
             return
@@ -5866,6 +6075,7 @@ class MainWindow(QMainWindow):
         self.mask_view.set_selection_combine_mode(mode)
         self.selection_add_btn.setChecked(mode == 'add')
         self.selection_subtract_btn.setChecked(mode == 'subtract')
+        self.restore_original_btn.setChecked(mode == 'restore_original')
         self.selection_intersect_btn.setChecked(mode == 'local_intersect')
         self.selection_inner_btn.setChecked(mode == 'selection_inner')
         self.selection_add_inner_btn.setChecked(mode == 'add_selection_inner')
@@ -5875,10 +6085,13 @@ class MainWindow(QMainWindow):
         self.update_selection_combine_controls_visibility()
         self.update_local_intersect_controls_visibility()
         self.update_selection_combine_status()
+        self.update_edit_state_label()
 
     def selection_mode_allowed_for_tool(self, mode: str, tool: str) -> bool:
         if mode == 'local_edit_selection':
             return tool == 'rect'
+        if mode == 'restore_original':
+            return tool in ('rect', 'lasso')
         if tool == 'brush':
             return mode in ('add', 'subtract')
         if tool == 'rect':
@@ -5896,6 +6109,7 @@ class MainWindow(QMainWindow):
         selection_tool = tool in ('rect', 'magic', 'lasso')
         self.selection_add_btn.setVisible(tool in ('rect', 'magic', 'brush', 'lasso'))
         self.selection_subtract_btn.setVisible(tool in ('rect', 'magic', 'brush', 'lasso'))
+        self.restore_original_btn.setVisible(True)
         self.selection_intersect_btn.setVisible(selection_tool)
         self.selection_inner_btn.setVisible(tool == 'magic')
         self.selection_add_inner_btn.setVisible(tool == 'magic')
@@ -5930,6 +6144,17 @@ class MainWindow(QMainWindow):
             return
         label = SELECTION_COMBINE_LABELS.get(self.selection_combine_mode, '添加')
         self.status.showMessage(f'選區模式：{label}；右鍵拖矩形清除所有 mask')
+
+    def update_edit_state_label(self) -> None:
+        if not hasattr(self, 'edit_state_label') or not hasattr(self, 'mask_view'):
+            return
+        tool_label = {'rect': '矩形', 'brush': '筆刷', 'magic': '魔法棒', 'lasso': '套索'}.get(
+            self.mask_view.tool, self.mask_view.tool
+        )
+        _set_state_label(self.edit_state_label,
+            f'模式：{EDIT_MODE_LABELS[self.edit_mode]} · {tool_label} · '
+            f'{SELECTION_COMBINE_LABELS[self.selection_combine_mode]}'
+        )
 
     def change_brush_radius(self, delta: int) -> None:
         self.mask_view.set_brush_radius(self.mask_view.brush_radius + delta)
@@ -5994,6 +6219,26 @@ class MainWindow(QMainWindow):
             self.resize_fit_timer.start(120)
 
     def keyPressEvent(self, event) -> None:
+        function_keys = {getattr(Qt.Key, f'Key_F{number}') for number in range(1, 13)}
+        if (isinstance(self.focusWidget(), (QLineEdit, QSpinBox, QDoubleSpinBox))
+                and event.key() not in function_keys):
+            super().keyPressEvent(event)
+            return
+        if event.key() == Qt.Key.Key_A and event.modifiers() == Qt.KeyboardModifier.NoModifier:
+            self.previous_image()
+            return
+        if event.key() == Qt.Key.Key_D and event.modifiers() == Qt.KeyboardModifier.NoModifier:
+            self.next_image()
+            return
+        pan = {
+            Qt.Key.Key_Left: (-VIEW_KEY_PAN_STEP, 0),
+            Qt.Key.Key_Right: (VIEW_KEY_PAN_STEP, 0),
+            Qt.Key.Key_Up: (0, -VIEW_KEY_PAN_STEP),
+            Qt.Key.Key_Down: (0, VIEW_KEY_PAN_STEP),
+        }.get(event.key())
+        if pan is not None and event.modifiers() == Qt.KeyboardModifier.NoModifier:
+            self.mask_view.pan_by(*pan)
+            return
         if event.key() == Qt.Key.Key_Escape and self.mask_view._magic_stroke_rect is not None:
             self.mask_view.cancel_magic_stroke()
             return
@@ -6002,6 +6247,9 @@ class MainWindow(QMainWindow):
             return
         if event.key() == Qt.Key.Key_F2:
             self.set_edit_mode('manual_other')
+            return
+        if event.key() == Qt.Key.Key_F3:
+            self.set_selection_combine_mode('restore_original')
             return
         if event.key() == Qt.Key.Key_F4:
             self.fit_both_views()
@@ -6136,6 +6384,9 @@ class MainWindow(QMainWindow):
 
     def on_selection_created(self, selection: object) -> None:
         selection_mask = np.asarray(selection, dtype=bool)
+        if self.selection_combine_mode == 'restore_original':
+            self.on_erase_all_masks_requested(selection_mask)
+            return
         if self.selection_combine_mode == 'local_edit_selection':
             queued_selection = selection_mask.copy()
             QTimer.singleShot(0, lambda: self.open_local_edit_dialog(queued_selection))
@@ -6450,6 +6701,7 @@ class MainWindow(QMainWindow):
         self._pending_preview_cancel = cancel_preview
         self._pending_edit_identity = (paths['raw'], path, revision)
         self._last_edit_error = None
+        self.update_current_page_status()
         future = self._edit_executor.submit(
             _persist_edit_and_preview, paths, path, revision, job_id, page, self.current_base,
             settings, cancel_preview,
@@ -6487,28 +6739,24 @@ class MainWindow(QMainWindow):
         else:
             self._last_edit_error = result['error'] or '無法儲存頁面。'
             self.status.showMessage(f'儲存失敗：{self._last_edit_error}；修改仍保留在記憶體，可重試儲存。')
+        self.update_current_page_status()
 
     def _update_saved_page_summary(self, summary):
         name = osp.basename(self.current_img_path)
         pages = self.report.setdefault('pages', {})
         pages[name] = dict(summary)
-        status = STATUS_OTHER if summary.get('other_pixels', 0) else STATUS_OK
-        for row in range(self.list_widget.count()):
-            item = self.list_widget.item(row)
-            if item.data(Qt.ItemDataRole.UserRole) == self.current_img_path:
-                item.setText(f'{name}    {status}')
-                item.setForeground(QColor('#d59a45' if status == STATUS_OTHER else '#57b66f'))
-                break
+        self._update_page_item(self.current_img_path, pages[name])
+        self.update_review_summary()
         other_count = sum(bool(info.get('other_pixels', 0)) and 'error' not in info for info in pages.values())
         failed_count = sum('error' in info for info in pages.values())
-        self.summary_label.setText(f'共 {len(self.imglist)} 張    OTHER {other_count}    失敗 {failed_count}')
         self.report['summary'] = {
             'total': max(len(self.imglist), len(pages)),
             'processed': sum(bool(info.get('processed')) and 'error' not in info for info in pages.values()),
             'failed': failed_count, 'with_other_mask': other_count,
         }
+        self.update_current_page_status()
 
-    def _commit_current_masks(self):
+    def _commit_current_masks(self, *, silent: bool = False):
         if not self.current_img_path or self.current_page is None:
             return True
         dirty_bbox = self._current_dirty_bbox()
@@ -6519,6 +6767,9 @@ class MainWindow(QMainWindow):
             page = prepare_page_edits(self.current_base, self.current_manual_solid,
                 self.current_manual_other, state=self.current_page, dirty_bbox=dirty_bbox)
         except (OSError, ValueError) as exc:
+            if silent:
+                self._last_control_error = str(exc)
+                return False
             if '取色' not in str(exc):
                 QMessageBox.warning(self, '儲存失敗', str(exc))
                 return False
@@ -6544,8 +6795,9 @@ class MainWindow(QMainWindow):
         self.status.showMessage('已更新左側選區，正在儲存及生成右側預覽。')
         return True
 
-    def flush_pending_edits(self):
-        if not self._commit_current_masks():
+    def flush_pending_edits(self, *, silent: bool = False):
+        self._last_control_error = ''
+        if not self._commit_current_masks(silent=silent):
             return False
         if self._last_edit_error and self.current_page is not None:
             self._enqueue_current_page()
@@ -6557,19 +6809,24 @@ class MainWindow(QMainWindow):
         result = future.result()
         self._on_edit_result(result)
         if not result['saved']:
-            QMessageBox.warning(self, '儲存失敗', f'{result["error"]}\n修改保留在記憶體，請重試後再離開。')
+            self._last_control_error = result['error'] or '儲存失敗。'
+            if not silent:
+                QMessageBox.warning(self, '儲存失敗', f'{result["error"]}\n修改保留在記憶體，請重試後再離開。')
             return False
         return True
 
-    def save_all_edit_masks(self):
+    def save_all_edit_masks(self, *, silent: bool = False):
         # Equal in-memory masks can still have a pending save. Every boundary
         # must wait for the latest snapshot, including an undo or a retry.
-        return self.flush_pending_edits()
+        return self.flush_pending_edits(silent=silent)
 
     def closeEvent(self, event):
         if not self.flush_pending_edits():
             event.ignore()
             return
+        if self.control_server is not None:
+            self.control_server.close()
+            self.control_server = None
         self.startup_restore_timer.stop()
         self._edit_executor.shutdown(wait=True)
         self._edit_executor_closed = True
@@ -6648,6 +6905,7 @@ class MainWindow(QMainWindow):
             '滑鼠操作：\n'
             '筆刷左鍵：按「添加 / 減去」處理目前 mask\n'
             '右鍵拖拽：不分工具，矩形清除純色填充 / 圖像修補 mask\n'
+            'F3 恢復原圖：矩形或套索左鍵清除兩類選區，可撤銷\n'
             'Cmd（macOS）或 Ctrl（Windows/Linux）＋右鍵拖拽：矩形內現有的兩類 mask 逐像素互換；空白不變\n'
             '筆刷 Shift + 按下拖到鬆開：連接按下和鬆開位置\n'
             '矩形 / 魔法棒 / 套索：支援添加、減去、局部交集、從其他轉入和添加CTD檢測選區\n'
@@ -6677,6 +6935,7 @@ class MainWindow(QMainWindow):
             'D：下一頁\n'
             'F1：純色填充\n'
             'F2：圖像修補\n'
+            'F3：恢復原圖（清除兩類）\n'
             'F4：兩張圖同時適應窗口\n'
             'F5：矩形工具\n'
             'F6：筆刷工具\n'
@@ -6686,6 +6945,8 @@ class MainWindow(QMainWindow):
             'F10：減去\n'
             'F11：局部交集\n'
             'F12：從其他轉入\n'
+            '相容工具間切換會保留目前添加或減去模式。\n'
+            '左側可輸入頁碼或完整檔名跳頁，校對完按「完成本頁並到下一頁」。\n'
             '[：縮小筆刷\n'
             ']：放大筆刷\n'
             'Ctrl+Z：撤銷\n'

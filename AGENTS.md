@@ -2,6 +2,8 @@
 
 開始處理任務前，先閱讀 [Agent.md](Agent.md) 中的專案架構、資料格式與執行方式。
 
+漫畫去字的「開始偵測 → 逐頁校正 → 保存」工作流使用專案 Skill：[comic-detect-review](.agents/skills/comic-detect-review/SKILL.md)。
+
 ## 子代理委派
 
 本專案已在 `.codex/agents/` 配置 `explorer` 和 `worker`。對需要追查程式碼路徑、跨檔分析或修改程式的任務，主代理應主動委派適合的子代理，不必等使用者每次點名模型。
