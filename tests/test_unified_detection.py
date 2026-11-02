@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 import cv2
 import numpy as np
+from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QDialog, QDialogButtonBox, QMessageBox
 import solid_inpaint_ui as ui
 import bubble_solid as bubble
@@ -38,7 +39,7 @@ class UnifiedDetectionTests(unittest.TestCase):
             cv2.imwrite(str(self.fixture.root / f'{index:02d}.png'), self.fixture.image)
         self.w.load_folder(str(self.fixture.root))
 
-    def test_inline_options_follow_project_and_are_shared_by_all_models(self):
+    def test_inline_options_are_shared_by_all_models(self):
         from PySide6.QtGui import QAction
         dialog = ui.DetectorSelectionDialog(self.w.settings, self.w,
             solid_settings={'enabled': False, 'shrink_percent': 6.0}, image_paths=self.w.imglist)
@@ -60,6 +61,62 @@ class UnifiedDetectionTests(unittest.TestCase):
         self.assertFalse(dialog.bubble_direct_white.isChecked())
         self.assertFalse(any(action.text() == '純色填充設定' for action in self.w.findChildren(QAction)))
         dialog.close()
+
+    def test_bubble_options_follow_global_settings_across_projects_and_restart(self):
+        first = ui.DetectorSelectionDialog(self.w.settings, image_paths=self.w.imglist)
+        first.bubble_enabled.setChecked(False)
+        first.bubble_direct_white.setChecked(False)
+        first.bubble_shrink.setValue(5.5)
+        first.save_settings()
+        first.close()
+
+        other_folder = self.fixture.root / 'other_project'
+        other_folder.mkdir()
+        cv2.imwrite(str(other_folder / '01.png'), self.fixture.image)
+        self.w.load_folder(str(other_folder))
+        store.update_project(self.w.paths['raw'], settings={'solid_fill': {
+            'enabled': True, 'shrink_percent': 1.0, 'direct_white': True}})
+        reopened_settings = QSettings(str(self.fixture.root / 'ui.ini'), QSettings.Format.IniFormat)
+        reopened = ui.DetectorSelectionDialog(reopened_settings, image_paths=self.w.imglist)
+        self.assertEqual(reopened.selected_solid_settings(), {
+            'enabled': False, 'shrink_percent': 5.5, 'direct_white': False})
+        reopened.close()
+
+    def test_bubble_options_save_only_after_detection_starts(self):
+        store.update_project(self.w.paths['raw'], settings={'solid_fill': {
+            'enabled': False, 'shrink_percent': 7.0, 'direct_white': False}})
+
+        def cancel_options(dialog):
+            dialog.bubble_enabled.setChecked(False)
+            dialog.bubble_direct_white.setChecked(False)
+            return QDialog.DialogCode.Rejected
+
+        with patch.object(ui.DetectorSelectionDialog, 'exec', cancel_options), \
+                patch.object(self.w, 'start_worker') as start:
+            self.w.run_or_load()
+        start.assert_not_called()
+        self.assertFalse(self.w.settings.contains('bubble/enabled'))
+
+        def choose_options(dialog):
+            self.assertEqual(dialog.selected_solid_settings(), {
+                'enabled': True, 'shrink_percent': 2.0, 'direct_white': True})
+            dialog.bubble_enabled.setChecked(False)
+            dialog.bubble_direct_white.setChecked(False)
+            dialog.bubble_shrink.setValue(4.5)
+            return QDialog.DialogCode.Accepted
+
+        with patch.object(ui.DetectorSelectionDialog, 'exec', choose_options), \
+                patch.object(self.w, 'start_worker', return_value=False), \
+                patch.object(ui.QMessageBox, 'warning', return_value=QMessageBox.StandardButton.Yes):
+            self.w.run_or_load()
+        self.assertFalse(self.w.settings.contains('bubble/enabled'))
+
+        with patch.object(ui.DetectorSelectionDialog, 'exec', choose_options), \
+                patch.object(self.w, 'start_worker', return_value=True), \
+                patch.object(ui.QMessageBox, 'warning', return_value=QMessageBox.StandardButton.Yes):
+            self.w.run_or_load()
+        self.assertEqual(ui.DetectorSelectionDialog(self.w.settings).selected_solid_settings(), {
+            'enabled': False, 'shrink_percent': 4.5, 'direct_white': False})
 
     def test_page_range_defaults_to_all_and_tracks_file_names(self):
         paths = ['01.png', '03.png', '10.jpg', '20.jpg']

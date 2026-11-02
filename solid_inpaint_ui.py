@@ -93,7 +93,7 @@ from detect_solid_inpaint_folder import (
 from utils.io_utils import imread, imwrite
 from ysg_detector import YSG_DEFAULT_LABELS, YSG_LABEL_DESCRIPTIONS, YSG_UNSUPPORTED_LABELS
 import project_store as store
-from bubble_solid import load_settings as load_solid_settings, save_settings as save_solid_settings
+from bubble_solid import save_settings as save_solid_settings
 
 
 STATUS_OK = ''
@@ -3464,6 +3464,7 @@ class DetectorSelectionDialog(QDialog):
                  *, solid_settings: dict | None = None,
                  image_paths: list[str] | None = None) -> None:
         super().__init__(parent)
+        self.settings = settings
         self.image_paths = list(image_paths or [])
         self.setWindowTitle('偵測並生成')
         layout = QVBoxLayout(self)
@@ -3526,7 +3527,7 @@ class DetectorSelectionDialog(QDialog):
         bubble_title_font.setBold(True)
         bubble_title.setFont(bubble_title_font)
         bubble_layout.addWidget(bubble_title)
-        values = solid_settings or {'enabled': True, 'shrink_percent': 2.0, 'direct_white': True}
+        values = solid_settings if solid_settings is not None else self._saved_solid_settings()
         self.bubble_enabled = QCheckBox('啟用氣泡填充（MangaLens）')
         self.bubble_enabled.setChecked(values['enabled'])
         bubble_layout.addWidget(self.bubble_enabled)
@@ -3601,8 +3602,24 @@ class DetectorSelectionDialog(QDialog):
     def selected_detector_params(self) -> dict:
         return self.selector.selected_detector_params()
 
+    def _saved_solid_settings(self) -> dict:
+        try:
+            shrink_percent = float(self.settings.value('bubble/shrink_percent', 2.0))
+            if not math.isfinite(shrink_percent) or not 0 <= shrink_percent <= 10:
+                shrink_percent = 2.0
+        except (TypeError, ValueError):
+            shrink_percent = 2.0
+        return {
+            'enabled': self.settings.value('bubble/enabled', True, type=bool),
+            'shrink_percent': shrink_percent,
+            'direct_white': self.settings.value('bubble/direct_white', True, type=bool),
+        }
+
     def save_settings(self) -> None:
         self.selector.save_settings()
+        for key, value in self.selected_solid_settings().items():
+            self.settings.setValue(f'bubble/{key}', value)
+        self.settings.sync()
 
     def selected_solid_settings(self) -> dict:
         return {'enabled': self.bubble_enabled.isChecked(),
@@ -5028,8 +5045,7 @@ class MainWindow(QMainWindow):
             return
 
         detector_dialog = DetectorSelectionDialog(
-            self.settings, self, solid_settings=load_solid_settings(self.paths['raw']),
-            image_paths=self.imglist,
+            self.settings, self, image_paths=self.imglist,
         )
         if detector_dialog.exec() != QDialog.DialogCode.Accepted:
             return
