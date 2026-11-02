@@ -15,7 +15,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QLocale, QObject, QPoint, QPointF, QRectF, QSettings, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QLocale, QObject, QPoint, QPointF, QRect, QRectF, QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QPolygonF, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -139,6 +139,19 @@ EDIT_MODE_LABELS = {
     'manual_solid': '純色填充',
     'manual_other': '圖像修補',
 }
+
+
+def review_window_geometry(available: QRect) -> QRect:
+    """Center a review window within one screen's logical available geometry."""
+    margin = 40  # Leave room for the window frame and desktop edges.
+    width = min(1500, max(1, available.width() - 2 * margin))
+    height = min(1000, max(1, available.height() - 2 * margin))
+    return QRect(
+        available.x() + (available.width() - width) // 2,
+        available.y() + (available.height() - height) // 2,
+        width,
+        height,
+    )
 
 
 def _set_state_label(label: QLabel, value: str) -> None:
@@ -4175,6 +4188,12 @@ class MainWindow(QMainWindow):
         self.navigator_action.triggered.connect(self.set_navigator_visible)
         toolbar.addAction(self.navigator_action)
 
+        self.arrange_review_button = QToolButton()
+        self.arrange_review_button.setText('整理監修視窗')
+        self.arrange_review_button.setAccessibleName('整理監修視窗')
+        self.arrange_review_button.clicked.connect(self.arrange_review_window)
+        toolbar.addWidget(self.arrange_review_button)
+
         more_menu = QMenu(self)
         more_menu.addAction('打開輸出', self.open_output)
         more_menu.addAction('生成 PDF', self.generate_pdf)
@@ -6186,6 +6205,20 @@ class MainWindow(QMainWindow):
     def fit_both_views(self) -> None:
         self.mask_view.fit()
         self.sync_preview_view()
+
+    def arrange_review_window(self) -> None:
+        """Fit the window to its current screen without changing page data."""
+        if self.is_mask_stroke_active or self.is_local_edit_active:
+            self.status.showMessage('正在編輯選區，完成目前操作後再整理監修視窗。')
+            return
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            self.status.showMessage('無法取得顯示器尺寸。')
+            return
+        self.showNormal()
+        self.setGeometry(review_window_geometry(screen.availableGeometry()))
+        self.resize_fit_timer.start(120)
+        self.status.showMessage('已整理監修視窗。')
 
     def sync_preview_view(self) -> None:
         if self._syncing_preview_view:
