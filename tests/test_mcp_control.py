@@ -175,6 +175,24 @@ class McpControlTests(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(self.call('get_job_status', {'job_id': job})['state'], 'completed')
 
+    def test_detection_defaults_to_all_project_pages_and_reports_range_gap(self):
+        self.call('open_project', {'path': str(self.root)})
+        self.window.imglist = [str(self.root / f'{index}.jpg') for index in range(1, 31)]
+        all_pages = self.call('start_detection')
+        self.assertEqual(all_pages['project_page_count'], 30)
+        self.assertEqual(all_pages['selected_page_count'], 30)
+        self.assertEqual(all_pages['coverage_missing_pages'], [])
+        self.window.worker_thread = None
+        partial = self.call('start_detection', {'end_page': 28})
+        self.assertEqual(partial['selected_page_count'], 28)
+        self.assertEqual(partial['coverage_missing_pages'], ['29.jpg', '30.jpg'])
+        self.window.worker.finished.emit({'pages': {}})
+        self.app.processEvents()
+        final = self.call('get_job_status', {'job_id': partial['job_id']})
+        self.assertEqual(final['state'], 'completed')
+        self.assertEqual(final['project_page_count'], 30)
+        self.assertEqual(final['coverage_missing_pages'], ['29.jpg', '30.jpg'])
+
     def test_image_matches_current_page_and_busy_guard(self):
         self.call('open_project', {'path': str(self.root)})
         result = self.call('get_page_view', {'kind': 'original', 'max_side': 512})

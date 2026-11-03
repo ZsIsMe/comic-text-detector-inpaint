@@ -28,8 +28,9 @@ if os.name == 'posix':
     import fcntl
 
 
-MAX_MESSAGE = 16 * 1024 * 1024
+MAX_MESSAGE = 64 * 1024 * 1024
 MAX_VIEW_SIDE = 2048
+MAX_BATCH_OPERATIONS = 64
 
 
 def server_name() -> str:
@@ -117,6 +118,8 @@ class ControlServer(QObject):
         self._buffers: dict[QLocalSocket, bytearray] = {}
         self.jobs: dict[str, dict] = {}
         self.latest_job_id = ''
+        self._review_tokens: dict[str, tuple] = {}
+        self._last_batch_stamp: tuple | None = None
         self._closed = False
 
     def close(self) -> None:
@@ -272,8 +275,12 @@ class ControlServer(QObject):
                 info = pages.get(name, {})
                 result.append({'index': i, 'name': name, 'processed': bool(info.get('processed')),
                                'other_pixels': int(info.get('other_pixels', 0)),
-                               'reviewed': is_page_reviewed(info), 'error': info.get('error')})
-            return {'folder': w.folder, 'pages': result}
+                               'reviewed': is_page_reviewed(info), 'failed': 'error' in info,
+                               'error': info.get('error')})
+            return {'folder': w.folder, 'page_count': len(result), 'pages': result,
+                    'processed_count': sum(page['processed'] and not page['failed'] for page in result),
+                    'failed_pages': [page['name'] for page in result if page['failed']],
+                    'unreviewed_pages': [page['name'] for page in result if not page['reviewed']]}
         if method == 'go_to_page':
             self._ensure_idle()
             if not w.folder:
@@ -311,6 +318,14 @@ class ControlServer(QObject):
             return self._start_detection(params)
         if method == 'get_page_view':
             return self._page_view(params)
+        if method == 'get_review_bundle':
+            return self._review_bundle(params)
+        if method == 'apply_page_edits':
+            return self._apply_page_edits(params)
+        if method == 'undo_page_edit':
+            return self._undo_page_edit(params)
+        if method == 'mark_page_reviewed':
+            return self._mark_page_reviewed(params)
         raise ControlError('unknown_method', f'未知方法：{method}')
 
     def _start_detection(self, params):
@@ -364,7 +379,10 @@ class ControlServer(QObject):
         job = {'job_id': job_id, 'state': 'running', 'current': 0, 'total': len(images),
                'name': None, 'error': None, 'folder': w.folder,
                'start_page': start, 'end_page': end, 'detector': detector,
-               'image_names': [Path(path).name for path in images]}
+               'image_names': [Path(path).name for path in images],
+               'project_page_count': len(w.imglist), 'selected_page_count': len(images),
+               'coverage_missing_pages': [Path(path).name for path in
+                                          (w.imglist[:start - 1] + w.imglist[end:])]}
         self.jobs[job_id] = job
         self.latest_job_id = job_id
         def attach(worker):
@@ -440,6 +458,248 @@ class ControlServer(QObject):
     def _job_failed(self, job_id, message):
         if job_id in self.jobs:
             self.jobs[job_id].update(state='failed', error=message)
+
+    def _page_stamp(self) -> tuple:
+        """Bind a review decision to the loaded page, saved data and source file."""
+        from project_store import page_path, page_state_digest, source_signature
+        w = self.window
+        if not w.folder or not w.current_img_path or w.current_base is None or w.current_page is None:
+            raise ControlError('no_page', '目前沒有可校對的頁面。')
+        try:
+            source = source_signature(w.current_img_path)
+            archive = page_path(w.paths, w.current_img_path)
+            archive_stat = archive.stat() if archive.exists() else None
+        except OSError as exc:
+            raise ControlError('page_unavailable', str(exc)) from exc
+        loaded_source = getattr(w, '_control_loaded_source_signature', source)
+        if loaded_source != source:
+            raise ControlError('stale_page', '原圖載入後已變更；請重新載入頁面並核對。')
+        info = w.report.get('pages', {}).get(Path(w.current_img_path).name, {})
+        archive_signature = (archive_stat.st_size, archive_stat.st_mtime_ns) if archive_stat else None
+        if getattr(w, '_control_loaded_archive_signature', archive_signature) != archive_signature:
+            raise ControlError('stale_page', '正式頁面資料載入後已變更；請重新載入頁面並核對。')
+        if info.get('has_data') and archive_signature is None:
+            raise ControlError('page_unavailable', '正式頁面資料遺失；請重新載入頁面並核對。')
+        return (str(Path(w.folder).resolve()), str(Path(w.current_img_path).resolve()),
+                w.list_widget.currentRow(), getattr(w, '_control_page_generation', 0),
+                id(w.current_base), id(w.current_page), w._edit_revision, w._saved_edit_revision,
+                source, archive_signature,
+                page_state_digest(w.current_page, source), info.get('state_digest'),
+                info.get('reviewed_digest'))
+
+    def _issue_page_token(self) -> str:
+        token = uuid.uuid4().hex
+        self._review_tokens[token] = self._page_stamp()
+        while len(self._review_tokens) > 32:
+            self._review_tokens.pop(next(iter(self._review_tokens)))
+        return token
+
+    def _validate_page_token(self, token):
+        if not isinstance(token, str) or token not in self._review_tokens:
+            raise ControlError('stale_page', '頁面憑證無效；請重新讀取校對影像。')
+        if self._review_tokens[token] != self._page_stamp():
+            raise ControlError('stale_page', '頁面或原圖已變更；請重新讀取校對影像。')
+
+    def _review_bundle(self, params):
+        self._ensure_idle()
+        self._page_stamp()
+        self._flush()
+        before = self._page_stamp()
+        include_mask = params.get('include_mask', False)
+        if type(include_mask) is not bool:
+            raise ControlError('bad_request', 'include_mask 必須是布林值。')
+        view_params = {key: params[key] for key in ('max_side', 'crop') if key in params}
+        images = {kind: self._page_view({**view_params, 'kind': kind})
+                  for kind in (('original', 'composite', 'mask') if include_mask
+                               else ('original', 'composite'))}
+        if before != self._page_stamp():
+            raise ControlError('stale_page', '讀取影像時頁面或原圖已變更。')
+        first = images['original']
+        status = self._status()
+        from project_store import is_page_reviewed
+        info = self.window.report.get('pages', {}).get(first['name'], {})
+        return {'folder': status['folder'], 'name': first['name'],
+                'page_index': first['page_index'], 'page_count': status['page_count'],
+                'width': first['width'], 'height': first['height'],
+                'revision': first['revision'], 'origin': first['origin'],
+                'crop_width': first['crop_width'], 'crop_height': first['crop_height'],
+                'image_width': first['image_width'], 'image_height': first['image_height'],
+                'scale': first['scale'], 'saved': not status['save_pending'],
+                'save_error': status['save_error'], 'processed': bool(info.get('processed')),
+                'failed': 'error' in info,
+                'reviewed': is_page_reviewed(info), 'page_token': self._issue_page_token(),
+                'images': images}
+
+    @staticmethod
+    def _validated_operations(operations, width, height):
+        if not isinstance(operations, list) or not 1 <= len(operations) <= MAX_BATCH_OPERATIONS:
+            raise ControlError('bad_request', 'operations 須為 1 至 64 個操作。')
+        result = []
+        for number, operation in enumerate(operations, 1):
+            if not isinstance(operation, dict) or set(operation) - {'kind', 'target', 'shape', 'color_rgb'}:
+                raise ControlError('bad_request', f'第 {number} 個操作格式無效。')
+            kind, target, shape = operation.get('kind'), operation.get('target'), operation.get('shape')
+            if kind not in ('restore', 'add', 'transfer') or not isinstance(shape, dict) or len(shape) != 1:
+                raise ControlError('bad_request', f'第 {number} 個操作類型或形狀無效。')
+            if kind == 'restore':
+                if target is not None or 'color_rgb' in operation:
+                    raise ControlError('bad_request', f'第 {number} 個恢復操作不能指定類別或顏色。')
+            elif target not in ('solid', 'other'):
+                raise ControlError('bad_request', f'第 {number} 個操作須指定 solid 或 other。')
+            color = operation.get('color_rgb')
+            if target == 'solid':
+                if (not isinstance(color, list) or len(color) != 3
+                        or any(type(value) is not int or not 0 <= value <= 255 for value in color)):
+                    raise ControlError('bad_request', f'第 {number} 個純色操作須指定 RGB 顏色。')
+            elif color is not None:
+                raise ControlError('bad_request', f'第 {number} 個操作不需顏色。')
+            if 'rect' in shape:
+                rect = shape['rect']
+                if (not isinstance(rect, list) or len(rect) != 4
+                        or any(type(value) is not int for value in rect)):
+                    raise ControlError('bad_request', f'第 {number} 個矩形格式無效。')
+                x, y, rw, rh = rect
+                if not (0 <= x < width and 0 <= y < height and rw > 0 and rh > 0
+                        and x + rw <= width and y + rh <= height):
+                    raise ControlError('bad_request', f'第 {number} 個矩形超出原圖。')
+                bbox = (x, y, x + rw, y + rh)
+                points = None
+            elif 'polygon' in shape:
+                points = shape['polygon']
+                if (not isinstance(points, list) or not 3 <= len(points) <= 256
+                        or any(not isinstance(p, list) or len(p) != 2
+                               or any(type(v) is not int for v in p) for p in points)
+                        or any(not (0 <= p[0] < width and 0 <= p[1] < height) for p in points)):
+                    raise ControlError('bad_request', f'第 {number} 個多邊形格式或範圍無效。')
+                if abs(cv2.contourArea(np.asarray(points, dtype=np.float32))) < .5:
+                    raise ControlError('bad_request', f'第 {number} 個多邊形面積為零。')
+                bbox = (min(p[0] for p in points), min(p[1] for p in points),
+                        max(p[0] for p in points) + 1, max(p[1] for p in points) + 1)
+            else:
+                raise ControlError('bad_request', f'第 {number} 個操作缺少矩形或多邊形。')
+            result.append((kind, target, bbox, points, color))
+        return result
+
+    def _apply_page_edits(self, params):
+        self._ensure_idle()
+        self._validate_page_token(params.get('page_token'))
+        self._flush()
+        self._validate_page_token(params.get('page_token'))
+        if type(params.get('include_mask', False)) is not bool:
+            raise ControlError('bad_request', 'include_mask 必須是布林值。')
+        view_params = {key: params[key] for key in ('max_side', 'crop') if key in params}
+        self._page_view({**view_params, 'kind': 'original'})
+        w = self.window
+        height, width = w.current_base.shape[:2]
+        operations = self._validated_operations(params.get('operations'), width, height)
+        # Prepare the full batch in detached arrays. A late invalid operation or
+        # colour calculation cannot leave the GUI with a partly edited page.
+        from detect_solid_inpaint_folder import prepare_page_edits
+        solid = w.current_manual_solid.copy()
+        other = w.current_manual_other.copy()
+        page = {key: value.copy() for key, value in w.current_page.items()}
+        for kind, target, bbox, points, color in operations:
+            selection = np.zeros((height, width), dtype=np.uint8)
+            x1, y1, x2, y2 = bbox
+            if points is None:
+                selection[y1:y2, x1:x2] = 1
+            else:
+                cv2.fillPoly(selection, [np.asarray(points, dtype=np.int32)], 1, lineType=cv2.LINE_8)
+            selection = selection > 0
+            if kind == 'restore':
+                solid[selection] = 0
+                other[selection] = 0
+            elif kind == 'add':
+                (solid if target == 'solid' else other)[selection] = 255
+                (other if target == 'solid' else solid)[selection] = 0
+            else:
+                source = other if target == 'solid' else solid
+                moved = selection & (source > 0)
+                source[moved] = 0
+                (solid if target == 'solid' else other)[moved] = 255
+            try:
+                page = prepare_page_edits(w.current_base, solid, other, state=page,
+                                          dirty_bbox=bbox,
+                                          fill_color=tuple(reversed(color)) if color is not None else None)
+            except (OSError, ValueError) as exc:
+                raise ControlError('edit_failed', str(exc)) from exc
+        previous = w.current_page
+        changed = np.any(previous['overlay'] != page['overlay'], axis=2)
+        changed |= previous['other'] != page['other']
+        changed |= previous['edited'] != page['edited']
+        rows, cols = np.flatnonzero(np.any(changed, axis=1)), np.flatnonzero(np.any(changed, axis=0))
+        if rows.size:
+            dirty = (int(cols[0]), int(rows[0]), int(cols[-1]) + 1, int(rows[-1]) + 1)
+            w.push_undo_snapshot()
+            w.current_manual_solid, w.current_manual_other, w.current_page = solid, other, page
+            w._edit_revision += 1
+            w._update_committed_left(dirty)
+            w._enqueue_current_page()
+            try:
+                self._flush()
+            except ControlError as exc:
+                raise ControlError('save_failed',
+                                   f'{exc} 修改保留在 GUI 記憶體；可用 GUI 撤銷或重試保存。') from exc
+            self._last_batch_stamp = self._page_stamp()
+        else:
+            dirty = None
+        bundle = self._review_bundle(params)
+        bundle['changed_bbox'] = list(dirty) if dirty else None
+        bundle['saved'] = True
+        return bundle
+
+    def _undo_page_edit(self, params):
+        self._ensure_idle()
+        self._validate_page_token(params.get('page_token'))
+        self._flush()
+        self._validate_page_token(params.get('page_token'))
+        if type(params.get('include_mask', False)) is not bool:
+            raise ControlError('bad_request', 'include_mask 必須是布林值。')
+        view_params = {key: params[key] for key in ('max_side', 'crop') if key in params}
+        self._page_view({**view_params, 'kind': 'original'})
+        w = self.window
+        if self._last_batch_stamp != self._page_stamp() or not w.undo_stack:
+            raise ControlError('stale_page', '最近一次操作已變更，不能代替 GUI 撤銷。')
+        w.undo_mask()
+        self._flush()
+        self._last_batch_stamp = None
+        return self._review_bundle(params)
+
+    def _mark_page_reviewed(self, params):
+        self._ensure_idle()
+        self._validate_page_token(params.get('page_token'))
+        self._flush()
+        self._validate_page_token(params.get('page_token'))
+        if type(params.get('include_mask', False)) is not bool:
+            raise ControlError('bad_request', 'include_mask 必須是布林值。')
+        view_params = {key: params[key] for key in ('max_side', 'crop') if key in params}
+        self._page_view({**view_params, 'kind': 'original'})
+        reviewed, advance = params.get('reviewed', True), params.get('advance', False)
+        if type(reviewed) is not bool or type(advance) is not bool:
+            raise ControlError('bad_request', 'reviewed 與 advance 必須是布林值。')
+        w = self.window
+        if not w.set_current_reviewed(reviewed):
+            raise ControlError('save_failed', w._last_control_error or '頁面尚未成功偵測或校對標記保存失敗。')
+        old_path = w.current_img_path
+        if advance:
+            w.next_image()
+            if w.current_img_path == old_path and w.list_widget.currentRow() < len(w.imglist) - 1:
+                raise ControlError('navigation_failed', '校對標記已保存，但切頁失敗。')
+        if w.current_base is None or w.current_page is None:
+            return {'saved': True, 'marked_reviewed': reviewed,
+                    'advanced': w.current_img_path != old_path,
+                    'next_page_unavailable': True, **self._status(), 'images': {}}
+        try:
+            result = self._review_bundle({**params, 'crop': None} if w.current_img_path != old_path else params)
+        except ControlError as exc:
+            if w.current_img_path == old_path:
+                raise
+            return {'saved': True, 'marked_reviewed': reviewed, 'advanced': True,
+                    'next_bundle_error': {'code': exc.code, 'message': str(exc)},
+                    **self._status(), 'images': {}}
+        result['marked_reviewed'] = reviewed
+        result['advanced'] = advance and w.current_img_path != old_path
+        return result
 
     def _page_view(self, params):
         w = self.window

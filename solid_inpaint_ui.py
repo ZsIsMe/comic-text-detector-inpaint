@@ -4126,6 +4126,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._apply_style()
+        self._fit_horizontal_toolbar_heights()
         try:
             from solid_inpaint_control import start_control
             self.control_server = start_control(self)
@@ -4237,19 +4238,24 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(10, 8, 10, 10)
         root_layout.setSpacing(8)
 
-        top_row = QHBoxLayout()
-        self.folder_label = QLabel('未選擇文件夾')
+        # The editable path below is the visible project identity.  Keep this
+        # label for status/accessibility metadata without repeating the path.
+        self.folder_label = QLabel('未選擇文件夾', root)
         self.folder_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.folder_label.setAccessibleName('目前專案資料夾')
+        self.folder_label.hide()
+        self.progress_row = QWidget()
+        top_row = QHBoxLayout(self.progress_row)
+        top_row.setContentsMargins(0, 0, 0, 0)
         self.progress_label = QLabel('')
         self.progress_label.setAccessibleName('偵測任務：尚未開始')
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
-        top_row.addWidget(self.folder_label, 4)
         top_row.addWidget(self.progress_label, 2)
         top_row.addWidget(self.progress, 3)
-        root_layout.addLayout(top_row)
+        root_layout.addWidget(self.progress_row)
+        self.progress_row.hide()
 
         project_row = QHBoxLayout()
         self.folder_path_input = QLineEdit()
@@ -4344,6 +4350,7 @@ class MainWindow(QMainWindow):
         workspace_layout.addLayout(mode_toolbar)
 
         edit_toolbar = QHBoxLayout()
+        edit_toolbar.setContentsMargins(0, 0, 0, 0)
         self.rect_btn = QPushButton('F5 矩形')
         self.rect_btn.setCheckable(True)
         self.rect_btn.clicked.connect(lambda: self.set_edit_tool('rect'))
@@ -4577,17 +4584,18 @@ class MainWindow(QMainWindow):
         self.edit_toolbar_scroll.setWidgetResizable(False)
         self.edit_toolbar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.edit_toolbar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.edit_toolbar_scroll.setFixedHeight(66)
+        self.edit_toolbar_scroll.setFixedHeight(
+            edit_toolbar_widget.sizeHint().height()
+            + self.edit_toolbar_scroll.horizontalScrollBar().sizeHint().height()
+            + 2 * self.edit_toolbar_scroll.frameWidth()
+        )
         self.edit_toolbar_scroll.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         workspace_layout.addWidget(self.edit_toolbar_scroll)
-        for controls in (self.local_intersect_dark_controls, self.magic_scope_controls):
-            policy = controls.sizePolicy()
-            policy.setRetainSizeWhenHidden(True)
-            controls.setSizePolicy(policy)
         workspace_layout.addWidget(self.local_intersect_dark_controls)
         workspace_layout.addWidget(self.magic_scope_controls)
 
         view_options = QHBoxLayout()
+        view_options.setContentsMargins(0, 0, 0, 0)
         view_options.addWidget(QLabel('Mask / 原圖'))
         self.alpha_slider = QSlider(Qt.Orientation.Horizontal)
         self.alpha_slider.setRange(0, 100)
@@ -4655,14 +4663,18 @@ class MainWindow(QMainWindow):
         view_options.addStretch()
         view_options_widget = QWidget()
         view_options_widget.setLayout(view_options)
-        view_options_scroll = QScrollArea()
-        view_options_scroll.setWidget(view_options_widget)
-        view_options_scroll.setWidgetResizable(False)
-        view_options_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
-        view_options_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        view_options_scroll.setFixedHeight(66)
-        view_options_scroll.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        workspace_layout.addWidget(view_options_scroll)
+        self.view_options_scroll = QScrollArea()
+        self.view_options_scroll.setWidget(view_options_widget)
+        self.view_options_scroll.setWidgetResizable(False)
+        self.view_options_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.view_options_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.view_options_scroll.setFixedHeight(
+            view_options_widget.sizeHint().height()
+            + self.view_options_scroll.horizontalScrollBar().sizeHint().height()
+            + 2 * self.view_options_scroll.frameWidth()
+        )
+        self.view_options_scroll.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        workspace_layout.addWidget(self.view_options_scroll)
 
         views_grid = QGridLayout()
         views_grid.setContentsMargins(0, 0, 0, 0)
@@ -4789,6 +4801,21 @@ class MainWindow(QMainWindow):
             QSlider::handle:horizontal { background: #e9fffb; border: 2px solid #38a996; width: 14px; margin: -5px 0; border-radius: 7px; }
             """
         )
+
+    def _fit_horizontal_toolbar_heights(self) -> None:
+        """Keep every control visible above its horizontal scrollbar after styling."""
+        for scroll in (self.edit_toolbar_scroll, self.view_options_scroll):
+            content = scroll.widget()
+            if content is None:
+                continue
+            content.ensurePolished()
+            content.layout().activate()
+            height = (content.sizeHint().height()
+                      + scroll.horizontalScrollBar().sizeHint().height()
+                      + 2 * scroll.frameWidth())
+            if scroll.height() != height:
+                scroll.setFixedHeight(height)
+            content.adjustSize()
 
     def choose_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, '選擇圖片文件夾', self.folder or str(Path.home()))
@@ -5370,6 +5397,7 @@ class MainWindow(QMainWindow):
                     QMessageBox.warning(self, '儲存失敗', str(exc))
                 return False
         self.progress.setValue(0)
+        _set_state_label(self.progress_label, '偵測準備中')
         self._control_worker_silent = silent
         self.worker_thread = QThread()
         self.worker = FolderWorker(
@@ -5402,6 +5430,7 @@ class MainWindow(QMainWindow):
                     QMessageBox.warning(self, '無法啟動任務', self._last_control_error)
                 return False
         self.mask_view.setEnabled(False)
+        self.progress_row.show()
         self.worker_thread.start()
         return True
 
@@ -5415,6 +5444,7 @@ class MainWindow(QMainWindow):
         if not self.save_all_edit_masks():
             return
         self.progress.setValue(0)
+        _set_state_label(self.progress_label, '選區轉換準備中')
         self.worker_thread = QThread()
         self.worker = ConvertMasksWorker(self.folder, self.paths, image_paths, target_mode)
         self.worker.moveToThread(self.worker_thread)
@@ -5426,6 +5456,7 @@ class MainWindow(QMainWindow):
         self.worker.failed.connect(self.worker_thread.quit)
         self.worker_thread.finished.connect(self.cleanup_worker)
         self.mask_view.setEnabled(False)
+        self.progress_row.show()
         self.worker_thread.start()
 
     def on_worker_progress(self, current: int, total: int, name: str) -> None:
@@ -5460,14 +5491,15 @@ class MainWindow(QMainWindow):
 
     def on_worker_failed(self, message: str) -> None:
         _set_state_label(self.progress_label, '偵測任務失敗')
+        self.status.showMessage(f'執行失敗：{message}')
         if self._control_worker_silent:
             self._last_control_error = message
-            self.status.showMessage(f'執行失敗：{message}')
         else:
             QMessageBox.critical(self, '執行失敗', message)
 
     def cleanup_worker(self) -> None:
         self.mask_view.setEnabled(True)
+        self.progress_row.hide()
         self.worker = None
         self.worker_thread = None
         self._control_worker_silent = False
@@ -5651,6 +5683,25 @@ class MainWindow(QMainWindow):
         if row < self.list_widget.count() - 1:
             self.list_widget.setCurrentRow(row + 1)
 
+    def _clear_unavailable_current_page(self) -> None:
+        self.current_base = None
+        self.current_page = None
+        self.current_manual_solid = None
+        self.current_manual_other = None
+        self.current_background_sample = None
+        self._control_page_generation = getattr(self, '_control_page_generation', 0) + 1
+        self._control_loaded_source_signature = None
+        self._control_loaded_archive_signature = None
+        self.mask_view.set_mask(None, (1, 1), reset_brush_line=True)
+        self.mask_view.set_source_image(None)
+        self.mask_view._committed_mask_overlay.clear()
+        self.mask_view.set_qimage(None)
+        self.mask_view.setEnabled(False)
+        self.preview_view.set_qimage(None)
+        if getattr(self, 'navigator', None) is not None:
+            self.navigator.set_qimage(None)
+        self.update_current_page_status()
+
     def reload_current(self, keep_view: bool = False, *, reuse_saved_page: bool = False) -> None:
         if self.is_mask_stroke_active or self.is_local_edit_active:
             return
@@ -5661,22 +5712,29 @@ class MainWindow(QMainWindow):
         reuse_saved_page = reuse_saved_page and self.current_base is not None and self.current_page is not None
         base = self.current_base if reuse_saved_page else _optional_imread(self.current_img_path, cv2.IMREAD_UNCHANGED)
         if base is None:
+            self._clear_unavailable_current_page()
+            self.status.showMessage(f'無法讀取原圖：{self.current_img_path}')
             return
         try:
             state = self.current_page if reuse_saved_page else read_page_state(self.paths, self.current_img_path, base.shape[:2])
             masks = {'manual_solid': state['overlay'][:, :, 3].copy(),
                      'manual_other': state['other'].copy()}
         except (OSError, ValueError) as exc:
-            self.current_page = None
-            self.current_base = None
-            self.current_manual_solid = None
-            self.current_manual_other = None
-            self.mask_view.setEnabled(False)
+            self._clear_unavailable_current_page()
             self.status.showMessage(str(exc))
             return
         self.mask_view.setEnabled(self.worker_thread is None)
         self.current_base = base
         self.current_page = state
+        # MCP page tokens must expire on a reload, even when edit revisions reset.
+        self._control_page_generation = getattr(self, '_control_page_generation', 0) + 1
+        if not reuse_saved_page:
+            self._control_loaded_source_signature = store.source_signature(self.current_img_path)
+            archive = store.page_path(self.paths, self.current_img_path)
+            archive_stat = archive.stat() if archive.exists() else None
+            self._control_loaded_archive_signature = (
+                (archive_stat.st_size, archive_stat.st_mtime_ns) if archive_stat else None
+            )
         shape = base.shape[:2]
         overlay, other_mask = state['overlay'], state['other']
         self.current_manual_solid = masks['manual_solid']
@@ -6082,6 +6140,7 @@ class MainWindow(QMainWindow):
         self.update_local_intersect_controls_visibility()
         self.update_selection_combine_status()
         self.update_edit_state_label()
+        self._fit_horizontal_toolbar_heights()
 
     def set_selection_combine_mode(self, mode: str) -> None:
         if mode not in SELECTION_COMBINE_LABELS:
@@ -6105,6 +6164,7 @@ class MainWindow(QMainWindow):
         self.update_local_intersect_controls_visibility()
         self.update_selection_combine_status()
         self.update_edit_state_label()
+        self._fit_horizontal_toolbar_heights()
 
     def selection_mode_allowed_for_tool(self, mode: str, tool: str) -> bool:
         if mode == 'local_edit_selection':
@@ -6245,6 +6305,8 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        if getattr(self, 'view_options_scroll', None) is not None:
+            self._fit_horizontal_toolbar_heights()
         if getattr(self, 'navigator', None) is not None:
             self.restore_navigator_position()
             self.update_navigator_viewport()
@@ -6762,6 +6824,11 @@ class MainWindow(QMainWindow):
             self._saved_edit_revision = result['revision']
             self._last_edit_error = None
             self._update_saved_page_summary(result['summary'])
+            archive = store.page_path(self.paths, self.current_img_path)
+            archive_stat = archive.stat() if archive.exists() else None
+            self._control_loaded_archive_signature = (
+                (archive_stat.st_size, archive_stat.st_mtime_ns) if archive_stat else None
+            )
             if result['settings'] == self._preview_settings() and result['preview'] is not None:
                 self.preview_view.set_qimage(result['preview'], keep_view=True)
                 self.sync_preview_view()

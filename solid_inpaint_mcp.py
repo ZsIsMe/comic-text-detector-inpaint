@@ -109,6 +109,75 @@ def get_page_view(kind: str = 'composite', max_side: int = 1600,
             ImageContent(type='image', data=png, mimeType=mime)]
 
 
+def _bundle_contents(bundle: dict) -> list[TextContent | ImageContent]:
+    images = bundle.pop('images')
+    order = list(images)
+    bundle['image_order'] = order
+    image_blocks = []
+    bundle['image_metadata'] = {}
+    for kind in order:
+        entry = images[kind]
+        bundle['image_metadata'][kind] = {key: value for key, value in entry.items()
+                                          if key not in ('image_png_base64', 'mime_type')}
+        image_blocks.append(ImageContent(type='image', data=entry['image_png_base64'],
+                                         mimeType=entry['mime_type']))
+    return [TextContent(type='text', text=json.dumps(bundle, ensure_ascii=False)), *image_blocks]
+
+
+@mcp.tool()
+def get_review_bundle(max_side: int = 1600, crop: list[int] | None = None,
+                      include_mask: bool = False) -> list[TextContent | ImageContent]:
+    """Get one saved page snapshot: original and composite PNGs, optional mask.
+
+    crop uses original-image pixels [x,y,width,height]. The opaque page_token
+    is required for edits or review marks and expires when this page changes.
+    """
+    return _bundle_contents(_call('get_review_bundle', max_side=max_side, crop=crop,
+                                  include_mask=include_mask))
+
+
+@mcp.tool()
+def apply_page_edits(page_token: str, operations: list[dict], max_side: int = 1600,
+                     crop: list[int] | None = None,
+                     include_mask: bool = False) -> list[TextContent | ImageContent]:
+    """Atomically apply one undoable batch on the current saved page.
+
+    Each operation has kind restore/add/transfer and shape
+    {"rect":[x,y,width,height]} or {"polygon":[[x,y],...]}, all in original
+    pixels. Add/transfer require target solid/other. Operations targeting solid
+    require explicit color_rgb [R,G,B]. Transfer moves only selected pixels
+    already in the opposite class. Restore clears both classes.
+    """
+    return _bundle_contents(_call('apply_page_edits', page_token=page_token,
+                                  operations=operations, max_side=max_side, crop=crop,
+                                  include_mask=include_mask))
+
+
+@mcp.tool()
+def undo_page_edit(page_token: str, max_side: int = 1600,
+                   crop: list[int] | None = None,
+                   include_mask: bool = False) -> list[TextContent | ImageContent]:
+    """Undo only the latest MCP batch when its page token is still current."""
+    return _bundle_contents(_call('undo_page_edit', page_token=page_token,
+                                  max_side=max_side, crop=crop,
+                                  include_mask=include_mask))
+
+
+@mcp.tool()
+def mark_page_reviewed(page_token: str, reviewed: bool = True,
+                       advance: bool = False, max_side: int = 1600,
+                       crop: list[int] | None = None,
+                       include_mask: bool = False) -> list[TextContent | ImageContent]:
+    """Save the human/AI review decision; optionally advance and get next bundle.
+
+    Call after visual confirmation. Editing alone never marks a page reviewed.
+    """
+    return _bundle_contents(_call('mark_page_reviewed', page_token=page_token,
+                                  reviewed=reviewed, advance=advance,
+                                  max_side=max_side, crop=crop,
+                                  include_mask=include_mask))
+
+
 @mcp.tool()
 def save_project() -> dict:
     """Flush the currently edited page and report any save error."""
