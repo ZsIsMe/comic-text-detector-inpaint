@@ -35,13 +35,13 @@ Solid Inpaint 會先偵測漫畫圖片中的文字，對純色背景文字生成
 macOS：
 
 ```text
-雙擊 launch.command
+雙擊 塗白.command
 ```
 
 如果 macOS 提示命令文件不可執行，先執行一次：
 
 ```bash
-chmod +x launch.command
+chmod +x 塗白.command
 ```
 
 Windows：
@@ -55,7 +55,7 @@ Windows：
 ```text
 1. 建立 .venv
 2. 安裝 requirements.txt
-3. 下載 CTBD、CTD、YSGYOLO 2.0 與 MangaLens 模型
+3. 下載 CTBD、CTD、YSGYOLO 2.0、MangaLens 與 RF-DETR 模型
 4. 啟動圖形界面
 ```
 
@@ -271,6 +271,8 @@ OTHER_CHANNEL
 models/comic-text-and-bubble-detector.onnx
 models/comictextdetector.pt
 models/ysgyolo_yolo26_2.0.pt
+models/mangalens.pt
+models/koharu-layout-rfdetr-seg-2xl-1152/model.safetensors
 ```
 
 CTBD 模型來源：
@@ -283,6 +285,12 @@ CTD 模型來源：
 
 ```text
 https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.2.1/comictextdetector.pt
+```
+
+RF-DETR 模型來源：
+
+```text
+https://huggingface.co/mayocream/koharu-layout-rfdetr-seg-2xl-1152
 ```
 
 模型授權與歸屬屬於原項目。
@@ -330,7 +338,7 @@ YSGYOLO 設定會自動保存：
 .venv/bin/python detect_solid_inpaint_folder.py /path/to/image_folder --detector ysgyolo
 ```
 
-新增依賴為 `ultralytics>=8.4.14` 與 `networkx`。Python 3.13 以上使用 NumPy 2，以兼容新 Python 的套件；較舊 Python 沿用 NumPy 1 的限制。
+偵測器依賴包含 `ultralytics>=8.4.14`、`networkx`，以及 RF-DETR 所需的 `rfdetr==1.7.0`、`transformers==5.15.0`、`supervision==0.28.0`。Python 3.10 的 Apple Silicon macOS 固定使用 `scipy==1.14.1`，避開在該環境無法載入的 1.15.3 wheel；其他環境由 pip 選擇相容版本。Python 3.13 以上使用 NumPy 2，以兼容新 Python 的套件；較舊 Python 沿用 NumPy 1 的限制。
 
 如果缺少所選模型，命令行和圖形界面都會提示找不到模型文件。
 
