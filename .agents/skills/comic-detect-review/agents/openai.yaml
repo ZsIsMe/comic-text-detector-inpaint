@@ -1,4 +1,4 @@
 interface:
   display_name: "漫畫偵測與逐頁校正"
-  short_description: "使用 MCP 與 Computer Use 完成漫畫偵測、精確選區校正與保存核對"
-  default_prompt: "使用 $comic-detect-review，對指定圖片資料夾完成開始偵測、逐頁校正與保存，保留原圖。"
+  short_description: "依要求只做漫畫偵測、續做既有結果校正或完整去字，核對保存狀態"
+  default_prompt: "使用 $comic-detect-review，先確認指定資料夾的既有結果，依我的要求只做偵測、續做校正或完整去字並核對保存；已有結果除非明確要求，否則不重新偵測。"
