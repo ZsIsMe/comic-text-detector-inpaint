@@ -12,15 +12,16 @@ import fcntl
 import json
 import os
 import sys
-import tempfile
 from pathlib import Path
 
+import coordination
 
-DEFAULT_LOCK = Path(tempfile.gettempdir()) / "solid-inpaint-computer-use.lock"
+
+DEFAULT_LOCK = coordination.ROOT / 'desktop.lock'
 
 
 def acquire(path: Path, *, wait: bool = False):
-    path.parent.mkdir(parents=True, exist_ok=True)
+    coordination.directory(path.parent)
     handle = path.open("a+")
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
