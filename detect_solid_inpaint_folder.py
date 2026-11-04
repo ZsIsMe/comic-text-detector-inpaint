@@ -1258,67 +1258,155 @@ def load_report(paths):
     return store.load_project(paths['raw'])
 
 
-def run(img_dir: str, detector_name: str = DEFAULT_DETECTOR) -> int:
+def run(img_dir: str, detector_name: str | None = None, *, start_page: int = 1,
+        end_page: int | None = None, redetect: bool = False,
+        device: str | None = None, bubble: bool | None = None) -> dict:
+    """Detect a folder without a GUI, preserving existing pages by default."""
     img_dir = osp.abspath(img_dir)
     if not osp.isdir(img_dir):
         raise FileNotFoundError(f'找不到資料夾：{img_dir}')
-    model_path = osp.abspath(str(detector_model_path(detector_name)))
-    if not osp.isfile(model_path):
-        raise FileNotFoundError(f'找不到模型檔：{model_path}')
-    device = 'cpu'
-
-    paths = _ensure_dirs(img_dir)
     imglist = image_files_in_folder(img_dir)
     if not imglist:
-        print(f'資料夾內沒有可處理的圖片：{img_dir}')
-        return 0
-
+        raise ValueError(f'資料夾內沒有可處理的圖片：{img_dir}')
+    if (type(start_page) is not int or start_page < 1 or start_page > len(imglist)
+            or (end_page is not None and (type(end_page) is not int or
+                                           end_page < start_page or end_page > len(imglist)))):
+        raise ValueError(f'頁面範圍須介於 1–{len(imglist)}，且結束頁不得早於起始頁。')
+    end_page = len(imglist) if end_page is None else end_page
+    selected = imglist[start_page - 1:end_page]
+    out_dir = Path(img_dir) / OUTPUT_DIR
+    raw = out_dir / RAW_DIR
+    paths = {'output': str(out_dir), 'raw': str(raw),
+             'export_pair': str(out_dir / EXPORT_PAIR_DIR)}
+    if raw.exists() and not store.project_path(raw).exists():
+        legacy = ('mask', 'manual_solid', 'manual_other', 'solid_inpaint_report.json')
+        if any((raw / name).exists() for name in legacy):
+            raise ValueError('此資料夾是舊格式專案。請先將 ctd_inpainted 改名保留，再重新偵測建立新版專案。')
+    existing = store.load_project(raw)
+    saved_detector = existing.get('detector', DEFAULT_DETECTOR)
+    detector_name = saved_detector if detector_name is None else detector_name
+    model_path = osp.abspath(str(detector_model_path(detector_name)))
+    detector_params = (dict(existing.get('detector_params') or {})
+                       if detector_name == saved_detector and
+                       isinstance(existing.get('detector_params'), dict) else {})
+    if device is not None:
+        if device not in ('auto', 'cpu', 'mps', 'cuda'):
+            raise ValueError(f'不支援的裝置：{device}')
+        if detector_name in (DETECTOR_CTBD, DETECTOR_LEGACY_CTD):
+            if device not in ('auto', 'cpu'):
+                raise ValueError(f'{DETECTOR_LABELS[detector_name]} 只支援 CPU。')
+            detector_params.pop('device', None)
+        else:
+            detector_params['device'] = device
+    elif detector_name in (DETECTOR_CTBD, DETECTOR_LEGACY_CTD):
+        detector_params.pop('device', None)
     print(f'資料夾：{img_dir}')
     print(f'輸出：{paths["output"]}')
+    print(f'專案圖片數：{len(imglist)}；本次頁面：{start_page}–{end_page}（{len(selected)} 頁）')
     print(f'模型：{model_path}')
-    print(f'裝置：{device}')
-    print(f'圖片數量：{len(imglist)}')
-
-    detector = create_detector(detector_name)
-    device = getattr(detector, 'device', 'cpu')
-    pages = {}
-
-    for img_path in tqdm(imglist, desc='solid inpaint'):
+    to_process = []
+    skipped = 0
+    failures = {}
+    for img_path in selected:
         img_name = osp.basename(img_path)
-        try:
-            pages[img_name] = process_image_with_detector(img_path, paths, detector)
-        except Exception as exc:
-            pages[img_name] = {'error': str(exc)}
+        info = existing.get('pages', {}).get(img_name, {})
+        archive = store.page_path(paths, img_path)
+        if not redetect and (info.get('processed') or info.get('has_data') or
+                             info.get('reviewed_digest') or archive.exists()):
+            try:
+                if archive.exists() and not info:
+                    raise ValueError('正式頁面資料缺少專案記錄。')
+                image = imread(img_path, cv2.IMREAD_UNCHANGED)
+                if image is None:
+                    raise ValueError('原圖無法讀取。')
+                if not archive.exists() and not info.get('source_signature'):
+                    raise ValueError('既有頁面缺少來源簽章。')
+                signature = store.source_signature(img_path)
+                if info.get('source_signature') and info['source_signature'] != signature:
+                    raise ValueError('原圖與專案記錄的來源簽章不一致。')
+                if 'has_data' in info and bool(info['has_data']) != archive.exists():
+                    raise ValueError('正式頁面資料與專案記錄不一致。')
+                page = store.load_page(paths, img_path, image.shape[:2])
+                digest = info.get('state_digest')
+                if digest and digest != store.page_state_digest(page, signature):
+                    raise ValueError('正式頁面內容與專案記錄不一致。')
+            except Exception as exc:
+                failures[img_name] = f'既有結果無法安全讀取：{exc}；請先檢查，明確需要重跑時使用 --redetect。'
+            else:
+                skipped += 1
+            continue
+        to_process.append(img_path)
 
-    report = build_report(img_dir, paths, imglist, pages, detector_name, device=device)
-    report_path = write_report(paths, report)
-    print('完成。正式資料與快取：')
-    print(f'  - {report_path}')
-    print(f'  - {paths["raw"]}/pages/<原圖檔名>.npz')
-    print(f'  - {paths["raw"]}/cache/<原圖檔名>.npz')
-    print(f'含 other_mask 頁數：{report["summary"]["with_other_mask"]}')
-    if report['summary']['failed']:
-        print(f'失敗頁數：{report["summary"]["failed"]}')
-    return int(report['summary']['processed'])
+    detected = 0
+    if to_process:
+        if not osp.isfile(model_path):
+            raise FileNotFoundError(f'找不到模型檔：{model_path}')
+        detector = create_detector(detector_name, detector_params)
+        actual_device = getattr(detector, 'device', 'cpu')
+        print(f'裝置：{actual_device}')
+        paths = _ensure_dirs(img_dir)
+        if bubble is not None:
+            from bubble_solid import save_settings as save_solid_settings
+            solid_settings = load_settings(paths['raw'])
+            save_solid_settings(paths['raw'], bubble,
+                                solid_settings['shrink_percent'], solid_settings['direct_white'])
+        for img_path in tqdm(to_process, desc='solid inpaint'):
+            img_name = osp.basename(img_path)
+            try:
+                process_image_with_detector(img_path, paths, detector)
+                detected += 1
+            except Exception as exc:
+                failures[img_name] = str(exc)
+        pages = dict(load_report(paths).get('pages', {}))
+        for name, error in failures.items():
+            if not pages.get(name, {}).get('processed') and not store.page_path(paths, name).exists():
+                pages[name] = {'error': error}
+        report = build_report(img_dir, paths, imglist, pages, detector_name, device=actual_device)
+        report['detector_params'] = detector_params
+        write_report(paths, report)
+    for name, message in failures.items():
+        print(f'失敗 {name}：{message}', file=sys.stderr)
+    print(f'本次：成功偵測 {detected} 頁；跳過已有結果 {skipped} 頁；失敗 {len(failures)} 頁。')
+    if store.project_path(paths['raw']).exists():
+        print(f'正式資料：{store.project_path(paths["raw"])}')
+    print('本次僅執行偵測，沒有逐頁校對。')
+    return {'total': len(imglist), 'selected': len(selected), 'detected': detected,
+            'skipped': skipped, 'failed': len(failures), 'failed_pages': failures}
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description='偵測文字並分類為純色填充與圖像修補，保存新版專案。',
+        description=('不啟動圖形界面，偵測資料夾中的漫畫文字並保存專案。'
+                     '預設跳過已有結果；只有 --redetect 會重跑選定頁面。'),
     )
     parser.add_argument('img_dir', help='輸入圖片資料夾路徑')
     parser.add_argument(
         '--detector',
         choices=(DETECTOR_CTBD, DETECTOR_LEGACY_CTD, DETECTOR_RFDETR, DETECTOR_YSGYOLO),
-        default=DEFAULT_DETECTOR,
+        default=None,
         help=(
             '文字偵測模型；ctbd 使用 RT-DETR-V2 ONNX 模型，'
-            'rfdetr 使用 RF-DETR 分割模型，ysgyolo 使用 YSGYOLO 2.0，legacy_ctd 使用 CTD 模型。'
+            'rfdetr 使用 RF-DETR 分割模型，ysgyolo 使用 YSGYOLO 2.0，legacy_ctd 使用 CTD 模型；'
+            '未指定時沿用專案原模型，新專案使用 legacy_ctd。'
         ),
     )
-    args = parser.parse_args()
-    run(args.img_dir, args.detector)
+    parser.add_argument('--start-page', type=int, default=1, help='起始頁（依檔名自然排序，從 1 開始）')
+    parser.add_argument('--end-page', type=int, help='結束頁（包含此頁，預設最後一頁）')
+    parser.add_argument('--redetect', action='store_true', help='明確重跑選定範圍內已有結果')
+    parser.add_argument('--device', choices=('auto', 'cpu', 'mps', 'cuda'),
+                        help='運算裝置；CTD 和 CTBD 僅支援 auto/cpu')
+    parser.add_argument('--bubble', action=argparse.BooleanOptionalAction, default=None,
+                        help='本次是否啟用氣泡填充；未指定時沿用專案設定')
+    args = parser.parse_args(argv)
+    try:
+        result = run(args.img_dir, args.detector, start_page=args.start_page,
+                     end_page=args.end_page, redetect=args.redetect,
+                     device=args.device, bubble=args.bubble)
+    except Exception as exc:
+        print(f'無法開始偵測：{exc}', file=sys.stderr)
+        return 2
+    return 1 if result['failed'] else 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

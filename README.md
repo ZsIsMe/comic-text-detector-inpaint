@@ -170,21 +170,55 @@ Ctrl+Z：撤銷
 Ctrl+Shift+Z：重做
 ```
 
-## 命令行批量處理
+## 無界面批量偵測
+
+已安裝依賴及所選模型後，可直接對圖片資料夾執行偵測，不啟動 GUI，也不需要 MCP：
 
 macOS：
 
 ```bash
-.venv/bin/python detect_solid_inpaint_folder.py /path/to/image_folder
+.venv/bin/python detect_solid_inpaint_folder.py "/path/to/image_folder"
 ```
 
 Windows：
 
 ```bat
-.venv\Scripts\python detect_solid_inpaint_folder.py D:\path\to\image_folder
+.venv\Scripts\python detect_solid_inpaint_folder.py "D:\path\to\image_folder"
 ```
 
-命令行模式會處理整個圖片資料夾，並生成 PDF 預覽報告。
+預設檢查整個資料夾，只偵測尚無結果或首次偵測失敗的頁面；已成功偵測的頁面（包括沒有選區的空白頁）及已有人工資料會保留。重複執行可以繼續未完成頁面，不會自動重跑已有結果。只做偵測，不標記為已逐頁校對。
+
+依 GUI 相同的檔名自然排序，以從 1 開始的頁碼指定範圍，包含首尾：
+
+```bash
+.venv/bin/python detect_solid_inpaint_folder.py "/path/to/image_folder" --start-page 5 --end-page 8
+```
+
+確定要重跑已有結果時，明確加上 `--redetect`；只影響指定範圍，沿用核心流程保留人工修改及擦除：
+
+```bash
+.venv/bin/python detect_solid_inpaint_folder.py "/path/to/image_folder" --start-page 5 --end-page 8 --redetect
+```
+
+人工修改的保留適用於同一版原圖。原圖已更換時，明確重跑會按核心既有行為建立新頁，舊人工選區不會沿用；重跑前先核對來源及保留需要的舊成果。
+
+可選模型、裝置及是否填充氣泡，例如：
+
+```bash
+.venv/bin/python detect_solid_inpaint_folder.py "/path/to/image_folder" --detector ysgyolo --device cpu --no-bubble
+```
+
+| 參數 | 用途 |
+| --- | --- |
+| `--detector` | `legacy_ctd`、`ctbd`、`rfdetr` 或 `ysgyolo`；新專案預設 CTD，舊專案未指定時沿用已保存模型及其參數 |
+| `--device` | `auto`、`cpu`、`mps` 或 `cuda`；CTD／CTBD 僅支援 `auto`／`cpu` |
+| `--bubble`／`--no-bubble` | 開啟／關閉氣泡填充；未指定時沿用專案設定，新專案使用預設值 |
+| `--start-page`／`--end-page` | 從 1 開始、包含首尾的頁碼；省略結束頁時取最後一頁 |
+| `--redetect` | 允許重新偵測選定範圍的已有結果 |
+
+命令列不讀寫 GUI 的全局偏好。結果保存為相同的 `ctd_inpainted/raw/` 專案資料，之後開 GUI 可直接繼續校正；不自動導出 PDF、PNG 或 PSD。終端會顯示偵測、跳過及失敗計數；退出碼 `0` 表示本次任務成功、`1` 表示有頁面失敗，`2` 表示參數或啟動錯誤。
+
+若原圖已變更、正式頁面資料缺失或損壞，預設回報問題，不以重新偵測悄悄覆蓋。不要同時從 GUI 與 CLI 修改同一個漫畫資料夾，專案尚無跨程序編輯鎖。
 
 ## 輸出結構
 

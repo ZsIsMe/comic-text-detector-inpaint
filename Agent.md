@@ -53,11 +53,13 @@ Windows：
 py -3 bootstrap.py
 ```
 
-命令行批量處理：
+無界面批量偵測（不啟動 GUI，不需要 MCP）：
 
 ```bash
 .venv/bin/python detect_solid_inpaint_folder.py /path/to/image_folder
 ```
+
+預設跳過已有成功結果及人工資料，只處理未完成頁；成功但沒有選區的頁面也算已有結果。`--start-page 5 --end-page 8` 指定與 GUI 相同自然排序、從 1 開始的頁碼（包含首尾）；只有使用者明確要求重跑才加 `--redetect`。可用 `--detector`、`--device`、`--bubble`／`--no-bubble`；未指定模型與氣泡設定時，舊專案沿用其已保存參數，新專案使用預設值，不讀寫 GUI 全局偏好。結果仍是相同的 v2 專案，之後可用 GUI 繼續逐頁校正。退出碼 0 為成功、1 為頁面失敗、2 為參數或啟動錯誤；完整參數見 README。不要同時用 CLI 和 GUI 修改同一專案。
 
 ## 依賴注意
 
