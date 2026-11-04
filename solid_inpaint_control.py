@@ -7,6 +7,7 @@ bounded JSON requests to this socket; it never reads or writes project files.
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import json
 import math
@@ -15,6 +16,7 @@ from pathlib import Path
 import socket as py_socket
 import stat
 import sys
+import tempfile
 import time
 import uuid
 
@@ -23,10 +25,6 @@ import numpy as np
 from PySide6.QtCore import QCoreApplication, QObject
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication
-
-if os.name == 'posix':
-    import fcntl
-
 
 MAX_MESSAGE = 64 * 1024 * 1024
 MAX_VIEW_SIDE = 2048
@@ -43,76 +41,118 @@ def server_name() -> str:
     return str(Path('/tmp') / name) if os.name == 'posix' else name
 
 
+def _instance_name(instance_id: str) -> str:
+    return f'{server_name()}-{instance_id}'
+
+
+def _registry_dir() -> Path:
+    base = server_name()
+    if os.name == 'posix':
+        return Path(base + '.instances')
+    return Path.home() / '.solid-inpaint-control' / (base + '.instances')
+
+
+def _ensure_registry() -> Path:
+    directory = _registry_dir()
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name == 'posix':
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise RuntimeError('本機控制實例目錄權限不正確。')
+    return directory
+
+
+def _registration(instance_id: str) -> Path:
+    return _registry_dir() / (instance_id + '.json')
+
+
+def _registered_ids() -> list[str]:
+    directory = _registry_dir()
+    if not directory.exists():
+        return []
+    _ensure_registry()
+    ids = []
+    for path in directory.glob('*.json'):
+        instance_id = path.stem
+        if len(instance_id) != 32 or any(ch not in '0123456789abcdef' for ch in instance_id):
+            continue
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(info.st_mode) or (os.name == 'posix' and info.st_uid != os.getuid()):
+            continue
+        ids.append(instance_id)
+    return sorted(ids)
+
+
+def _remove_registration(instance_id: str) -> None:
+    try:
+        _registration(instance_id).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _remove_stale_socket(instance_id: str) -> None:
+    """Remove only this user's abandoned Unix socket, never a live endpoint."""
+    if os.name != 'posix':
+        return
+    path = Path(_instance_name(instance_id))
+    try:
+        before = path.stat()
+    except OSError:
+        return
+    if not stat.S_ISSOCK(before.st_mode) or before.st_uid != os.getuid():
+        return
+    try:
+        with py_socket.socket(py_socket.AF_UNIX, py_socket.SOCK_STREAM) as probe:
+            probe.settimeout(.25)
+            probe.connect(str(path))
+        return
+    except ConnectionRefusedError:
+        pass
+    except OSError:
+        return
+    try:
+        after = path.stat()
+        if (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino):
+            path.unlink()
+    except OSError:
+        pass
+
+
 class ControlError(Exception):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
 
 
-def _remove_stale_unix_socket(name: str) -> bool:
-    """Unlink only an abandoned socket owned by this user, never an active one."""
-    path = Path(name)
-    try:
-        before = path.stat()
-    except OSError:
-        return False
-    if not stat.S_ISSOCK(before.st_mode) or before.st_uid != os.getuid():
-        return False
-    try:
-        with py_socket.socket(py_socket.AF_UNIX, py_socket.SOCK_STREAM) as probe:
-            probe.settimeout(.25)
-            probe.connect(name)
-        return False
-    except ConnectionRefusedError:
-        # Recheck identity because another process may have rebound this path.
-        try:
-            after = path.stat()
-            if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
-                return False
-            path.unlink()
-            return True
-        except OSError:
-            return False
-    except OSError:
-        # Permission errors or timeouts cannot prove that the listener is dead.
-        return False
-
-
 class ControlServer(QObject):
     def __init__(self, window):
         super().__init__(window)
         self.window = window
-        self.name = server_name()
-        self._lock_fd = None
-        if os.name == 'posix':
-            lock_name = self.name + '.lock'
-            flags = os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0)
-            fd = os.open(lock_name, flags, 0o600)
-            try:
-                owner = os.fstat(fd)
-                if owner.st_uid != os.getuid() or not stat.S_ISREG(owner.st_mode):
-                    raise RuntimeError('本機控制鎖檔權限不正確。')
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError as exc:
-                    raise RuntimeError('已有 Solid Inpaint 視窗持有本機控制入口。') from exc
-                self._lock_fd = fd
-            except Exception:
-                os.close(fd)
-                raise
+        self.instance_id = uuid.uuid4().hex
+        self.name = _instance_name(self.instance_id)
+        directory = _ensure_registry()
         try:
-            # Qt with UserAccessOption can bind over another Unix socket on
-            # macOS. The lock protects peers using this implementation; the
-            # active-socket probe also protects an older running GUI.
-            if os.name == 'posix' and Path(self.name).exists():
-                if not _remove_stale_unix_socket(self.name):
-                    raise RuntimeError('已有 Solid Inpaint 控制端正在執行。')
             self.server = QLocalServer(self)
             self.server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
             if not self.server.listen(self.name):
                 raise RuntimeError(f'無法啟動本地控制端：{self.server.errorString()}')
+            fd, temporary = tempfile.mkstemp(dir=directory, prefix='.instance-', suffix='.tmp')
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                    json.dump({'instance_id': self.instance_id, 'pid': os.getpid()}, handle)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, _registration(self.instance_id))
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
         except Exception:
-            self._release_lock()
+            if hasattr(self, 'server'):
+                self.server.close()
+                QLocalServer.removeServer(self.name)
             raise
         self.server.newConnection.connect(self._accept)
         self._buffers: dict[QLocalSocket, bytearray] = {}
@@ -131,12 +171,7 @@ class ControlServer(QObject):
         self._buffers.clear()
         self.server.close()
         QLocalServer.removeServer(self.name)
-        self._release_lock()
-
-    def _release_lock(self) -> None:
-        if self._lock_fd is not None:
-            os.close(self._lock_fd)
-            self._lock_fd = None
+        _remove_registration(self.instance_id)
 
     def _accept(self) -> None:
         while self.server.hasPendingConnections():
@@ -212,7 +247,8 @@ class ControlServer(QObject):
     def _status(self):
         w = self.window
         index = w.list_widget.currentRow() + 1 if w.current_img_path else 0
-        return {'folder': w.folder or None, 'current_page': Path(w.current_img_path).name if w.current_img_path else None,
+        return {'instance_id': getattr(self, 'instance_id', None), 'pid': os.getpid(),
+                'folder': w.folder or None, 'current_page': Path(w.current_img_path).name if w.current_img_path else None,
                 'page_index': index, 'page_count': len(w.imglist),
                 'page_loaded': bool(w.current_img_path and w.current_base is not None and w.current_page is not None),
                 'job_id': self.latest_job_id or None,
@@ -772,8 +808,9 @@ def start_control(window):
     return ControlServer(window)
 
 
-def request_control(method: str, params: dict | None = None, *, timeout_ms: int = 30000) -> dict:
-    """Call the running GUI from another process or a non-GUI test thread."""
+def _request_to_instance(instance_id: str, method: str, params: dict | None,
+                         timeout_ms: int) -> dict:
+    """Send one request to a known local endpoint without changing its target."""
     request_id = uuid.uuid4().hex
     payload = json.dumps({'id': request_id, 'method': method, 'params': params or {}},
                          ensure_ascii=False).encode('utf-8') + b'\n'
@@ -782,7 +819,7 @@ def request_control(method: str, params: dict | None = None, *, timeout_ms: int 
     if os.name == 'posix':
         # Qt uses a Unix socket in the user temp directory. The stdlib client
         # reliably receives the final response even when Qt closes immediately.
-        path = server_name()
+        path = _instance_name(instance_id)
         buffer = bytearray()
         try:
             with py_socket.socket(py_socket.AF_UNIX, py_socket.SOCK_STREAM) as client:
@@ -796,20 +833,23 @@ def request_control(method: str, params: dict | None = None, *, timeout_ms: int 
                     buffer.extend(part)
                     if len(buffer) > MAX_MESSAGE:
                         raise ControlError('too_large', '回應超過大小限制。')
-        except FileNotFoundError as exc:
-            raise ControlError('unavailable', 'Solid Inpaint GUI 未執行或控制端尚未就緒。') from exc
         except py_socket.timeout as exc:
             raise ControlError('timeout', '等待 GUI 回應逾時。') from exc
-        except ConnectionError as exc:
+        except OSError as exc:
+            if exc.errno not in (errno.ENOENT, errno.ECONNREFUSED):
+                raise ControlError('connection_failed', f'無法連接 Solid Inpaint GUI：{exc}') from exc
             raise ControlError('unavailable', f'無法連接 Solid Inpaint GUI：{exc}') from exc
     else:
         app = QCoreApplication.instance()
         if app is None:
             app = QCoreApplication([])
         socket = QLocalSocket()
-        socket.connectToServer(server_name())
+        socket.connectToServer(_instance_name(instance_id))
         if not socket.waitForConnected(min(timeout_ms, 3000)):
-            raise ControlError('unavailable', 'Solid Inpaint GUI 未執行或控制端尚未就緒。')
+            if socket.error() in (QLocalSocket.LocalSocketError.ServerNotFoundError,
+                                  QLocalSocket.LocalSocketError.ConnectionRefusedError):
+                raise ControlError('unavailable', 'Solid Inpaint GUI 未執行或控制端尚未就緒。')
+            raise ControlError('connection_failed', f'無法連接 Solid Inpaint GUI：{socket.errorString()}')
         socket.write(payload)
         if not socket.waitForBytesWritten(min(timeout_ms, 3000)):
             raise ControlError('timeout', '無法送出控制請求。')
@@ -836,3 +876,53 @@ def request_control(method: str, params: dict | None = None, *, timeout_ms: int 
         error = response.get('error', {})
         raise ControlError(error.get('code', 'failed'), error.get('message', '控制請求失敗。'))
     return response['result']
+
+
+def _discover_instances(*, timeout_ms: int = 1000) -> list[dict]:
+    instances = []
+    for instance_id in _registered_ids():
+        try:
+            status = _request_to_instance(instance_id, 'get_app_status', {}, timeout_ms)
+            if status.get('instance_id') != instance_id:
+                raise ControlError('protocol_error', 'GUI 實例 ID 與控制端不符。')
+            instances.append(status)
+        except ControlError as exc:
+            if exc.code == 'unavailable':
+                _remove_registration(instance_id)
+                _remove_stale_socket(instance_id)
+            else:
+                # A busy or unresponsive window is still a possible target.
+                # Keep it in the selection set to avoid silently routing to
+                # another window.
+                instances.append({'instance_id': instance_id, 'error':
+                                  {'code': exc.code, 'message': str(exc)}})
+    return instances
+
+
+def list_app_instances() -> dict:
+    """List available GUI endpoints and their current project/page status."""
+    return {'instances': _discover_instances()}
+
+
+def request_control(method: str, params: dict | None = None, *,
+                    instance_id: str | None = None, timeout_ms: int = 30000) -> dict:
+    """Call a selected GUI; auto-select only when exactly one is running."""
+    if instance_id is None:
+        instances = _discover_instances()
+        if not instances:
+            raise ControlError('unavailable', 'Solid Inpaint GUI 未執行或控制端尚未就緒。')
+        if len(instances) > 1:
+            raise ControlError('ambiguous_instance',
+                               '有多個 Solid Inpaint 視窗；先呼叫 list_app_instances，並指定 instance_id。')
+        instance_id = instances[0]['instance_id']
+    elif (not isinstance(instance_id, str) or len(instance_id) != 32 or
+          any(ch not in '0123456789abcdef' for ch in instance_id) or
+          instance_id not in _registered_ids()):
+        raise ControlError('unavailable', '找不到指定的 Solid Inpaint 視窗。')
+    try:
+        return _request_to_instance(instance_id, method, params, timeout_ms)
+    except ControlError as exc:
+        if exc.code == 'unavailable':
+            _remove_registration(instance_id)
+            _remove_stale_socket(instance_id)
+        raise

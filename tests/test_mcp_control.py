@@ -6,6 +6,7 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
@@ -19,7 +20,8 @@ import numpy as np
 from PySide6.QtCore import QObject, QSettings, Signal
 from PySide6.QtWidgets import QApplication, QDialog, QListWidget, QWidget
 
-from solid_inpaint_control import ControlError, request_control, start_control
+from solid_inpaint_control import (ControlError, list_app_instances, request_control,
+                                   start_control)
 
 
 class DummyWorker(QObject):
@@ -137,17 +139,21 @@ class McpControlTests(unittest.TestCase):
         self.addCleanup(self.server.close)
         self.addCleanup(self.window.close)
 
-    def call(self, method, params=None):
+    def run_with_events(self, func, *args, **kwargs):
         # The transport is a real Qt socket. The client waits on another thread
         # while the test pumps the GUI event loop to process the request.
         with ThreadPoolExecutor(max_workers=1) as executor:
-            task = executor.submit(request_control, method, params, timeout_ms=5000)
+            task = executor.submit(func, *args, **kwargs)
             deadline = time.monotonic() + 5
             while not task.done() and time.monotonic() < deadline:
                 self.app.processEvents()
                 time.sleep(.005)
             self.app.processEvents()
             return task.result(timeout=1)
+
+    def call(self, method, params=None, *, instance_id=None):
+        return self.run_with_events(request_control, method, params,
+                                    instance_id=instance_id, timeout_ms=5000)
 
     def test_open_and_jump_and_save_failure_cannot_leave_page(self):
         self.assertEqual(self.call('open_project', {'path': str(self.root)})['page_count'], 2)
@@ -259,7 +265,7 @@ class McpControlTests(unittest.TestCase):
             'print(json.dumps(c.request_control("get_app_status")))'
         )
         child = subprocess.Popen(
-            [sys.executable, '-c', child_code, self.server.name],
+            [sys.executable, '-c', child_code, self.server.name.removesuffix('-' + self.server.instance_id)],
             env={**os.environ, 'TMPDIR': str(alternate)},
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
@@ -276,17 +282,71 @@ class McpControlTests(unittest.TestCase):
                 child.kill()
                 child.wait()
 
-    def test_second_window_failure_cannot_remove_active_endpoint(self):
-        second = DummyWindow(self.root)
+    def test_two_windows_have_independent_endpoints_and_require_selection(self):
+        second_root = self.root / 'second'
+        second_root.mkdir()
+        for name in ('1.jpg', '2.jpg'):
+            (second_root / name).write_bytes(b'image placeholder')
+        second = DummyWindow(second_root)
         try:
-            with self.assertRaises(RuntimeError):
-                start_control(second)
+            second_server = start_control(second)
+            try:
+                self.assertNotEqual(self.server.instance_id, second_server.instance_id)
+                listed = self.run_with_events(list_app_instances)['instances']
+                self.assertEqual({entry['instance_id'] for entry in listed},
+                                 {self.server.instance_id, second_server.instance_id})
+                with self.assertRaises(ControlError) as raised:
+                    self.call('open_project', {'path': str(self.root)})
+                self.assertEqual(raised.exception.code, 'ambiguous_instance')
+                self.assertFalse(self.window.folder)
+                self.assertFalse(second.folder)
+                first = self.call('open_project', {'path': str(self.root)},
+                                  instance_id=self.server.instance_id)
+                other = self.call('open_project', {'path': str(second_root)},
+                                  instance_id=second_server.instance_id)
+                self.assertEqual(first['folder'], str(self.root))
+                self.assertEqual(other['folder'], str(second_root))
+                self.assertEqual(self.call('go_to_page', {'index': 2},
+                                           instance_id=second_server.instance_id)['current_page'], '2.jpg')
+                self.assertEqual(self.call('get_app_status', instance_id=self.server.instance_id)['current_page'],
+                                 '1.jpg')
+                self.assertTrue(self.call('save_project', instance_id=second_server.instance_id)['saved'])
+                second_server.close()
+                self.assertEqual(self.call('get_app_status')['instance_id'], self.server.instance_id)
+                with self.assertRaises(ControlError) as closed:
+                    self.call('get_app_status', instance_id=second_server.instance_id)
+                self.assertEqual(closed.exception.code, 'unavailable')
+            finally:
+                second_server.close()
         finally:
             second.close()
-        import gc
-        gc.collect()
-        self.assertEqual(self.call('get_app_status')['page_count'], 0)
         self.assertTrue(Path(self.server.name).exists())
+
+    def test_stale_registration_is_removed_but_timeout_stays_ambiguous(self):
+        import solid_inpaint_control as control
+        stale_id = uuid.uuid4().hex
+        stale = control._registration(stale_id)
+        stale.write_text('{}', encoding='utf-8')
+        if os.name == 'posix':
+            stale_socket = Path(control._instance_name(stale_id))
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as abandoned:
+                abandoned.bind(str(stale_socket))
+            self.addCleanup(lambda: stale_socket.unlink(missing_ok=True))
+        listed = self.run_with_events(list_app_instances)['instances']
+        self.assertEqual([entry['instance_id'] for entry in listed], [self.server.instance_id])
+        self.assertFalse(stale.exists())
+        if os.name == 'posix':
+            self.assertFalse(stale_socket.exists())
+        timeout_id = uuid.uuid4().hex
+        with patch.object(control, '_registered_ids', return_value=[self.server.instance_id, timeout_id]), \
+                patch.object(control, '_request_to_instance', side_effect=[
+                    {'instance_id': self.server.instance_id},
+                    ControlError('timeout', 'GUI 正忙')]), \
+                patch.object(control, '_remove_registration') as remove:
+            with self.assertRaises(ControlError) as raised:
+                control.request_control('save_project')
+            self.assertEqual(raised.exception.code, 'ambiguous_instance')
+            remove.assert_not_called()
 
 
 class RealWindowControlTests(unittest.TestCase):

@@ -18,12 +18,13 @@ cwd = "<repo>"
 tool_timeout_sec = 60
 ```
 
-重新載入 MCP 連線後，先呼叫 `get_app_status`。如果 GUI 尚未執行，工具會回報 unavailable；MCP 不會自行開啟另一個 GUI 或直接修改專案檔。UI 與 MCP 預設選項共用全局 QSettings，已處理頁面重偵測需明確傳入 `allow_redetect=true`。
+重新載入 MCP 連線後，先呼叫 `list_app_instances` 查看正在執行的視窗及其 `instance_id`、PID、資料夾與目前頁面。只有一個視窗時，原有工具仍可省略 `instance_id`；多個視窗時，每次操作都須傳入目標 `instance_id`，否則回報 `ambiguous_instance`，不會猜測目標。如果 GUI 尚未執行，列表為空，控制工具回報 `unavailable`；MCP 不會自行開啟另一個 GUI 或直接修改專案檔。UI 與 MCP 預設選項共用全局 QSettings，已處理頁面重偵測需明確傳入 `allow_redetect=true`。
 
 可用工具：
 
 | 工具 | 用途 |
 | --- | --- |
+| `list_app_instances` | 列出本份程式所有 GUI 視窗的 ID、PID 與目前狀態 |
 | `get_app_status` | 資料夾、目前頁、頁數、儲存／任務狀態 |
 | `open_project(path)` | 直接打開絕對資料夾路徑 |
 | `get_detection_settings` | 目前全局模型與氣泡填充預設值 |
@@ -40,7 +41,20 @@ tool_timeout_sec = 60
 
 MCP 透過同使用者可存取的 Qt 本地 socket 與視窗通訊。耗時的偵測在 GUI 背景 worker 執行；MCP 工具用 job id 查進度。矩形／套索的精確編輯可透過 MCP 執行；筆刷、魔法棒及局部副本等使用 Computer Use。整頁圖用來掃描漏檢與誤判，小字和邊緣需以足夠解析度的局部圖或 GUI 放大核對；完成修改後仍要核對局部及整頁預覽。正式資料由 `project_store.py` 原子保存，MCP 不接受任意 Mask 陣列覆寫。
 
-同一份程式路徑由一個 GUI 持有 MCP 控制入口；第二個視窗不會搶走或刪除已運行的端點。要切換控制視窗，先正常關閉原視窗，再重新啟動需要控制的 GUI。
+每個 GUI 視窗都有獨立的本地控制端點及 `instance_id`，可以同時控制多個視窗。除了 `list_app_instances`，上述每個工具都接受可選的 `instance_id`。例如先從列表依資料夾辨認兩個視窗，再分別呼叫：
+
+```text
+get_app_status(instance_id="視窗 A 的 ID")
+open_project(path="/absolute/path/to/chapter-b", instance_id="視窗 B 的 ID")
+start_detection(instance_id="視窗 B 的 ID")
+get_job_status(job_id="剛取得的任務 ID", instance_id="視窗 B 的 ID")
+```
+
+從舊版更新後，先保存並重啟 GUI，再於 MCP 客戶端重新載入服務，讓視窗使用新的獨立端點並取得更新後的工具參數。
+
+`instance_id` 在視窗關閉後失效，重開須重新取得；指定已關閉或不存在的 ID 會回報 `unavailable`，不會轉到其他視窗。翻頁、取圖、編輯、保存與任務進度查詢都應沿用同一視窗 ID，頁面 token 及 job id 不能跨視窗使用。單開時省略 ID 的方式保留相容，但需要持續操作同一視窗時，建議仍傳入明確 ID。
+
+多視窗應各自處理不同漫畫資料夾；此功能不提供同一專案的跨程序編輯鎖，同時修改同一資料夾仍可能互相覆蓋。多開也會共用全局偏好設定，並各自使用偵測所需的記憶體及顯存。
 
 `get_job_status` 查詢由 MCP 啟動的任務；狀態含範圍、完成頁數與失敗檔名。`get_page_view` 回傳原圖尺寸、裁切起點、實際圖像尺寸與縮放倍率，座標不依賴桌面視窗大小。局部視窗或選色等模態操作尚未結束時，控制工具回報 busy，不會自動關閉對話框。
 
