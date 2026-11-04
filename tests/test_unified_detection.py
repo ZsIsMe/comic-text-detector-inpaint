@@ -32,6 +32,7 @@ class UnifiedDetectionTests(unittest.TestCase):
         dialog.selected_solid_settings.return_value = {'enabled': False, 'shrink_percent': 4.5,
                                                         'direct_white': False}
         dialog.selected_page_range.return_value = (1, len(self.w.imglist))
+        dialog.selected_processing_mode.return_value = 'detect'
         return dialog
 
     def add_pages(self, count=4):
@@ -142,6 +143,48 @@ class UnifiedDetectionTests(unittest.TestCase):
         self.assertFalse(buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled())
         self.assertFalse(dialog.start_page_spin.isEnabled())
         dialog.close()
+
+    def test_keep_original_mode_disables_detector_and_bubble_without_saving_options(self):
+        dialog = ui.DetectorSelectionDialog(self.w.settings, image_paths=self.w.imglist)
+        self.assertEqual(dialog.selected_processing_mode(), 'detect')
+        dialog.processing_mode.setCurrentIndex(1)
+        self.assertEqual(dialog.selected_processing_mode(), 'keep_original')
+        self.assertFalse(dialog.selector.isEnabled())
+        self.assertFalse(dialog.bubble_frame.isEnabled())
+        self.assertTrue(dialog.processing_mode_hint.isVisibleTo(dialog))
+        self.assertEqual(dialog.findChild(QDialogButtonBox).button(
+            QDialogButtonBox.StandardButton.Ok).text(), '開始處理')
+        dialog.save_settings()
+        self.assertFalse(self.w.settings.contains('bubble/enabled'))
+        dialog.processing_mode.setCurrentIndex(0)
+        self.assertTrue(dialog.selector.isEnabled())
+        self.assertTrue(dialog.bubble_frame.isEnabled())
+        dialog.close()
+
+    def test_keep_original_uses_selected_range_and_warns_before_clearing(self):
+        self.add_pages()
+        dialog = self.dialog()
+        dialog.selected_processing_mode.return_value = 'keep_original'
+        dialog.selected_page_range.return_value = (2, 3)
+        with patch.object(ui, 'DetectorSelectionDialog', return_value=dialog), \
+                patch.object(self.w, 'start_worker', return_value=True) as start, \
+                patch.object(self.w, 'has_existing_masks', return_value=True), \
+                patch.object(ui.QMessageBox, 'warning', return_value=QMessageBox.StandardButton.Cancel) as warning:
+            self.w.run_or_load()
+        start.assert_not_called()
+        dialog.save_settings.assert_not_called()
+        self.assertIn('第 2–3 頁', warning.call_args.args[2])
+        self.assertIn('人工分類、填色與擦除', warning.call_args.args[2])
+        with patch.object(ui, 'DetectorSelectionDialog', return_value=dialog), \
+                patch.object(self.w, 'start_worker', return_value=True) as start, \
+                patch.object(self.w, 'has_existing_masks', return_value=True), \
+                patch.object(ui.QMessageBox, 'warning', return_value=QMessageBox.StandardButton.Yes):
+            self.w.run_or_load()
+        self.assertEqual(start.call_args.args, ('keep_original', self.w.imglist[1:3]))
+        dialog.selected_detector.assert_not_called()
+        dialog.selected_detector_params.assert_not_called()
+        dialog.selected_solid_settings.assert_not_called()
+        dialog.save_settings.assert_not_called()
 
     def test_cancel_dialog_does_not_save_or_start(self):
         before = store.load_project(self.w.paths['raw'])
@@ -265,6 +308,76 @@ class UnifiedDetectionTests(unittest.TestCase):
             worker.run()
         self.assertFalse(failures)
         process.assert_not_called()
+
+    def test_keep_original_worker_clears_selected_page_and_preserves_others(self):
+        self.add_pages(3)
+        selected = self.w.imglist[1]
+        untouched = self.w.imglist[2]
+        for path in (selected, untouched):
+            page = store.empty_page(self.fixture.mask.shape)
+            page['overlay'][10:14, 10:14] = (255, 255, 255, 255)
+            page['other'][20:24, 20:24] = 255
+            page['edited'][10:24, 10:24] = 255
+            store.save_page(self.w.paths, path, page)
+            store.update_cache_file(store.cache_path(self.w.paths, path), sentinel=np.array(1))
+            store.set_page_reviewed(self.w.paths, path)
+        before_untouched = store.page_path(self.w.paths, untouched).read_bytes()
+        before_cache = store.cache_path(self.w.paths, untouched).read_bytes()
+        before_original = Path(selected).read_bytes()
+        worker = ui.FolderWorker(self.w.folder, 'keep_original', [selected])
+        failures, progress = [], []
+        worker.failed.connect(failures.append)
+        worker.progress.connect(lambda current, total, name: progress.append((current, total, name)))
+        with patch.object(ui, 'create_detector', side_effect=AssertionError('model must not load')), \
+                patch.object(ui, 'process_image_with_detector', side_effect=AssertionError('must not detect')):
+            worker.run()
+        self.assertFalse(failures)
+        self.assertEqual(progress, [(1, 1, Path(selected).name)])
+        self.assertEqual(Path(selected).read_bytes(), before_original)
+        self.assertFalse(store.page_path(self.w.paths, selected).exists())
+        self.assertFalse(store.cache_path(self.w.paths, selected).exists())
+        page = store.load_page(self.w.paths, selected, self.fixture.mask.shape)
+        self.assertFalse(any(np.any(value) for value in page.values()))
+        selected_info = store.load_project(self.w.paths['raw'])['pages'][Path(selected).name]
+        self.assertTrue(selected_info['processed'])
+        self.assertFalse(store.is_page_reviewed(selected_info))
+        self.assertEqual(selected_info['processing_mode'], 'keep_original')
+        self.assertEqual(store.page_path(self.w.paths, untouched).read_bytes(), before_untouched)
+        self.assertEqual(store.cache_path(self.w.paths, untouched).read_bytes(), before_cache)
+        untouched_info = store.load_project(self.w.paths['raw'])['pages'][Path(untouched).name]
+        self.assertTrue(store.is_page_reviewed(untouched_info))
+
+    def test_keep_original_worker_reports_unreadable_page_as_failed(self):
+        selected = self.w.imglist[0]
+        Path(selected).write_bytes(b'not an image')
+        worker = ui.FolderWorker(self.w.folder, 'keep_original', [selected])
+        failures = []
+        worker.failed.connect(failures.append)
+        with patch.object(ui, 'create_detector', side_effect=AssertionError('model must not load')):
+            worker.run()
+        self.assertFalse(failures)
+        info = store.load_project(self.w.paths['raw'])['pages'][Path(selected).name]
+        self.assertIn('error', info)
+        self.assertFalse(info.get('processed'))
+
+    def test_keep_original_marks_entire_folder_processed_with_empty_masks(self):
+        self.add_pages(4)
+        originals = {path: Path(path).read_bytes() for path in self.w.imglist}
+        worker = ui.FolderWorker(self.w.folder, 'keep_original', self.w.imglist)
+        failures = []
+        worker.failed.connect(failures.append)
+        with patch.object(ui, 'create_detector', side_effect=AssertionError('model must not load')):
+            worker.run()
+        self.assertFalse(failures)
+        report = store.load_project(self.w.paths['raw'])
+        self.assertEqual(report['summary']['processed'], 4)
+        for path in self.w.imglist:
+            self.assertEqual(Path(path).read_bytes(), originals[path])
+            self.assertFalse(store.page_path(self.w.paths, path).exists())
+            self.assertTrue(report['pages'][Path(path).name]['processed'])
+            self.assertEqual(report['pages'][Path(path).name]['filled_pixels'], 0)
+            self.assertEqual(report['pages'][Path(path).name]['other_pixels'], 0)
+            self.assertFalse(store.is_page_reviewed(report['pages'][Path(path).name]))
 
     def test_batch_persists_disabled_and_bypasses_cached_bubbles(self):
         options = {'enabled': False, 'shrink_percent': 4.5, 'direct_white': False}

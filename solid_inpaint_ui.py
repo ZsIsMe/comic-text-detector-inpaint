@@ -2957,6 +2957,16 @@ class FolderWorker(QObject):
                 try:
                     if self.mode == 'detect':
                         pages[name] = process_image_with_detector(img_path, paths, detector)
+                    elif self.mode == 'keep_original':
+                        image = imread(img_path, cv2.IMREAD_UNCHANGED)
+                        if image is None:
+                            raise FileNotFoundError(f'無法讀取原圖：{img_path}')
+                        pages[name] = store.save_page(
+                            paths, img_path, store.empty_page(image.shape[:2]),
+                            {'processing_mode': 'keep_original'},
+                        )
+                        store.set_page_reviewed(paths, img_path, False)
+                        store.cache_path(paths, img_path).unlink(missing_ok=True)
                     elif self.mode == 'add_detection':
                         pages[name] = add_detection_to_mask(
                             img_path,
@@ -3492,7 +3502,7 @@ class DetectorSelectorWidget(QWidget):
 
 
 class DetectorSelectionDialog(QDialog):
-    """選擇 detector 並重新偵測生成（覆蓋式）。"""
+    """選擇頁面範圍與偵測或保留原圖的處理模式。"""
 
     def __init__(self, settings: QSettings, parent: QWidget | None = None,
                  *, solid_settings: dict | None = None,
@@ -3551,10 +3561,25 @@ class DetectorSelectionDialog(QDialog):
         self.end_page_spin.valueChanged.connect(self._end_page_changed)
         self._update_page_range_hint()
         content_layout.addWidget(range_frame)
+        mode_frame = QFrame()
+        mode_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        mode_layout = QVBoxLayout(mode_frame)
+        mode_layout.setContentsMargins(20, 14, 20, 16)
+        mode_layout.addWidget(QLabel('處理模式'))
+        self.processing_mode = QComboBox()
+        self.processing_mode.addItem('偵測並去字', 'detect')
+        self.processing_mode.addItem('保留原圖（不去字）', 'keep_original')
+        mode_layout.addWidget(self.processing_mode)
+        self.processing_mode_hint = QLabel('不進行偵測，清空所選頁面的全部 Mask，並標記為已處理。')
+        self.processing_mode_hint.setWordWrap(True)
+        self.processing_mode_hint.setProperty('secondary', True)
+        self.processing_mode_hint.hide()
+        mode_layout.addWidget(self.processing_mode_hint)
+        content_layout.addWidget(mode_frame)
         content_layout.addWidget(self.selector)
-        bubble_frame = QFrame()
-        bubble_frame.setFrameShape(QFrame.Shape.StyledPanel)
-        bubble_layout = QVBoxLayout(bubble_frame)
+        self.bubble_frame = QFrame()
+        self.bubble_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        bubble_layout = QVBoxLayout(self.bubble_frame)
         bubble_layout.setContentsMargins(20, 14, 20, 16)
         bubble_title = QLabel('氣泡填充')
         bubble_title_font = bubble_title.font()
@@ -3589,7 +3614,7 @@ class DetectorSelectionDialog(QDialog):
         self.bubble_enabled.toggled.connect(self.bubble_shrink.setEnabled)
         row.addWidget(self.bubble_shrink)
         bubble_layout.addLayout(row)
-        content_layout.addWidget(bubble_frame)
+        content_layout.addWidget(self.bubble_frame)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -3606,6 +3631,19 @@ class DetectorSelectionDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self.processing_mode.currentIndexChanged.connect(self._processing_mode_changed)
+
+    def selected_processing_mode(self) -> str:
+        return self.processing_mode.currentData()
+
+    def _processing_mode_changed(self) -> None:
+        detecting = self.selected_processing_mode() == 'detect'
+        self.selector.setEnabled(detecting)
+        self.bubble_frame.setEnabled(detecting)
+        self.processing_mode_hint.setVisible(not detecting)
+        self.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Ok).setText(
+            '開始偵測' if detecting else '開始處理'
+        )
 
     def selected_page_range(self) -> tuple[int, int]:
         return self.start_page_spin.value(), self.end_page_spin.value()
@@ -3650,6 +3688,8 @@ class DetectorSelectionDialog(QDialog):
         }
 
     def save_settings(self) -> None:
+        if self.selected_processing_mode() != 'detect':
+            return
         self.selector.save_settings()
         for key, value in self.selected_solid_settings().items():
             self.settings.setValue(f'bubble/{key}', value)
@@ -5185,6 +5225,23 @@ class MainWindow(QMainWindow):
             return
         image_paths = self.imglist[first_page - 1:last_page]
         scope_label = f'第 {first_page}–{last_page} 頁（共 {len(image_paths)} 頁）'
+        if detector_dialog.selected_processing_mode() == 'keep_original':
+            if self.has_existing_masks(image_paths):
+                reply = QMessageBox.warning(
+                    self,
+                    '確認保留原圖',
+                    f'處理範圍：{scope_label}\n\n'
+                    '這會清空所選頁面的全部 Mask，包括人工分類、填色與擦除，'
+                    '並將這些頁面標記為已處理。\n'
+                    '原圖不會改動。確定要繼續嗎？',
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Cancel,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+            if self.start_worker('keep_original', image_paths):
+                self.status.showMessage(f'保留原圖（不去字）；{scope_label}...')
+            return
         detector_name = detector_dialog.selected_detector()
         detector_params = detector_dialog.selected_detector_params()
         solid_settings = detector_dialog.selected_solid_settings()
@@ -5397,7 +5454,7 @@ class MainWindow(QMainWindow):
                     QMessageBox.warning(self, '儲存失敗', str(exc))
                 return False
         self.progress.setValue(0)
-        _set_state_label(self.progress_label, '偵測準備中')
+        _set_state_label(self.progress_label, '處理準備中' if mode == 'keep_original' else '偵測準備中')
         self._control_worker_silent = silent
         self.worker_thread = QThread()
         self.worker = FolderWorker(
@@ -5462,20 +5519,32 @@ class MainWindow(QMainWindow):
     def on_worker_progress(self, current: int, total: int, name: str) -> None:
         percent = int(current * 100 / max(1, total))
         self.progress.setValue(percent)
-        _set_state_label(self.progress_label, f'偵測進度 {current} / {total} · {name}')
+        action = '處理' if getattr(self.worker, 'mode', None) == 'keep_original' else '偵測'
+        _set_state_label(self.progress_label, f'{action}進度 {current} / {total} · {name}')
 
     def on_worker_finished(self, report: dict) -> None:
+        keep_original = self.worker is not None and self.worker.mode == 'keep_original'
+        failed_selected = sum(
+            'error' in report.get('pages', {}).get(Path(path).name, {})
+            for path in (self.worker.image_paths or [])
+        ) if keep_original else 0
         self.undo_stack = []
         self.redo_stack = []
         self.report = report
         self.progress.setValue(100)
         self.refresh_list()
         self.reload_current()
-        _set_state_label(self.progress_label, '偵測任務完成')
+        _set_state_label(
+            self.progress_label,
+            ('處理任務完成' if not failed_selected else f'處理失敗 {failed_selected} 頁')
+            if keep_original else '偵測任務完成',
+        )
         self.update_current_page_status()
         unavailable = sum(p.get('bubble_detection', {}).get('status') == 'unavailable'
                           for p in report.get('pages', {}).values())
         self.status.showMessage(
+            (f'保留原圖處理完成；{failed_selected} 頁失敗，請查看列表。'
+             if failed_selected else '保留原圖處理完成。') if keep_original else
             f'任務完成；{unavailable} 頁氣泡分割不可用，已使用文字範圍填色，原因記錄於報告。'
             if unavailable else '任務完成。'
         )
@@ -5490,7 +5559,8 @@ class MainWindow(QMainWindow):
         self.status.showMessage('選區轉換完成。')
 
     def on_worker_failed(self, message: str) -> None:
-        _set_state_label(self.progress_label, '偵測任務失敗')
+        action = '處理' if getattr(self.worker, 'mode', None) == 'keep_original' else '偵測'
+        _set_state_label(self.progress_label, f'{action}任務失敗')
         self.status.showMessage(f'執行失敗：{message}')
         if self._control_worker_silent:
             self._last_control_error = message
@@ -5511,7 +5581,8 @@ class MainWindow(QMainWindow):
         elif not info:
             detection = STATUS_TODO
         else:
-            detection = STATUS_OTHER if int(info.get('other_pixels', 0)) > 0 else '已偵測'
+            detection = (STATUS_OTHER if int(info.get('other_pixels', 0)) > 0 else
+                         '已處理' if info.get('processing_mode') == 'keep_original' else '已偵測')
         review = '已校對' if store.is_page_reviewed(info) else '待回看'
         return f'第 {index + 1} 頁  {name}    {detection} · {review}'
 
