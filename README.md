@@ -330,14 +330,11 @@ LaMa 只在明確執行 PSD 導出時處理 OTHER 選區，不重新偵測、不
 
 ## 模型文件
 
-唯一的文字與氣泡偵測器是 RF-DETR（Koharu Layout HighRes）；PSD 導出另使用 LaMa 修補模型。目前兩個權重透過 Git LFS 納入版本控制。請先安裝 Git LFS；若已拉取但模型仍是指標檔，執行以下命令取得實體模型：
+唯一的文字與氣泡偵測器是 RF-DETR（Koharu Layout HighRes）；PSD 導出另使用 LaMa 修補模型。**模型不隨 Git 分發，也不需要透過 Git LFS 下載當前版本的模型。** 首次執行 `python bootstrap.py` 時，程式會從下列原始發布來源下載缺少的模型，校驗 SHA-256 後才啟用；已有且校驗相符的模型直接複用。
 
-```bash
-git lfs install
-git lfs pull
-```
+`models/` 是本機模型目錄，除 `.gitkeep` 外全部由 Git 忽略。程式碼只保存模型來源、校驗值與載入設定。直接使用命令行工具時，請先完成首次啟動下載，或依下列來源手動放入對應位置。
 
-`bootstrap.py` 仍會校驗以下權重，缺失時從原來源下載；已存在且校驗相符時不重複下載：
+兩個模型統一從 **Hugging Face** 的原發布倉庫下載，啟動時無須選擇來源。`bootstrap.py` 會校驗以下權重，缺失時自動下載；已存在且校驗相符時不重複下載：
 
 ```text
 models/koharu-layout-highres/model.safetensors

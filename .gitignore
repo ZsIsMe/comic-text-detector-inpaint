@@ -14,10 +14,6 @@ ctd_inpainted/
 *.onnx
 models/*
 !models/.gitkeep
-!models/koharu-layout-highres/
-models/koharu-layout-highres/*
-!models/koharu-layout-highres/model.safetensors
-!models/lama_large_512px.ckpt
 
 *.zip
 *.7z

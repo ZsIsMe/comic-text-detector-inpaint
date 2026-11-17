@@ -86,9 +86,9 @@ NumPy 限制依 Python 版本選擇相容系列，修改時須同時核對 OpenC
 
 ## 模型文件
 
-依使用者要求，目前使用的 HighRes 與 LaMa 權重透過 Git LFS 提交；`.gitattributes` 只追蹤這兩個指定模型，其餘權重仍忽略。拉取前安裝 Git LFS，已有指標檔時執行 `git lfs pull` 取得實體模型。
+依使用者要求，模型權重不提交到 Git，也不使用 Git LFS 分發。`models/` 僅保存本機下載檔案，除 `.gitkeep` 外全部忽略；保留來源、下載與 SHA-256 校驗設定於程式碼。首次啟動由 `bootstrap.py` 自動下載缺少的 HighRes 與 LaMa，已有且校驗相符的檔案直接複用。直接執行 CLI 前也須先備妥模型；可執行 bootstrap 或按 README 手動下載。移除 Git 跟蹤時保留本機模型；既有歷史提交中的 LFS 指標不因停止跟蹤而消失。
 
-首次啟動時 `bootstrap.py` 會下載：
+兩個模型統一使用 Hugging Face 原發布來源，不提供 HF／ModelScope 選擇。首次啟動時 `bootstrap.py` 會下載：
 
 ```text
 models/koharu-layout-highres/model.safetensors
