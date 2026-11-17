@@ -25,11 +25,43 @@ close_current_terminal_window() {
     -e "end tell" >/dev/null 2>&1 </dev/null &
 }
 
-if command -v python3 >/dev/null 2>&1; then
-  PYTHON="$(command -v python3)"
-elif command -v python >/dev/null 2>&1; then
-  PYTHON="$(command -v python)"
-else
+python_is_usable() {
+  [ -n "$1" ] && [ -x "$1" ] && "$1" -c 'import sys; sys.exit(sys.version_info < (3, 10))' >/dev/null 2>&1
+}
+
+select_python() {
+  local candidate version
+
+  candidate="$SCRIPT_DIR/.venv/bin/python"
+  if python_is_usable "$candidate"; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  # Finder may not include Homebrew in PATH. Prefer the tested Python versions.
+  for version in 3.10 3.11 3.12; do
+    for candidate in "$(command -v "python$version" 2>/dev/null || true)" \
+                     "/opt/homebrew/bin/python$version" "/usr/local/bin/python$version"; do
+      if python_is_usable "$candidate"; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done
+  done
+
+  for candidate in /opt/homebrew/bin/python3.* /usr/local/bin/python3.* \
+                   /opt/homebrew/bin/python3 /usr/local/bin/python3 \
+                   "$(command -v python3 2>/dev/null || true)" \
+                   "$(command -v python 2>/dev/null || true)"; do
+    if python_is_usable "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if ! PYTHON="$(select_python)"; then
   echo "Python 3.10 or newer is required."
   echo "Install Python from https://www.python.org/downloads/"
   wait_for_error

@@ -35,13 +35,13 @@ Solid Inpaint 會先偵測漫畫圖片中的文字，對純色背景文字生成
 macOS：
 
 ```text
-雙擊 launch.command
+雙擊 塗白.command
 ```
 
 如果 macOS 提示命令文件不可執行，先執行一次：
 
 ```bash
-chmod +x launch.command
+chmod +x 塗白.command
 ```
 
 Windows：
@@ -55,7 +55,7 @@ Windows：
 ```text
 1. 建立 .venv
 2. 安裝 requirements.txt
-3. 下載 CTBD、CTD、YSGYOLO 2.0 與 MangaLens 模型
+3. 下載 CTBD、CTD、YSGYOLO 2.0、MangaLens 與 RF-DETR 模型
 4. 啟動圖形界面
 ```
 
@@ -132,11 +132,27 @@ MangaLens 通過整泡驗證時，以氣泡估色填充內縮區；人工圖像�
 
 「使用傳入 Mask 運行」的取代模式以傳入 Mask 重新分類並保留人工決定；交集模式同時收窄兩類並保留填色顏色。沒有同名 PNG 的頁面保持原狀。
 
-「從其他轉入」與批次轉成「圖像修補」時，會撤掉選中的純色填充，只將文字修補範圍轉入待修復 Mask，不包含自動擴展的氣泡背景；人工添加範圍與既有圖像修補範圍保留。缺少有效文字偵測快取時保留原範圍，避免誤刪人工選區。
+「從其他轉入」會搬移本次選區碰到的另一類既有選區，包含選中的氣泡填色範圍；框選過大可能連氣泡邊緣一起轉入，宜用套索或局部放大確認。它不能補出漏選的文字。
 
 「導出待精修」按需生成 `ctd_inpainted/export_pair/` 的合成 PNG、`other_mask/` 與 `colored/`。「導出右圖」共用其中的 `colored/`。
 
 完整操作和儲存格式見 [兩類專案說明](docs/two_class_project.md)。
+
+使用 Codex 執行完整的 Computer Use 去字工作流時，可呼叫專案內的 [$comic-detect-review](.agents/skills/comic-detect-review/SKILL.md)，並提供圖片資料夾路徑，例如：「使用 $comic-detect-review，對指定資料夾開始偵測，再逐頁校正並保存。」此 Skill 包含漏選補正、誤判恢復、純色填充／待修復判斷與保存核對。
+
+### AI 監修操作
+
+可直接貼上圖片資料夾路徑開啟專案，並輸入頁碼或完整檔名跳頁。頂部獨立顯示目前頁面、保存狀態及編輯類型／工具／選區模式；偵測進度不代表正在校對的頁面。低頻導出與工作流功能位於「更多」。
+
+跨顯示器監修時，先按「整理監修視窗」：依目前螢幕可用範圍，以一致的邏輯尺寸置中並重新適應兩側畫布。小螢幕會縮小到可用範圍內，不沿用另一台顯示器的螢幕座標；整理後重新取得畫面再框選。
+
+「F3 恢復原圖」讓矩形或套索的左鍵選區同時清除純色填充和待修復標記，可撤銷；切換工具會保留仍相容的添加／減去模式。局部視窗顯示原圖座標與尺寸，修改副本必須按「套用」才保存。
+
+逐頁確認後可按「標記已校對」或「完成本頁並到下一頁」。校對狀態跟專案保存，與 OTHER 分開計數；選區、顏色或人工擦除記錄改變後，該頁回到待回看。相同內容重存不會清掉校對標記。
+
+### MCP 控制
+
+可選的本機 MCP 介面提供開啟專案、全話偵測與範圍覆蓋核對、同版原圖／合成預覽，以及帶頁面 token 的矩形／多邊形編輯、單批撤銷和保存後校對標記。選區沿用 GUI 核心與正式保存，圖像語意、細字及修改結果仍逐頁視覺檢查；筆刷、魔法棒和局部副本可繼續使用 Computer Use。普通 GUI 啟動不需要安裝 MCP SDK；契約及接入方式見 [MCP 使用說明](docs/mcp.md)。
 
 「工作流比較」會開啟獨立視窗。選擇一個 `export_pair` 文件夾後，工具會讀取根目錄底圖，並自動識別 `inpaint_workflows/` 內任意數量的工作流子文件夾；它會逐組比較工作流圖片與底圖來生成各自的差異 Mask，不再依賴 `other_mask/`。頂部可調整「差異閾值」、「最小區域」及「Mask 擴大」（預設 `5 px`），差異 Mask 會緩存在 `.workflow_compare/diff_masks/`，也可按「重算 Mask」刷新當頁。比較區最左側固定顯示當頁實際合成效果，右側可同步比較最多三組結果；所有圖片同步縮放和移動，每張工作流圖片頂部的原圖比較滑桿也會同步移動，初始值為 `0`，即完整顯示工作流結果。每個工作流名稱旁的色塊代表該工作流的 Mask 顏色；在對應面板中，已採用區域使用較高不透明度，未採用區域以相同顏色淡化顯示。首次載入的頁面預設採用第一組工作流；在工作流圖片上左鍵拖矩形或使用筆刷，可重新指定該工作流差異 Mask 內的局部來源，右鍵拖矩形則直接指定該範圍保留原圖，中鍵拖動用於平移。圖片下方按鈕可將該工作流的整個差異 Mask 指定給該組。`M` 顯示或隱藏選區，`[`、`]` 調整筆刷大小。選擇狀態保存在 `.workflow_compare/`，最終圖片和來源摘要 `selection.json` 輸出到 `result/`。
 
@@ -145,29 +161,64 @@ MangaLens 通過整泡驗證時，以氣泡估色填充內縮區；人工圖像�
 ```text
 B：筆刷
 R：矩形
+F3：恢復原圖（左鍵清除兩類選區）
 [：縮小筆刷
 ]：放大筆刷
-← / PageUp：上一頁
-→ / PageDown：下一頁
+A / D：上一頁／下一頁（輸入欄位內不觸發）
+方向鍵：移動畫布
 Ctrl+Z：撤銷
 Ctrl+Shift+Z：重做
 ```
 
-## 命令行批量處理
+## 無界面批量偵測
+
+已安裝依賴及所選模型後，可直接對圖片資料夾執行偵測，不啟動 GUI，也不需要 MCP：
 
 macOS：
 
 ```bash
-.venv/bin/python detect_solid_inpaint_folder.py /path/to/image_folder
+.venv/bin/python detect_solid_inpaint_folder.py "/path/to/image_folder"
 ```
 
 Windows：
 
 ```bat
-.venv\Scripts\python detect_solid_inpaint_folder.py D:\path\to\image_folder
+.venv\Scripts\python detect_solid_inpaint_folder.py "D:\path\to\image_folder"
 ```
 
-命令行模式會處理整個圖片資料夾，並生成 PDF 預覽報告。
+預設檢查整個資料夾，只偵測尚無結果或首次偵測失敗的頁面；已成功偵測的頁面（包括沒有選區的空白頁）及已有人工資料會保留。重複執行可以繼續未完成頁面，不會自動重跑已有結果。只做偵測，不標記為已逐頁校對。
+
+依 GUI 相同的檔名自然排序，以從 1 開始的頁碼指定範圍，包含首尾：
+
+```bash
+.venv/bin/python detect_solid_inpaint_folder.py "/path/to/image_folder" --start-page 5 --end-page 8
+```
+
+確定要重跑已有結果時，明確加上 `--redetect`；只影響指定範圍，沿用核心流程保留人工修改及擦除：
+
+```bash
+.venv/bin/python detect_solid_inpaint_folder.py "/path/to/image_folder" --start-page 5 --end-page 8 --redetect
+```
+
+人工修改的保留適用於同一版原圖。原圖已更換時，明確重跑會按核心既有行為建立新頁，舊人工選區不會沿用；重跑前先核對來源及保留需要的舊成果。
+
+可選模型、裝置及是否填充氣泡，例如：
+
+```bash
+.venv/bin/python detect_solid_inpaint_folder.py "/path/to/image_folder" --detector ysgyolo --device cpu --no-bubble
+```
+
+| 參數 | 用途 |
+| --- | --- |
+| `--detector` | `legacy_ctd`、`ctbd`、`rfdetr` 或 `ysgyolo`；新專案預設 CTD，舊專案未指定時沿用已保存模型及其參數 |
+| `--device` | `auto`、`cpu`、`mps` 或 `cuda`；CTD／CTBD 僅支援 `auto`／`cpu` |
+| `--bubble`／`--no-bubble` | 開啟／關閉氣泡填充；未指定時沿用專案設定，新專案使用預設值 |
+| `--start-page`／`--end-page` | 從 1 開始、包含首尾的頁碼；省略結束頁時取最後一頁 |
+| `--redetect` | 允許重新偵測選定範圍的已有結果 |
+
+命令列不讀寫 GUI 的全局偏好。結果保存為相同的 `ctd_inpainted/raw/` 專案資料，之後開 GUI 可直接繼續校正；不自動導出 PDF、PNG 或 PSD。終端會顯示偵測、跳過及失敗計數；退出碼 `0` 表示本次任務成功、`1` 表示有頁面失敗，`2` 表示參數或啟動錯誤。
+
+若原圖已變更、正式頁面資料缺失或損壞，預設回報問題，不以重新偵測悄悄覆蓋。不要同時從 GUI 與 CLI 修改同一個漫畫資料夾，專案尚無跨程序編輯鎖。
 
 ## 輸出結構
 
@@ -254,6 +305,8 @@ OTHER_CHANNEL
 models/comic-text-and-bubble-detector.onnx
 models/comictextdetector.pt
 models/ysgyolo_yolo26_2.0.pt
+models/mangalens.pt
+models/koharu-layout-rfdetr-seg-2xl-1152/model.safetensors
 ```
 
 CTBD 模型來源：
@@ -266,6 +319,12 @@ CTD 模型來源：
 
 ```text
 https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.2.1/comictextdetector.pt
+```
+
+RF-DETR 模型來源：
+
+```text
+https://huggingface.co/mayocream/koharu-layout-rfdetr-seg-2xl-1152
 ```
 
 模型授權與歸屬屬於原項目。
@@ -313,7 +372,7 @@ YSGYOLO 設定會自動保存：
 .venv/bin/python detect_solid_inpaint_folder.py /path/to/image_folder --detector ysgyolo
 ```
 
-新增依賴為 `ultralytics>=8.4.14` 與 `networkx`。Python 3.13 以上使用 NumPy 2，以兼容新 Python 的套件；較舊 Python 沿用 NumPy 1 的限制。
+偵測器依賴包含 `ultralytics>=8.4.14`、`networkx`，以及 RF-DETR 所需的 `rfdetr==1.7.0`、`transformers==5.15.0`、`supervision==0.28.0`。Python 3.10 的 Apple Silicon macOS 固定使用 `scipy==1.14.1`，避開在該環境無法載入的 1.15.3 wheel；其他環境由 pip 選擇相容版本。Python 3.13 以上使用 NumPy 2，以兼容新 Python 的套件；較舊 Python 沿用 NumPy 1 的限制。
 
 如果缺少所選模型，命令行和圖形界面都會提示找不到模型文件。
 

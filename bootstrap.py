@@ -25,6 +25,9 @@ YSG_MODEL_SHA256 = '889347d65c8636dd188a8ed4f312b29658543faaa69016b5958ddf055998
 MANGALENS_MODEL_URL = 'https://www.modelscope.cn/models/hgmzhn/manga-translator-ui/resolve/master/mangalens.pt'
 MANGALENS_MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'mangalens.pt'
 MANGALENS_MODEL_SHA256 = '4028152940f7c910f40192f46ede3b3f6c7129e5c76849c324d3564f8ac50198'
+RF_DETR_MODEL_URL = 'https://huggingface.co/mayocream/koharu-layout-rfdetr-seg-2xl-1152/resolve/main/model.safetensors'
+RF_DETR_MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'koharu-layout-rfdetr-seg-2xl-1152' / 'model.safetensors'
+RF_DETR_MODEL_SHA256 = '9bf6d2cbd7793c956d8c857bb1672a396eb7f100eb0682f86830d05e31168efb'
 ROOT = Path(__file__).resolve().parent
 VENV_DIR = ROOT / '.venv'
 REQUIREMENTS = ROOT / 'requirements.txt'
@@ -180,6 +183,7 @@ def main() -> None:
     download_model(MODEL_URL, MODEL_PATH)
     download_model(YSG_MODEL_URL, YSG_MODEL_PATH, YSG_MODEL_SHA256)
     download_model(MANGALENS_MODEL_URL, MANGALENS_MODEL_PATH, MANGALENS_MODEL_SHA256)
+    download_model(RF_DETR_MODEL_URL, RF_DETR_MODEL_PATH, RF_DETR_MODEL_SHA256)
     launch_app(python)
 
 

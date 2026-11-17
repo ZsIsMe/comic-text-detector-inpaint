@@ -359,6 +359,7 @@ def _candidate_seed_points(
     text_mask: np.ndarray,
     repair_area: np.ndarray,
     sample_ring: np.ndarray,
+    offset: tuple[int, int] = (0, 0),
 ) -> list[tuple[int, int]]:
     gray = cv2.cvtColor(color_img, cv2.COLOR_BGR2GRAY)
     grad_x = cv2.Sobel(gray, cv2.CV_16S, 1, 0, ksize=3)
@@ -385,8 +386,13 @@ def _candidate_seed_points(
     ys, xs = np.where(clean)
     colors = color_img[ys, xs].astype(np.int16)
     color_delta = np.max(np.abs(colors - dominant), axis=1)
-    center_y, center_x = np.mean(np.where(repair_area > 0), axis=1)
-    distances = np.hypot(xs.astype(np.float32) - float(center_x), ys.astype(np.float32) - float(center_y))
+    # Score in page coordinates. Translating after float32 conversion can round
+    # tied candidates differently, changing which flood-fill seed wins.
+    offset_x, offset_y = offset
+    center_y, center_x = np.mean(
+        np.asarray(np.where(repair_area > 0)) + np.array([offset_y, offset_x])[:, None], axis=1)
+    distances = np.hypot((xs + offset_x).astype(np.float32) - float(center_x),
+                         (ys + offset_y).astype(np.float32) - float(center_y))
     scores = color_delta.astype(np.float32) + distances * 0.03 + gradient[ys, xs].astype(np.float32) * 0.3
     order = np.argsort(scores)
 
@@ -449,8 +455,37 @@ def _background_wand_sample(
     text_mask: np.ndarray,
     repair_area: np.ndarray,
     sample_ring: np.ndarray,
+    offset: tuple[int, int] = (0, 0),
 ) -> np.ndarray:
-    seeds = _candidate_seed_points(color_img, text_mask, repair_area, sample_ring)
+    """Sample a padded local window, keeping the original page-coordinate scores."""
+    x, y, width, height = cv2.boundingRect(repair_area)
+    if not width or not height:
+        return sample_ring
+    h, w = repair_area.shape
+    margin = max(BACKGROUND_WAND_ROI_PADDING_PX, BACKGROUND_WAND_SEED_SEARCH_PX + 1, 5)
+    x1, y1, x2, y2 = _expand_box((x, y, x + width, y + height), margin, w, h)
+    # Retain arbitrary caller-provided rings too, including fallback samples.
+    sx, sy, sw, sh = cv2.boundingRect(sample_ring)
+    if sw and sh:
+        x1, y1 = min(x1, max(0, sx - 1)), min(y1, max(0, sy - 1))
+        x2, y2 = max(x2, min(w, sx + sw + 1)), max(y2, min(h, sy + sh + 1))
+    roi = np.s_[y1:y2, x1:x2]
+    sample = _background_wand_sample_local(
+        color_img[roi], text_mask[roi], repair_area[roi], sample_ring[roi],
+        (offset[0] + x1, offset[1] + y1))
+    output = np.zeros_like(sample_ring)
+    output[roi] = sample
+    return output
+
+
+def _background_wand_sample_local(
+    color_img: np.ndarray,
+    text_mask: np.ndarray,
+    repair_area: np.ndarray,
+    sample_ring: np.ndarray,
+    offset: tuple[int, int] = (0, 0),
+) -> np.ndarray:
+    seeds = _candidate_seed_points(color_img, text_mask, repair_area, sample_ring, offset)
     if not seeds:
         return sample_ring
 
@@ -655,6 +690,15 @@ def _best_quality(color_img: np.ndarray, repair_area: np.ndarray, sample_ring: n
     return max(solid_directionals, key=lambda item: item.score)
 
 
+def _block_roi(text_mask, box, padding):
+    """Keep exactly the text owned by box, with room for local morphology."""
+    height, width = text_mask.shape
+    x1, y1, x2, y2 = _expand_box(box, padding, width, height)
+    roi = np.s_[y1:y2, x1:x2]
+    local_box = (box[0] - x1, box[1] - y1, box[2] - x1, box[3] - y1)
+    return roi, _mask_for_box(text_mask[roi], local_box), (x1, y1)
+
+
 def _solid_overlay_from_mask(
     img: np.ndarray,
     mask: np.ndarray,
@@ -662,6 +706,7 @@ def _solid_overlay_from_mask(
     bubble_shrink_ratio: float = 0.02,
     protected: np.ndarray | None = None,
     jpeg_source: bool = False,
+    bubble_direct_white: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     if len(img.shape) == 2:
         color_img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
@@ -673,88 +718,61 @@ def _solid_overlay_from_mask(
     repair_kernel = _kernel(REPAIR_EXPAND_PX)
     ring_kernel = _kernel(SAMPLE_RING_PX)
     overlay = np.zeros((height, width, 4), dtype=np.uint8)
+    solid_seeds = np.zeros_like(overlay)
     other_mask = np.zeros((height, width), dtype=np.uint8)
     background_sample_mask = np.zeros((height, width), dtype=np.uint8)
     debug_blocks = []
+    block_padding = REPAIR_EXPAND_PX + max(
+        BACKGROUND_WAND_ROI_PADDING_PX, BACKGROUND_WAND_SEED_SEARCH_PX + 1, SAMPLE_RING_PX, 5)
 
     for box in boxes:
-        local_text = _mask_for_box(text_mask, box)
+        roi, local_text, offset = _block_roi(text_mask, box, block_padding)
         if not np.any(local_text):
             continue
-        repair_area, sample_ring = _sample_ring_for_local_text(text_mask, local_text, repair_kernel, ring_kernel)
-        background_sample = _background_wand_sample(color_img, text_mask, repair_area, sample_ring)
-        quality = _best_quality(color_img, repair_area, background_sample)
-        background_sample_mask = cv2.bitwise_or(background_sample_mask, background_sample)
+        repair_area, sample_ring = _sample_ring_for_local_text(text_mask[roi], local_text, repair_kernel, ring_kernel)
+        background_sample = _background_wand_sample(color_img[roi], text_mask[roi], repair_area, sample_ring, offset)
+        quality = _best_quality(color_img[roi], repair_area, background_sample)
+        background_sample_mask[roi] |= background_sample
 
         if quality.is_solid:
             active = repair_area > 0
-            overlay[active, 0] = quality.fill_bgr[0]
-            overlay[active, 1] = quality.fill_bgr[1]
-            overlay[active, 2] = quality.fill_bgr[2]
-            overlay[active, 3] = 255
+            local_overlay = overlay[roi]
+            local_overlay[active, :3] = quality.fill_bgr
+            local_overlay[active, 3] = 255
+            local_seeds = solid_seeds[roi]
+            local_seeds[local_text > 0, :3] = quality.fill_bgr
+            local_seeds[local_text > 0, 3] = 255
         else:
-            other_mask = cv2.bitwise_or(other_mask, repair_area)
+            other_mask[roi] |= repair_area
 
         block_debug = asdict(quality)
         block_debug['box'] = [int(value) for value in box]
         debug_blocks.append(block_debug)
 
     bubble_records = []
-    ignored_boundary_noise = np.zeros(text_mask.shape, np.uint8)
     if bubble_polygons:
-        bubble_overlay, veto, bubble_sample, bubble_records = fill_bubbles(
-            color_img, text_mask, bubble_polygons, bubble_shrink_ratio, protected,
-            jpeg_source=jpeg_source,
+        bubble_overlay, bubble_records = fill_bubbles(
+            text_mask, solid_seeds, bubble_polygons, bubble_shrink_ratio, protected,
+            direct_white=bubble_direct_white,
         )
-        # Bubble validation owns its interior, including rejected expansion
-        # and the narrow rim intentionally excluded by erosion.
-        inside = veto > 0
-        overlay[inside] = 0
-        repair = cv2.dilate(text_mask, repair_kernel)
-        other_mask[inside & (repair > 0)] = 255
         accepted = bubble_overlay[:, :, 3] > 0
         overlay[accepted] = bubble_overlay[accepted]
         other_mask[accepted] = 0
-        background_sample_mask[inside] = bubble_sample[inside]
-        # An accepted bubble may contain tiny detector islands on its outline.
-        # Keep the source mask and artwork, but do not report these deliberately
-        # ignored islands as an unfilled paragraph. Never waive manual OTHER.
-        for record in bubble_records:
-            if not record['accepted']:
-                continue
-            for x, y, w, h in record.get('ignored_boundary_components', []):
-                island = _mask_for_box(text_mask, [x, y, x+w, y+h])
-                ignored_boundary_noise |= cv2.dilate(island, repair_kernel)
-        near_fill = cv2.dilate(accepted.astype(np.uint8), _kernel(3)) > 0
-        n, labels, stats, _ = cv2.connectedComponentsWithStats(other_mask, connectivity=8)
-        tiny_edges = []
-        for idx in range(1, n):
-            x, y, w, h, size = stats[idx]
-            if size > 4:
-                continue
-            active = labels[y:y+h, x:x+w] == idx
-            if np.all(near_fill[y:y+h, x:x+w][active]):
-                tiny_edges.append(idx)
-        if sum(stats[idx, cv2.CC_STAT_AREA] for idx in tiny_edges) <= min(64, max(4, np.count_nonzero(accepted)*0.0005)):
-            ignored_boundary_noise[np.isin(labels, tiny_edges)] = 255
-        if protected is not None:
-            ignored_boundary_noise[protected > 0] = 0
-        overlay[ignored_boundary_noise > 0] = 0
-        other_mask[ignored_boundary_noise > 0] = 0
     if protected is not None:
         overlay[protected > 0] = 0
         other_mask[(protected > 0) & (cv2.dilate(text_mask, repair_kernel) > 0)] = 255
     for record, box in zip(debug_blocks, boxes):
         record['local_is_solid'] = record['is_solid']
-        block_repair = cv2.dilate(_mask_for_box(text_mask, box), repair_kernel) > 0
-        record['ignored_boundary_pixels'] = int(np.count_nonzero(block_repair & (ignored_boundary_noise > 0)))
-        record['is_solid'] = bool(np.all(((overlay[:, :, 3] > 0) | (ignored_boundary_noise > 0))[block_repair]))
+        roi, local_text, _ = _block_roi(text_mask, box, REPAIR_EXPAND_PX)
+        block_repair = cv2.dilate(local_text, repair_kernel) > 0
+        record['ignored_boundary_pixels'] = 0
+        record['is_solid'] = bool(np.all((overlay[roi][:, :, 3] > 0)[block_repair]))
     summary = {
         'blocks': len(boxes),
         'auto_blocks': sum(1 for item in debug_blocks if item['is_solid']),
         'other_blocks': sum(1 for item in debug_blocks if not item['is_solid']),
         'other_pixels': int(np.count_nonzero(other_mask)),
-        'ignored_boundary_pixels': int(np.count_nonzero(ignored_boundary_noise)),
+        'ignored_boundary_pixels': 0,
         'blocks_debug': debug_blocks,
         'solid_bubbles': sum(item['accepted'] for item in bubble_records),
         'bubbles_debug': bubble_records,
@@ -776,27 +794,27 @@ def _manual_solid_overlay(
     filled_regions = 0
 
     for box in boxes:
-        local_solid = _mask_for_box(solid_mask, box)
+        roi, local_solid, _ = _block_roi(solid_mask, box, SAMPLE_RING_PX * 2)
+        local_exclude = exclude_mask[roi]
         if not np.any(local_solid):
             continue
         expanded = cv2.dilate(local_solid, ring_kernel, iterations=1)
         sample_ring = cv2.bitwise_and(expanded, cv2.bitwise_not(local_solid))
-        sample_ring = cv2.bitwise_and(sample_ring, cv2.bitwise_not(exclude_mask))
+        sample_ring = cv2.bitwise_and(sample_ring, cv2.bitwise_not(local_exclude))
         active_sample = sample_ring > 0
         if int(np.count_nonzero(active_sample)) < MIN_SAMPLE_PIXELS:
             expanded = cv2.dilate(local_solid, _kernel(SAMPLE_RING_PX * 2), iterations=1)
             sample_ring = cv2.bitwise_and(expanded, cv2.bitwise_not(local_solid))
-            sample_ring = cv2.bitwise_and(sample_ring, cv2.bitwise_not(exclude_mask))
+            sample_ring = cv2.bitwise_and(sample_ring, cv2.bitwise_not(local_exclude))
             active_sample = sample_ring > 0
         if int(np.count_nonzero(active_sample)) < MIN_SAMPLE_PIXELS:
             continue
 
-        fill_bgr = _dominant_bgr(color_img[active_sample])
+        fill_bgr = _dominant_bgr(color_img[roi][active_sample])
         active = local_solid > 0
-        overlay[active, 0] = fill_bgr[0]
-        overlay[active, 1] = fill_bgr[1]
-        overlay[active, 2] = fill_bgr[2]
-        overlay[active, 3] = 255
+        local_overlay = overlay[roi]
+        local_overlay[active, :3] = fill_bgr
+        local_overlay[active, 3] = 255
         filled_regions += 1
 
     return overlay, filled_regions, int(np.count_nonzero(overlay[:, :, 3] > 0))
@@ -819,11 +837,17 @@ def _compose_overlay_preview(base_img: np.ndarray, overlay: np.ndarray) -> np.nd
         base = base_img[:, :, :3].copy()
     if overlay is None or len(overlay.shape) != 3 or overlay.shape[2] < 4:
         return base
-    alpha = overlay[:, :, 3:4].astype(np.float32) / 255.0
-    return (
-        base.astype(np.float32) * (1.0 - alpha)
-        + overlay[:, :, :3].astype(np.float32) * alpha
-    ).astype(np.uint8)
+    opacity = overlay[:, :, 3]
+    opaque = opacity == 255
+    base[opaque] = overlay[opaque, :3]
+    partial = (opacity > 0) & ~opaque
+    if np.any(partial):
+        alpha = opacity[partial, None].astype(np.float32) / 255.0
+        base[partial] = (
+            base[partial].astype(np.float32) * (1.0 - alpha)
+            + overlay[partial, :3].astype(np.float32) * alpha
+        ).astype(np.uint8)
+    return base
 
 
 def _fit_image(image: Image.Image, width: int, height: int) -> Image.Image:
@@ -1025,17 +1049,50 @@ def _extend_saved_colors(overlay, added, retained):
     return remaining
 
 
-def save_page_edits(img_path, paths, solid, other, *, state=None, edited=None, fill_color=None):
-    image = imread(img_path, cv2.IMREAD_COLOR)
-    if image is None:
-        raise FileNotFoundError(f'無法讀取原圖：{img_path}')
-    old = read_page_state(paths, img_path, image.shape[:2]) if state is None else state
-    solid, other = np.asarray(solid) > 0, np.asarray(other) > 0
-    if solid.shape != image.shape[:2] or other.shape != solid.shape:
+def _edit_color_source(image):
+    image = np.asarray(image)
+    if image.dtype == np.uint16:
+        # IMREAD_COLOR reduces a 16-bit source to its high byte; the GUI cache
+        # retains the original depth because it uses IMREAD_UNCHANGED.
+        image = (image >> 8).astype(np.uint8)
+    elif image.dtype != np.uint8:
+        raise ValueError('原圖像素格式不支援。')
+    if image.ndim == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    elif image.ndim == 3 and image.shape[2] in (3, 4):
+        image = image[:, :, :3]
+    else:
+        raise ValueError('原圖必須是灰階、BGR 或 BGRA 圖像。')
+    return image
+
+
+def prepare_page_edits(source_image, solid, other, *, state, edited=None, fill_color=None,
+                       dirty_bbox=None):
+    """Prepare an authoritative snapshot in memory, without reading or writing files.
+
+    A dirty box includes every changed pixel. Its halo retains neighbouring saved
+    colours and the complete fallback sampling ring. Inputs are never mutated.
+    """
+    source_image = np.asarray(source_image)
+    solid, other = np.asarray(solid), np.asarray(other)
+    shape = source_image.shape[:2]
+    if solid.shape != shape or other.shape != shape:
         raise ValueError('選區尺寸與原圖不一致。')
+    if state['overlay'].shape != (*shape, 4) or state['other'].shape != shape or state['edited'].shape != shape:
+        raise ValueError('頁面資料尺寸與原圖不一致。')
+    height, width = shape
+    if dirty_bbox is None:
+        roi = np.s_[:, :]
+    else:
+        x1, y1, x2, y2 = _expand_box(dirty_bbox, BLOCK_PADDING_PX + SAMPLE_RING_PX * 2 + 1, width, height)
+        roi = np.s_[y1:y2, x1:x2]
+    image = _edit_color_source(source_image[roi])
+    solid, other = solid[roi] > 0, other[roi] > 0
     if np.any(solid & other):
         raise ValueError('兩類選區不能重疊。')
-    overlay = old['overlay'].copy()
+    page = {'overlay': state['overlay'].copy(), 'other': state['other'].copy(),
+            'edited': state['edited'].copy() if edited is None else edited.copy()}
+    overlay = page['overlay'][roi]
     was_solid = overlay[:, :, 3] > 0
     added = solid & ~was_solid
     if np.any(added):
@@ -1044,16 +1101,28 @@ def save_page_edits(img_path, paths, solid, other, *, state=None, edited=None, f
             overlay[added, 3] = 255
         else:
             remaining = _extend_saved_colors(overlay, added, was_solid & solid)
-            exclude = np.where(solid | other, 255, 0).astype(np.uint8)
-            new_overlay, _, _ = _manual_solid_overlay(image, remaining.astype(np.uint8)*255, exclude)
-            if not np.all(new_overlay[:, :, 3][remaining] > 0):
-                raise ValueError('新增純色選區沒有足夠背景可取色，請指定填色顏色。')
-            overlay[remaining] = new_overlay[remaining]
-    overlay[~solid] = 0
-    changed = (solid != was_solid) | (other != (old['other'] > 0))
-    locks = old['edited'].copy() if edited is None else edited.copy()
-    locks[changed] = 255
-    page = {'overlay': overlay, 'other': other.astype(np.uint8)*255, 'edited': locks}
+            if np.any(remaining):
+                exclude = np.where(solid | other, np.uint8(255), np.uint8(0))
+                new_overlay, _, _ = _manual_solid_overlay(image, remaining.astype(np.uint8)*255, exclude)
+                if not np.all(new_overlay[:, :, 3][remaining] > 0):
+                    raise ValueError('新增純色選區沒有足夠背景可取色，請指定填色顏色。')
+                overlay[remaining] = new_overlay[remaining]
+    np.multiply(overlay, solid[:, :, None], out=overlay)
+    changed = (solid != was_solid) | (other != (state['other'][roi] > 0))
+    page['edited'][roi][changed] = 255
+    page['other'][roi] = np.where(other, np.uint8(255), np.uint8(0))
+    return page
+
+
+def save_page_edits(img_path, paths, solid, other, *, state=None, edited=None, fill_color=None,
+                    source_image=None):
+    image = imread(img_path, cv2.IMREAD_COLOR) if source_image is None else np.asarray(source_image)
+    if image is not None and image.dtype not in (np.uint8, np.uint16):
+        image = imread(img_path, cv2.IMREAD_COLOR)
+    if image is None:
+        raise FileNotFoundError(f'無法讀取原圖：{img_path}')
+    old = read_page_state(paths, img_path, image.shape[:2]) if state is None else state
+    page = prepare_page_edits(image, solid, other, state=old, edited=edited, fill_color=fill_color)
     summary = store.save_page(paths, img_path, page)
     return page, summary
 
@@ -1100,19 +1169,10 @@ def regenerate_image_from_mask(img_path, paths, mask=None, *, reclassify=False):
     jpeg_source = Path(img_path).suffix.lower() in ('.jpg', '.jpeg')
     overlay, other, sample, diagnostics = _solid_overlay_from_mask(
         image, mask, polygons, settings['shrink_percent']/100,
-        jpeg_source=jpeg_source)
+        jpeg_source=jpeg_source, bubble_direct_white=settings['direct_white'])
     locked = old['edited'] > 0
     overlay[locked] = old['overlay'][locked]
     other[locked] = old['other'][locked]
-    # A manual OTHER region protects its entire detected bubble from automatic
-    # expansion, while retaining previously accepted colours elsewhere.
-    if np.any(old['other'][locked]):
-        protected = np.where(locked & (old['other'] > 0), 255, 0).astype(np.uint8)
-        overlay, other, sample, diagnostics = _solid_overlay_from_mask(
-            image, mask, polygons, settings['shrink_percent']/100, protected,
-            jpeg_source=jpeg_source)
-        overlay[locked] = old['overlay'][locked]
-        other[locked] = old['other'][locked]
     page = {'overlay': overlay, 'other': other, 'edited': old['edited']}
     diagnostics['bubble_detection'] = bubble_status
     if np.any(mask) or cache_path.exists():
@@ -1127,7 +1187,7 @@ def bubble_context(detect_img, mask, paths, img_path):
     settings = load_settings(paths['raw'])
     polygons = []
     status = {'status': 'disabled' if not settings['enabled'] else 'no_text'}
-    if settings['enabled'] and np.any(mask):
+    if settings['enabled'] and (settings['direct_white'] or np.any(mask)):
         try:
             polygons, source = detect_bubbles(detect_img, store.cache_path(paths, img_path))
             status = {'status': source, 'instances': len(polygons)}
@@ -1198,67 +1258,155 @@ def load_report(paths):
     return store.load_project(paths['raw'])
 
 
-def run(img_dir: str, detector_name: str = DEFAULT_DETECTOR) -> int:
+def run(img_dir: str, detector_name: str | None = None, *, start_page: int = 1,
+        end_page: int | None = None, redetect: bool = False,
+        device: str | None = None, bubble: bool | None = None) -> dict:
+    """Detect a folder without a GUI, preserving existing pages by default."""
     img_dir = osp.abspath(img_dir)
     if not osp.isdir(img_dir):
         raise FileNotFoundError(f'找不到資料夾：{img_dir}')
-    model_path = osp.abspath(str(detector_model_path(detector_name)))
-    if not osp.isfile(model_path):
-        raise FileNotFoundError(f'找不到模型檔：{model_path}')
-    device = 'cpu'
-
-    paths = _ensure_dirs(img_dir)
     imglist = image_files_in_folder(img_dir)
     if not imglist:
-        print(f'資料夾內沒有可處理的圖片：{img_dir}')
-        return 0
-
+        raise ValueError(f'資料夾內沒有可處理的圖片：{img_dir}')
+    if (type(start_page) is not int or start_page < 1 or start_page > len(imglist)
+            or (end_page is not None and (type(end_page) is not int or
+                                           end_page < start_page or end_page > len(imglist)))):
+        raise ValueError(f'頁面範圍須介於 1–{len(imglist)}，且結束頁不得早於起始頁。')
+    end_page = len(imglist) if end_page is None else end_page
+    selected = imglist[start_page - 1:end_page]
+    out_dir = Path(img_dir) / OUTPUT_DIR
+    raw = out_dir / RAW_DIR
+    paths = {'output': str(out_dir), 'raw': str(raw),
+             'export_pair': str(out_dir / EXPORT_PAIR_DIR)}
+    if raw.exists() and not store.project_path(raw).exists():
+        legacy = ('mask', 'manual_solid', 'manual_other', 'solid_inpaint_report.json')
+        if any((raw / name).exists() for name in legacy):
+            raise ValueError('此資料夾是舊格式專案。請先將 ctd_inpainted 改名保留，再重新偵測建立新版專案。')
+    existing = store.load_project(raw)
+    saved_detector = existing.get('detector', DEFAULT_DETECTOR)
+    detector_name = saved_detector if detector_name is None else detector_name
+    model_path = osp.abspath(str(detector_model_path(detector_name)))
+    detector_params = (dict(existing.get('detector_params') or {})
+                       if detector_name == saved_detector and
+                       isinstance(existing.get('detector_params'), dict) else {})
+    if device is not None:
+        if device not in ('auto', 'cpu', 'mps', 'cuda'):
+            raise ValueError(f'不支援的裝置：{device}')
+        if detector_name in (DETECTOR_CTBD, DETECTOR_LEGACY_CTD):
+            if device not in ('auto', 'cpu'):
+                raise ValueError(f'{DETECTOR_LABELS[detector_name]} 只支援 CPU。')
+            detector_params.pop('device', None)
+        else:
+            detector_params['device'] = device
+    elif detector_name in (DETECTOR_CTBD, DETECTOR_LEGACY_CTD):
+        detector_params.pop('device', None)
     print(f'資料夾：{img_dir}')
     print(f'輸出：{paths["output"]}')
+    print(f'專案圖片數：{len(imglist)}；本次頁面：{start_page}–{end_page}（{len(selected)} 頁）')
     print(f'模型：{model_path}')
-    print(f'裝置：{device}')
-    print(f'圖片數量：{len(imglist)}')
-
-    detector = create_detector(detector_name)
-    device = getattr(detector, 'device', 'cpu')
-    pages = {}
-
-    for img_path in tqdm(imglist, desc='solid inpaint'):
+    to_process = []
+    skipped = 0
+    failures = {}
+    for img_path in selected:
         img_name = osp.basename(img_path)
-        try:
-            pages[img_name] = process_image_with_detector(img_path, paths, detector)
-        except Exception as exc:
-            pages[img_name] = {'error': str(exc)}
+        info = existing.get('pages', {}).get(img_name, {})
+        archive = store.page_path(paths, img_path)
+        if not redetect and (info.get('processed') or info.get('has_data') or
+                             info.get('reviewed_digest') or archive.exists()):
+            try:
+                if archive.exists() and not info:
+                    raise ValueError('正式頁面資料缺少專案記錄。')
+                image = imread(img_path, cv2.IMREAD_UNCHANGED)
+                if image is None:
+                    raise ValueError('原圖無法讀取。')
+                if not archive.exists() and not info.get('source_signature'):
+                    raise ValueError('既有頁面缺少來源簽章。')
+                signature = store.source_signature(img_path)
+                if info.get('source_signature') and info['source_signature'] != signature:
+                    raise ValueError('原圖與專案記錄的來源簽章不一致。')
+                if 'has_data' in info and bool(info['has_data']) != archive.exists():
+                    raise ValueError('正式頁面資料與專案記錄不一致。')
+                page = store.load_page(paths, img_path, image.shape[:2])
+                digest = info.get('state_digest')
+                if digest and digest != store.page_state_digest(page, signature):
+                    raise ValueError('正式頁面內容與專案記錄不一致。')
+            except Exception as exc:
+                failures[img_name] = f'既有結果無法安全讀取：{exc}；請先檢查，明確需要重跑時使用 --redetect。'
+            else:
+                skipped += 1
+            continue
+        to_process.append(img_path)
 
-    report = build_report(img_dir, paths, imglist, pages, detector_name, device=device)
-    report_path = write_report(paths, report)
-    print('完成。正式資料與快取：')
-    print(f'  - {report_path}')
-    print(f'  - {paths["raw"]}/pages/<原圖檔名>.npz')
-    print(f'  - {paths["raw"]}/cache/<原圖檔名>.npz')
-    print(f'含 other_mask 頁數：{report["summary"]["with_other_mask"]}')
-    if report['summary']['failed']:
-        print(f'失敗頁數：{report["summary"]["failed"]}')
-    return int(report['summary']['processed'])
+    detected = 0
+    if to_process:
+        if not osp.isfile(model_path):
+            raise FileNotFoundError(f'找不到模型檔：{model_path}')
+        detector = create_detector(detector_name, detector_params)
+        actual_device = getattr(detector, 'device', 'cpu')
+        print(f'裝置：{actual_device}')
+        paths = _ensure_dirs(img_dir)
+        if bubble is not None:
+            from bubble_solid import save_settings as save_solid_settings
+            solid_settings = load_settings(paths['raw'])
+            save_solid_settings(paths['raw'], bubble,
+                                solid_settings['shrink_percent'], solid_settings['direct_white'])
+        for img_path in tqdm(to_process, desc='solid inpaint'):
+            img_name = osp.basename(img_path)
+            try:
+                process_image_with_detector(img_path, paths, detector)
+                detected += 1
+            except Exception as exc:
+                failures[img_name] = str(exc)
+        pages = dict(load_report(paths).get('pages', {}))
+        for name, error in failures.items():
+            if not pages.get(name, {}).get('processed') and not store.page_path(paths, name).exists():
+                pages[name] = {'error': error}
+        report = build_report(img_dir, paths, imglist, pages, detector_name, device=actual_device)
+        report['detector_params'] = detector_params
+        write_report(paths, report)
+    for name, message in failures.items():
+        print(f'失敗 {name}：{message}', file=sys.stderr)
+    print(f'本次：成功偵測 {detected} 頁；跳過已有結果 {skipped} 頁；失敗 {len(failures)} 頁。')
+    if store.project_path(paths['raw']).exists():
+        print(f'正式資料：{store.project_path(paths["raw"])}')
+    print('本次僅執行偵測，沒有逐頁校對。')
+    return {'total': len(imglist), 'selected': len(selected), 'detected': detected,
+            'skipped': skipped, 'failed': len(failures), 'failed_pages': failures}
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description='偵測文字並分類為純色填充與圖像修補，保存新版專案。',
+        description=('不啟動圖形界面，偵測資料夾中的漫畫文字並保存專案。'
+                     '預設跳過已有結果；只有 --redetect 會重跑選定頁面。'),
     )
     parser.add_argument('img_dir', help='輸入圖片資料夾路徑')
     parser.add_argument(
         '--detector',
         choices=(DETECTOR_CTBD, DETECTOR_LEGACY_CTD, DETECTOR_RFDETR, DETECTOR_YSGYOLO),
-        default=DEFAULT_DETECTOR,
+        default=None,
         help=(
             '文字偵測模型；ctbd 使用 RT-DETR-V2 ONNX 模型，'
-            'rfdetr 使用 RF-DETR 分割模型，ysgyolo 使用 YSGYOLO 2.0，legacy_ctd 使用 CTD 模型。'
+            'rfdetr 使用 RF-DETR 分割模型，ysgyolo 使用 YSGYOLO 2.0，legacy_ctd 使用 CTD 模型；'
+            '未指定時沿用專案原模型，新專案使用 legacy_ctd。'
         ),
     )
-    args = parser.parse_args()
-    run(args.img_dir, args.detector)
+    parser.add_argument('--start-page', type=int, default=1, help='起始頁（依檔名自然排序，從 1 開始）')
+    parser.add_argument('--end-page', type=int, help='結束頁（包含此頁，預設最後一頁）')
+    parser.add_argument('--redetect', action='store_true', help='明確重跑選定範圍內已有結果')
+    parser.add_argument('--device', choices=('auto', 'cpu', 'mps', 'cuda'),
+                        help='運算裝置；CTD 和 CTBD 僅支援 auto/cpu')
+    parser.add_argument('--bubble', action=argparse.BooleanOptionalAction, default=None,
+                        help='本次是否啟用氣泡填充；未指定時沿用專案設定')
+    args = parser.parse_args(argv)
+    try:
+        result = run(args.img_dir, args.detector, start_page=args.start_page,
+                     end_page=args.end_page, redetect=args.redetect,
+                     device=args.device, bubble=args.bubble)
+    except Exception as exc:
+        print(f'無法開始偵測：{exc}', file=sys.stderr)
+        return 2
+    return 1 if result['failed'] else 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())
