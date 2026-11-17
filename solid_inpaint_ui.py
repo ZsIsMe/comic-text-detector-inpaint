@@ -496,6 +496,14 @@ class ImageView(QGraphicsView):
         if not self._suppress_view_changed:
             self.viewChanged.emit()
 
+    def keyPressEvent(self, event) -> None:
+        if (event.key() in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown)
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier):
+            # Let the window navigate pages instead of scrolling the graphics view.
+            event.ignore()
+            return
+        super().keyPressEvent(event)
+
     def set_qimage(self, image: QImage | None, keep_view: bool = False) -> None:
         if image is None:
             self.pixmap_item.setPixmap(QPixmap())
@@ -6268,10 +6276,10 @@ class MainWindow(QMainWindow):
                 and event.key() not in function_keys):
             super().keyPressEvent(event)
             return
-        if event.key() == Qt.Key.Key_A and event.modifiers() == Qt.KeyboardModifier.NoModifier:
+        if event.key() in (Qt.Key.Key_A, Qt.Key.Key_PageUp) and event.modifiers() == Qt.KeyboardModifier.NoModifier:
             self.previous_image()
             return
-        if event.key() == Qt.Key.Key_D and event.modifiers() == Qt.KeyboardModifier.NoModifier:
+        if event.key() in (Qt.Key.Key_D, Qt.Key.Key_PageDown) and event.modifiers() == Qt.KeyboardModifier.NoModifier:
             self.next_image()
             return
         pan = {
@@ -6998,8 +7006,8 @@ class MainWindow(QMainWindow):
             'Command/Ctrl + +：放大\n'
             'Command/Ctrl + -：縮小（保持頁面中心點）\n'
             '方向鍵：移動畫布\n'
-            'A：上一頁\n'
-            'D：下一頁\n'
+            'Page Up / A：上一頁\n'
+            'Page Down / D：下一頁\n'
             'F1：純色填充\n'
             'F2：圖像修補\n'
             'F3：恢復原圖（清除兩類）\n'

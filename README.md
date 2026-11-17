@@ -164,7 +164,8 @@ R：矩形
 F3：恢復原圖（左鍵清除兩類選區）
 [：縮小筆刷
 ]：放大筆刷
-A / D：上一頁／下一頁（輸入欄位內不觸發）
+Page Up / A：上一頁（輸入欄位內不觸發）
+Page Down / D：下一頁（輸入欄位內不觸發）
 方向鍵：移動畫布
 Ctrl+Z：撤銷
 Ctrl+Shift+Z：重做
@@ -221,6 +222,35 @@ Windows：
 命令列不讀寫 GUI 的全局偏好。結果保存為相同的 `ctd_inpainted/raw/` 專案資料，之後開 GUI 可直接繼續校正；不自動導出 PDF、PNG 或 PSD。終端會顯示偵測、跳過及失敗計數；退出碼 `0` 表示本次任務成功、`1` 表示有頁面失敗，`2` 表示參數或啟動錯誤。
 
 若原圖已變更、正式頁面資料缺失或損壞，預設回報問題，不以重新偵測悄悄覆蓋。不要同時從 GUI 與 CLI 修改同一個漫畫資料夾，專案尚無跨程序編輯鎖。
+
+## 命令列批量導出
+
+對單一 v2 工程或包含多個工程的總資料夾，可遞迴尋找 `ctd_inpainted/raw/project.json`，依自然順序逐工程導出。腳本只讀取已保存的原圖與正式頁面資料；先在 GUI 保存編輯，並避免同時修改正在導出的工程。這兩個批量入口目前只提供命令列。
+
+Windows 下批量導出待精修：
+
+```bat
+.venv\Scripts\python scripts\batch_export_refinement.py --root "D:\comics" --report-dir "D:\export-reports"
+```
+
+批量導出 PSD 素材、LaMa 修補 PNG 與分層 PSD：
+
+```bat
+.venv\Scripts\python scripts\batch_export_psd.py --root "D:\comics" --report-dir "D:\export-reports"
+```
+
+macOS 將 Python 路徑改為 `.venv/bin/python`，並使用對應的資料夾路徑即可。兩個腳本都可加 `--preflight-only`，僅檢查工程清單、檔名衝突、原圖簽章及正式頁面檔是否齊全，不執行導出或模型推論。正式導出會逐頁讀取並驗證圖片與選區；單工程失敗會記錄原因後繼續下一個。
+
+| 腳本 | 各工程內的輸出 | 驗證及續跑 |
+| --- | --- | --- |
+| `batch_export_refinement.py` | `ctd_inpainted/export_pair/` 的合成圖、`other_mask/`、`colored/` | 三組 PNG 逐張讀回比對像素，整工程驗收後發布；既有導出只在相同報告能驗證時跳過，其餘情況保留並回報失敗 |
+| `batch_export_psd.py` | `ctd_inpainted/psd_assets/` 的 `solid/`、`other_mask/`、`lama_large_512px/`、`psds/` | 沿用程式的兩階段流程，先完成本工程全部 LaMa PNG，再組裝 PSD；檢查素材像素、PSD 可讀性及新 PSD 圖層，已有 PSD 保留 |
+
+只有 PSD 導出會在 OTHER 非空時執行 LaMa，需已安裝 `requirements.txt` 並備妥已校驗的 LaMa 權重；不需要啟動 Photoshop。待精修標記圖沿用本機 GUI 的顏色及透明度設定。
+
+每完成一個工程即保存報告及 JSONL 進度；續跑時使用相同的 `--root` 和 `--report-dir`，腳本會核對正式資料與輸出檔雜湊，驗證通過才跳過。待精修報告為 `report.json`、`preflight.json`、`progress.jsonl`；PSD 報告為 `psd-report.json`、`psd-preflight.json`、`psd-progress.jsonl`，可放在同一報告目錄。
+
+PSD 報告的 `success` 表示輸出已確認對應目前資料。`preserved` 表示素材已更新，但已有 PSD 被保留，與目前資料的對應狀態為 `stale` 或 `unknown`，需要人工確認；腳本不自動覆寫或刪除這些 PSD。PSD 腳本退出碼：`0` 全部成功（或預檢全部通過）、`1` 有失敗或 `preserved`、`2` 參數或啟動錯誤。
 
 ## 輸出結構
 

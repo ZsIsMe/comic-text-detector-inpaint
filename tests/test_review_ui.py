@@ -117,6 +117,7 @@ class ReviewUiTests(unittest.TestCase):
         QTest.keyClicks(w.folder_path_input, 'a/d')
         QTest.keyClick(w.folder_path_input, Qt.Key.Key_Left)
         QTest.keyClick(w.folder_path_input, Qt.Key.Key_Right)
+        QTest.keyClick(w.folder_path_input, Qt.Key.Key_PageDown)
         self.assertEqual(w.folder_path_input.text(), 'a/d')
         self.assertEqual(w.list_widget.currentRow(), 0)
         w.page_jump_input.setFocus()
@@ -137,6 +138,12 @@ class ReviewUiTests(unittest.TestCase):
         QTest.keyClick(w.mask_view, Qt.Key.Key_D)
         self.assertEqual(w.list_widget.currentRow(), 1)
         QTest.keyClick(w.mask_view, Qt.Key.Key_A)
+        self.assertEqual(w.list_widget.currentRow(), 0)
+        QTest.keyClick(w.mask_view, Qt.Key.Key_PageDown, Qt.KeyboardModifier.ControlModifier)
+        self.assertEqual(w.list_widget.currentRow(), 0)
+        QTest.keyClick(w.mask_view, Qt.Key.Key_PageDown)
+        self.assertEqual(w.list_widget.currentRow(), 1)
+        QTest.keyClick(w.mask_view, Qt.Key.Key_PageUp)
         self.assertEqual(w.list_widget.currentRow(), 0)
 
     def test_return_jump_restores_canvas_focus_and_function_keys(self):
