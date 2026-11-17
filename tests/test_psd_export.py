@@ -81,12 +81,11 @@ class PsdExportTests(unittest.TestCase):
 
     def test_no_solid_omits_overlay_and_empty_other_does_not_load_lama(self):
         empty = np.zeros_like(self.other)
-        with patch('lama_inpainter.LamaLargeInpainter', side_effect=AssertionError('no weights')):
+        with patch.object(export, 'inpaint_other', side_effect=AssertionError('no inference')):
             self.assertTrue(export.export_page_psd(self.source, None, empty, self.destination))
         psd = PSDImage.open(self.destination)
-        self.assertEqual([layer.name for layer in psd], ['bg', 'lama_large_512px'])
-        self.assertTrue(psd[1].visible)
-        self.assertFalse(np.any(read_pixels(psd[1], 8)))
+        self.assertEqual([layer.name for layer in psd], ['bg'])
+        np.testing.assert_array_equal(read_pixels(psd[0], 8, 'color'), self.image[:, :, ::-1])
 
     def test_8_and_16bit_gray_and_bgra_preserve_background_precision_and_alpha(self):
         gray = np.arange(12 * 16, dtype=np.uint16).reshape(12, 16) * 311
@@ -277,16 +276,85 @@ class PsdExportTests(unittest.TestCase):
         self.assertEqual(destination.read_bytes(), b'previous generated repair')
         self.assertEqual([path.name for path in destination.parent.iterdir()], [destination.name])
 
-    def test_empty_other_exports_transparent_repair_png_without_loading_model(self):
-        destination = self.root / 'repair.png'
+    def test_empty_other_does_not_export_repair_png_or_create_directory(self):
+        destination = self.root / 'lama_large_512px' / '原圖.png'
         empty = np.zeros_like(self.other)
-        with patch('lama_inpainter.LamaLargeInpainter', side_effect=AssertionError('empty')):
-            export.export_repair_png(self.source, empty, destination)
-        actual = imread(destination, cv2.IMREAD_UNCHANGED)
-        self.assertEqual(actual.shape, (12, 16, 4))
-        self.assertFalse(np.any(actual))
-        with patch.object(export, 'inpaint_other', side_effect=AssertionError('use on-disk PNG')):
-            export.export_page_psd(self.source, None, empty, self.destination, repair_path=destination)
+        with patch.object(export, 'inpaint_other', side_effect=AssertionError('empty')):
+            self.assertIsNone(export.export_repair_png(self.source, empty, destination))
+        self.assertFalse(destination.exists())
+        self.assertFalse(destination.parent.exists())
+        with self.assertRaisesRegex(ValueError, '尺寸'):
+            export.export_repair_png(self.source, np.zeros((1, 1), np.uint8), destination)
+
+    def test_empty_other_removes_only_matching_entirely_zero_bgra_png(self):
+        destination = self.root / 'lama_large_512px' / '原圖.png'
+        destination.parent.mkdir()
+        empty = np.zeros_like(self.other)
+        imwrite(destination, np.zeros((*empty.shape, 4), np.uint8))
+        with patch.object(export, 'inpaint_other', side_effect=AssertionError('empty')):
+            self.assertIsNone(export.export_repair_png(self.source, empty, destination))
+        self.assertFalse(destination.exists())
+        # A transparent file with hidden RGB is not an old all-zero generated file.
+        for pixels in (np.full((*empty.shape, 4), 50, np.uint8),
+                       np.dstack((np.ones((*empty.shape, 3), np.uint8), empty)),
+                       np.zeros((1, 1, 4), np.uint8),
+                       np.zeros((*empty.shape, 3), np.uint8)):
+            with self.subTest(shape=pixels.shape):
+                imwrite(destination, pixels)
+                before = destination.read_bytes()
+                with patch.object(export, 'inpaint_other', side_effect=AssertionError('empty')):
+                    self.assertIsNone(export.export_repair_png(self.source, empty, destination))
+                self.assertEqual(destination.read_bytes(), before)
+        destination.write_bytes(b'bad PNG; preserve it')
+        before = destination.read_bytes()
+        self.assertIsNone(export.export_repair_png(self.source, empty, destination))
+        self.assertEqual(destination.read_bytes(), before)
+
+    def test_empty_other_ignores_repair_inputs_and_keeps_nonempty_solid_layer(self):
+        empty = np.zeros_like(self.other)
+        with patch.object(export, 'inpaint_other', side_effect=AssertionError('empty')):
+            self.assertTrue(export.export_page_psd(
+                self.source, self.overlay, empty, self.destination,
+                repair_path=self.root / 'missing.png', repair_rgba=np.ones((1, 1))))
+        psd = PSDImage.open(self.destination)
+        self.assertEqual([layer.name for layer in psd], ['bg', 'overlay-manual'])
+        np.testing.assert_array_equal(read_pixels(psd[1], 8), self.overlay[:, :, [2, 1, 0, 3]])
+
+    def test_mixed_empty_and_nonempty_project_keeps_two_phases_and_raw_unchanged(self):
+        from detect_solid_inpaint_folder import _ensure_dirs
+        second = self.root / '空頁.png'
+        imwrite(second, self.image)
+        paths = _ensure_dirs(str(self.root))
+        store.save_page(paths, self.source, {'overlay': self.overlay, 'other': self.other,
+                                           'edited': np.zeros_like(self.other)})
+        store.save_page(paths, second, store.empty_page(self.other.shape))
+        raw = Path(paths['raw'])
+        raw_before = files(raw)
+        sources_before = {p.name: p.read_bytes() for p in (self.source, second)}
+        assets = Path(paths['output']) / 'psd_assets'
+        stages = []
+        original_build = export.export_page_psd
+
+        def build(source, *args, **kwargs):
+            self.assertTrue((assets / 'lama_large_512px' / '原圖.png').exists())
+            self.assertFalse((assets / 'lama_large_512px' / '空頁.png').exists())
+            if Path(source) == second:
+                self.assertNotIn('repair_path', kwargs)
+            return original_build(source, *args, **kwargs)
+
+        with patch.object(export, 'inpaint_other', side_effect=repair) as inference, \
+                patch.object(export, 'export_page_psd', side_effect=build):
+            result = export.export_project_assets([self.source, second], paths,
+                                                  progress=lambda *v: stages.append(v))
+        inference.assert_called_once()
+        self.assertEqual(len(result['repair_pngs']), 1)
+        self.assertEqual(len(result['created']), 2)
+        self.assertEqual([event[0] for event in stages], ['LaMa 修補'] * 4 + ['PSD 組裝'] * 4)
+        self.assertEqual([event[4] for event in stages], [0, 1, 1, 2, 2, 3, 3, 4])
+        self.assertTrue(all(event[5] == 4 for event in stages))
+        self.assertEqual([p.name for p in PSDImage.open(assets / 'psds' / '空頁.psd')], ['bg'])
+        self.assertEqual(files(raw), raw_before)
+        self.assertEqual({p.name: p.read_bytes() for p in (self.source, second)}, sources_before)
 
 
 if __name__ == '__main__':

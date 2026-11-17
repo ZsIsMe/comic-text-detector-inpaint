@@ -34,7 +34,7 @@ ctd_inpainted/
   psd_assets/                  # 按需導出 PNG 與分層 PSD
     solid/01.png
     other_mask/01.png
-    lama_large_512px/01.png    # 先整批生成的 RGBA 透明修補圖
+    lama_large_512px/01.png    # OTHER 非空的頁面才生成 RGBA 透明修補圖
     psds/01.psd                # psd-tools 直接生成，含 LaMa 修補層
   psd/                        # Photoshop 腳本輸出
 ```
@@ -81,7 +81,7 @@ UI 以進度條和目前階段、該階段頁碼、檔名顯示進度，完成�
 - `overlay-manual`：正式保存的純色 overlay；Alpha 非零時才建立。
 - `lama_large_512px`：讀取同名透明修補 PNG，放置 LaMa 修補原圖 `other_mask > 0` 區域的普通 RGBA 圖層，預設顯示。
 
-LaMa 的 8-bit 修補 PNG 在 OTHER 內 Alpha 為 255，區外 RGBA 全為 0；PSD 修補層與此 PNG 同源，寫入 16-bit PSD 時按位深轉存，區內仍為完全不透明。新 PSD 不建立黑白 `other_mask` 圖層或 `OTHER_CHANNEL`。原有 `other_mask` PNG 仍維持黑白 Mask，`solid` PNG 仍維持透明填色 overlay。OTHER 為空時仍輸出全透明修補 PNG，但不載入或執行模型，PSD 可留下空透明的 LaMa 圖層。
+LaMa 的 8-bit 修補 PNG 在 OTHER 內 Alpha 為 255，區外 RGBA 全為 0；PSD 修補層與此 PNG 同源，寫入 16-bit PSD 時按位深轉存，區內仍為完全不透明。新 PSD 不建立黑白 `other_mask` 圖層或 `OTHER_CHANNEL`。原有 `other_mask` PNG 仍維持黑白 Mask，`solid` PNG 仍維持透明填色 overlay。OTHER 為空時不執行模型、不生成修補 PNG，PSD 也不建立 LaMa 圖層。重新導出該頁時只清理同名、尺寸相符且 RGBA 全零的舊修補 PNG；非空或損壞舊檔保留但不採用，已有 PSD 繼續遵守不覆寫規則。
 
 8-bit CMYK 或帶灰階 ICC 的來源會先轉為 sRGB，並寫入轉換後的 ICC。16-bit 灰階 ICC 或其他不能套用到 RGB PSD 的描述檔會明確報錯。
 

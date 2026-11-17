@@ -136,7 +136,7 @@ ctd_inpainted/raw/cache/<原圖檔名>.npz
 
 「導出 PSD 素材」先保存目前編輯，再由背景 worker 做兩階段整批導出。第一階段「LaMa 修補」完成全部 `psd_assets/solid`、`other_mask` 素材與 `psd_assets/lama_large_512px/<stem>.png` 透明修補圖；第二階段「PSD 組裝」才從原圖、solid 和落盤修補 PNG 生成 `psd_assets/psds/<stem>.psd`，不重跑模型。視窗顯示進度條、階段、該階段頁碼與檔名；整批以 2N 個頁面工作單位更新進度。
 
-PSD 自下而上為原圖 `bg`、有純色 Alpha 時才建立的 `overlay-manual`、預設顯示的 `lama_large_512px` 普通 RGBA 圖層；修補層內容必須與中間 PNG 同源。空 OTHER 仍輸出全透明修補 PNG，但不載入模型，可留下空透明修補層。LaMa 的 8-bit 修補輸出只在 `other_mask > 0` 處有內容與 Alpha 255，區外 RGBA 全為 0；寫入 16-bit PSD 時按位深轉存，保持區內完全不透明。不把黑白 OTHER 放成 PSD 圖層或 `OTHER_CHANNEL`，旁邊的黑白 `other_mask` PNG 仍保留。
+PSD 自下而上為原圖 `bg`、有純色 Alpha 時才建立的 `overlay-manual`、OTHER 非空時才建立並預設顯示的 `lama_large_512px` 普通 RGBA 圖層；修補層內容必須與中間 PNG 同源。空 OTHER 不執行推論、不生成修補 PNG，也不建立 LaMa 圖層；同頁已有尺寸相符且 RGBA 全零的舊修補 PNG 在重新導出時移除，非空或損壞舊檔保留且不採用。LaMa 的 8-bit 修補輸出只在 `other_mask > 0` 處有內容與 Alpha 255，區外 RGBA 全為 0；寫入 16-bit PSD 時按位深轉存，保持區內完全不透明。不把黑白 OTHER 放成 PSD 圖層或 `OTHER_CHANNEL`，旁邊的黑白 `other_mask` PNG 仍保留。
 
 新 PSD 保留原圖尺寸與位深；RGB 來源的既有 ICC 直接寫入，8-bit CMYK 或帶灰階 ICC 的來源先轉為 sRGB 並使用轉換後的 ICC。16-bit 灰階 ICC 或其他不能套用到 RGB PSD 的描述檔明確報錯，不能透過 8-bit 轉換降低精度。16-bit 背景保深，LaMa 輸入及修補內容使用 8-bit，不把整張背景降為 8-bit。每次明確導出依當次資料更新中間 PNG；已存在的同名 PSD 預設跳過，不覆寫 Photoshop 手改。舊 `create_psds_from_outputs.jsx` 可繼續選用，輸出仍為 `ctd_inpainted/psd/` 並沿用 `OTHER_CHANNEL` 流程，與程式直接生成的 `psd_assets/psds/` 分開。
 

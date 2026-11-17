@@ -13,7 +13,7 @@ import project_store as store
 import psd_export
 from image_io import imwrite
 from scripts import batch_export_psd as batch
-from scripts.batch_export_common import paths_for, preflight_project, raw_hashes
+from scripts.batch_export_common import paths_for, preflight_project, raw_hashes, sha256
 
 
 def repair(image, mask):
@@ -68,12 +68,83 @@ class BatchExportPsdTests(unittest.TestCase):
     def test_empty_page_without_npz_does_not_load_model_and_16bit_is_preserved(self):
         folder, image = self.project('empty16', empty=True, depth=16)
         self.assertFalse(store.page_path(paths_for(folder), image).exists())
-        with patch('lama_inpainter.LamaLargeInpainter', side_effect=AssertionError('no model')):
+        with patch.object(psd_export, 'inpaint_other', side_effect=AssertionError('no model')):
             record = batch.export_project(folder, preflight_project(folder))
         detail = next(iter(record['psd_details'].values()))
         self.assertEqual(detail['depth'], 16)
-        self.assertEqual(detail['layers'], ['bg', 'lama_large_512px'])
+        self.assertEqual(detail['layers'], ['bg'])
         self.assertEqual(record['status'], 'success')
+        self.assertEqual(record['png_files'], 2)
+        self.assertEqual(record['repair_pages'], 0)
+        self.assertEqual(len(record['export_hashes']), 3)
+        self.assertFalse((Path(record['output']) / 'lama_large_512px').exists())
+        self.assertTrue(batch.verified_resume(folder, record))
+
+    def test_mixed_pages_only_export_nonempty_repairs_and_resume(self):
+        second = self.folder / '02.png'
+        imwrite(second, np.full((8, 10, 3), 140, np.uint8))
+        paths = paths_for(self.folder)
+        store.update_project(paths['raw'], images=['01.png', '02.png'])
+        store.save_page(paths, second, store.empty_page((8, 10)))
+        before = raw_hashes(self.folder)
+        with patch.object(psd_export, 'inpaint_other', side_effect=repair) as infer:
+            record = batch.export_project(self.folder, preflight_project(self.folder))
+        infer.assert_called_once()
+        self.assertEqual(record['repair_pages'], 1)
+        self.assertEqual(record['png_files'], 5)
+        self.assertEqual(len(record['export_hashes']), 7)
+        self.assertFalse((Path(record['output']) / 'lama_large_512px' / '02.png').exists())
+        self.assertEqual(raw_hashes(self.folder), before)
+        self.assertTrue(batch.verified_resume(self.folder, record))
+
+    def test_legacy_empty_png_is_removed_but_old_psd_is_preserved_as_stale(self):
+        folder, image = self.project('legacy', empty=True)
+        record = self.export(folder)
+        output = Path(record['output'])
+        png = output / 'lama_large_512px' / '01.png'
+        png.parent.mkdir()
+        imwrite(png, np.zeros((8, 10, 4), np.uint8))
+        destination = Path(record['created'][0])
+        psd = PSDImage.open(destination)
+        psd.create_pixel_layer_from_array(np.zeros((8, 10, 4), np.uint8), name='lama_large_512px')
+        psd.save(destination)
+        before = destination.read_bytes()
+        record.pop('repair_policy')
+        record['export_hashes'][str(destination.relative_to(output))] = sha256(destination)
+        record['export_hashes'][str(png.relative_to(output))] = sha256(png)
+        self.assertFalse(batch.verified_resume(folder, record))
+        updated = self.export(folder, previous=record)
+        self.assertFalse(png.exists())
+        self.assertEqual(destination.read_bytes(), before)
+        self.assertEqual(updated['status'], 'preserved')
+        self.assertEqual(set(updated['psd_freshness'].values()), {'stale'})
+
+    def test_new_empty_report_detects_reintroduced_empty_png_and_cleans_it(self):
+        folder, image = self.project('empty', empty=True)
+        record = self.export(folder)
+        png = Path(record['output']) / 'lama_large_512px' / '01.png'
+        png.parent.mkdir()
+        imwrite(png, np.zeros((8, 10, 4), np.uint8))
+        self.assertFalse(batch.verified_resume(folder, record))
+        updated = self.export(folder, previous=record)
+        self.assertFalse(png.exists())
+        self.assertEqual(updated['status'], 'success')
+        self.assertTrue(batch.verified_resume(folder, updated))
+
+    def test_ignored_nonempty_or_corrupt_repair_is_preserved_and_does_not_block_resume(self):
+        folder, image = self.project('empty-leftover', empty=True)
+        record = self.export(folder)
+        png = Path(record['output']) / 'lama_large_512px' / '01.png'
+        png.parent.mkdir()
+        for content in (b'old damaged repair', b'changed damaged repair'):
+            png.write_bytes(content)
+            self.assertFalse(batch.verified_resume(folder, record))
+            record = self.export(folder, previous=record)
+            self.assertEqual(png.read_bytes(), content)
+            self.assertEqual(record['status'], 'success')
+            self.assertEqual(record['png_files'], 2)
+            self.assertEqual(len(record['unused_repair_hashes']), 1)
+            self.assertTrue(batch.verified_resume(folder, record))
 
     def test_existing_hand_edited_psd_is_preserved_without_layer_requirements(self):
         record = self.export()

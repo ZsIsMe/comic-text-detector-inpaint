@@ -119,16 +119,28 @@ def _validate_repair(repair, mask):
         raise ValueError('LaMa 圖層透明範圍與 OTHER 不一致。')
 
 
-def export_repair_png(source_path, other_mask, destination):
+def export_repair_png(source_path, other_mask, destination) -> str | None:
     """Generate and atomically save one original-size RGBA LaMa repair PNG.
 
     This helper does not import psd-tools or write source materials/project data.
-    Its PNG can be passed directly to export_page_psd(repair_path=...).
+    Its PNG can be passed directly to export_page_psd(repair_path=...). Empty
+    OTHER returns None without inference or creating an output directory. Only
+    an old, matching, entirely zero BGRA PNG is removed in that case.
     """
     background, _ = _source(source_path)
     mask = np.asarray(other_mask)
     if mask.shape != background.shape[:2]:
         raise ValueError(f'LaMa Mask 尺寸與原圖不一致：{source_path}')
+    if not np.any(mask > 0):
+        existing = _existing(destination)
+        if existing is not None and existing.is_file():
+            try:
+                old = imread(existing, cv2.IMREAD_UNCHANGED)
+            except (OSError, ValueError, cv2.error):
+                old = None
+            if old is not None and old.shape == (*mask.shape, 4) and not np.any(old):
+                existing.unlink()
+        return None
     repair = inpaint_other(background, mask)
     _validate_repair(repair, mask)
     bgra = cv2.cvtColor(repair, cv2.COLOR_RGBA2BGRA)
@@ -175,22 +187,25 @@ def export_page_psd(source_path, overlay_bgra, other_mask, destination, *,
     if overlay.shape != (height, width, 4) or mask.shape != (height, width):
         raise ValueError(f'PSD 素材尺寸與原圖不一致：{source_path}')
     depth = 16 if background.dtype == np.uint16 else 8
-    if repair_rgba is not None and repair_path is not None:
-        raise ValueError('repair_rgba 與 repair_path 只能指定一項。')
-    if repair_path is not None:
-        repair = imread(repair_path, cv2.IMREAD_UNCHANGED)
-        if repair is None or repair.ndim != 3 or repair.shape[2] != 4:
-            raise ValueError(f'LaMa PNG 必須是 RGBA：{repair_path}')
-        repair = cv2.cvtColor(repair, cv2.COLOR_BGRA2RGBA)
-    elif repair_rgba is not None:
-        repair = np.asarray(repair_rgba)
-    else:
-        repair = inpaint_other(background, mask)
-    _validate_repair(repair, mask)
+    repair = None
+    if np.any(mask > 0):
+        if repair_rgba is not None and repair_path is not None:
+            raise ValueError('repair_rgba 與 repair_path 只能指定一項。')
+        if repair_path is not None:
+            repair = imread(repair_path, cv2.IMREAD_UNCHANGED)
+            if repair is None or repair.ndim != 3 or repair.shape[2] != 4:
+                raise ValueError(f'LaMa PNG 必須是 RGBA：{repair_path}')
+            repair = cv2.cvtColor(repair, cv2.COLOR_BGRA2RGBA)
+        elif repair_rgba is not None:
+            repair = np.asarray(repair_rgba)
+        else:
+            repair = inpaint_other(background, mask)
+        _validate_repair(repair, mask)
     layers = [('bg', background, True)]
     if np.any(overlay[:, :, 3]):
         layers.append(('overlay-manual', _at_depth(overlay[:, :, [2, 1, 0, 3]], depth), True))
-    layers.append((MODEL_NAME, _at_depth(repair, depth), bool(lama_visible)))
+    if repair is not None:
+        layers.append((MODEL_NAME, _at_depth(repair, depth), bool(lama_visible)))
     # Three document channels avoid a separate composite "Alpha 1" channel.
     # RGBA layer arrays still retain their own native -1 transparency channels.
     psd = PSDImage.new('RGB', (width, height), depth=depth)
@@ -234,8 +249,9 @@ def export_psds_from_assets(images, assets_dir, *, overwrite=False, lama_visible
             progress('LaMa 修補', index, total, source.name, index - 1, total * 2)
         other = imread(root / 'other_mask' / f'{source.stem}.png', cv2.IMREAD_GRAYSCALE)
         repair_path = root / MODEL_NAME / f'{source.stem}.png'
-        export_repair_png(source, other, repair_path)
-        result['repair_pngs'].append(str(repair_path))
+        exported = export_repair_png(source, other, repair_path)
+        if exported is not None:
+            result['repair_pngs'].append(exported)
         if progress:
             progress('LaMa 修補', index, total, source.name, index, total * 2)
     for index, source in enumerate(images, 1):
@@ -248,9 +264,11 @@ def export_psds_from_assets(images, assets_dir, *, overwrite=False, lama_visible
             solid_path = root / 'solid' / f'{source.stem}.png'
             solid = imread(solid_path, cv2.IMREAD_UNCHANGED) if solid_path.exists() else None
             other = imread(root / 'other_mask' / f'{source.stem}.png', cv2.IMREAD_GRAYSCALE)
+            repair_options = ({'repair_path': root / MODEL_NAME / f'{source.stem}.png'}
+                              if np.any(other > 0) else {})
             created = export_page_psd(source, solid, other, destination,
                                       overwrite=overwrite, lama_visible=lama_visible,
-                                      repair_path=root / MODEL_NAME / f'{source.stem}.png')
+                                      **repair_options)
             result['created' if created else 'skipped'].append(str(destination))
         if progress:
             progress('PSD 組裝', index, total, source.name, total + index, total * 2)

@@ -26,6 +26,8 @@ from scripts.batch_export_common import (
     discover_projects, paths_for, preflight_project, raw_hashes, read_image, save_json, sha256,
 )
 
+REPAIR_POLICY = 'nonempty-other-v1'
+
 
 def verify_outputs(folder, images, created):
     """Validate current PNGs and read PSDs without imposing layers on hand edits."""
@@ -40,14 +42,19 @@ def verify_outputs(folder, images, created):
         base = read_image(source)
         page = store.load_page(paths, source, base.shape[:2])
         pngs = {name: root / name / f'{source.stem}.png'
-                for name in ('solid', 'other_mask', MODEL_NAME)}
-        solid, other, repair = (read_image(pngs[name]) for name in pngs)
+                for name in ('solid', 'other_mask')}
+        solid, other = (read_image(pngs[name]) for name in pngs)
         if not np.array_equal(solid, page['overlay']) or not np.array_equal(other, page['other']):
             raise ValueError(f'Saved page and exported PNGs differ: {source.name}')
-        if repair.ndim != 3 or repair.shape[2] != 4:
-            raise ValueError(f'Repair PNG is not BGRA: {source.name}')
-        repair_rgba = cv2.cvtColor(repair, cv2.COLOR_BGRA2RGBA)
-        psd_export._validate_repair(repair_rgba, other)
+        needs_repair = bool(np.any(other))
+        repair_path = root / MODEL_NAME / f'{source.stem}.png'
+        if needs_repair:
+            pngs[MODEL_NAME] = repair_path
+            repair = read_image(repair_path)
+            if repair.ndim != 3 or repair.shape[2] != 4:
+                raise ValueError(f'Repair PNG is not BGRA: {source.name}')
+            repair_rgba = cv2.cvtColor(repair, cv2.COLOR_BGRA2RGBA)
+            psd_export._validate_repair(repair_rgba, other)
         destination = psd_export._existing(root / 'psds' / f'{source.stem}.psd')
         if destination is None or not destination.is_file():
             raise ValueError(f'PSD output is missing: {source.name}')
@@ -60,7 +67,8 @@ def verify_outputs(folder, images, created):
             expected_names = ['bg']
             if np.any(solid[:, :, 3]):
                 expected_names.append('overlay-manual')
-            expected_names.append(MODEL_NAME)
+            if needs_repair:
+                expected_names.append(MODEL_NAME)
             depth = 16 if base.dtype == np.uint16 else 8
             if (psd.size != (base.shape[1], base.shape[0]) or psd.depth != depth
                     or psd.color_mode.name != 'RGB' or psd.channels != 3
@@ -70,21 +78,28 @@ def verify_outputs(folder, images, created):
             for layer in psd:
                 if layer.numpy() is None:
                     raise ValueError(f'New PSD layer cannot be decoded: {layer.name}')
-            maximum = (1 << depth) - 1
-            repair_pixels = np.rint(psd[-1].numpy() * maximum).astype(
-                np.uint16 if depth == 16 else np.uint8)
-            expected_repair = (repair_rgba.astype(np.uint16) * 257 if depth == 16 else repair_rgba)
-            if not np.array_equal(repair_pixels, expected_repair):
-                raise ValueError(f'PSD repair layer differs from repair PNG: {destination}')
+            if needs_repair:
+                maximum = (1 << depth) - 1
+                repair_pixels = np.rint(psd[-1].numpy() * maximum).astype(
+                    np.uint16 if depth == 16 else np.uint8)
+                expected_repair = (repair_rgba.astype(np.uint16) * 257 if depth == 16 else repair_rgba)
+                if not np.array_equal(repair_pixels, expected_repair):
+                    raise ValueError(f'PSD repair layer differs from repair PNG: {destination}')
         for file in (*pngs.values(), destination):
             hashes[str(file.relative_to(root))] = sha256(file)
+        unused_repair = None if needs_repair else psd_export._existing(repair_path)
         details[str(destination.relative_to(root))] = {
             'created': is_new, 'size': list(psd.size), 'depth': psd.depth,
             'layers': [layer.name for layer in psd],
             'materials': [str(p.relative_to(root)) for p in pngs.values()],
+            'repair_required': needs_repair,
+            'repair_policy_matches': needs_repair or not any(layer.name == MODEL_NAME for layer in psd),
+            'omitted_repair_png': None if needs_repair else str(repair_path.relative_to(root)),
+            'unused_repair_png': (str(unused_repair.relative_to(root))
+                                  if unused_repair is not None and unused_repair.is_file() else None),
         }
         print(f'  VERIFY {index}/{len(images)} {source.name}', flush=True)
-    if len(hashes) != len(images) * 4:
+    if len(hashes) != len(images) * 3 + sum(d['repair_required'] for d in details.values()):
         raise ValueError('Unexpected number of current PNG/PSD outputs')
     return hashes, details
 
@@ -93,13 +108,23 @@ def verified_resume(folder, previous):
     """Missing/corrupt exports invalidate resume; hand-edited PSDs are preserved."""
     if not previous or previous.get('status') not in ('success', 'preserved'):
         return False
+    if previous.get('repair_policy') != REPAIR_POLICY:
+        return False
     if raw_hashes(folder) != previous.get('raw_hashes'):
         return False
     expected = previous.get('export_hashes', {})
-    if not expected or len(expected) != previous.get('pages', 0) * 4:
+    repair_pages = previous.get('repair_pages')
+    if (not isinstance(repair_pages, int) or not 0 <= repair_pages <= previous.get('pages', 0)
+            or not expected or len(expected) != previous.get('pages', 0) * 3 + repair_pages):
         return False
     root = Path(paths_for(folder)['output']) / 'psd_assets'
     try:
+        if any(psd_export._existing(root / name) is not None
+               for name in previous.get('omitted_repair_pngs', [])):
+            return False
+        if any(not (root / name).is_file() or sha256(root / name) != digest
+               for name, digest in previous.get('unused_repair_hashes', {}).items()):
+            return False
         return all((root / name).is_file() and sha256(root / name) == digest
                    for name, digest in expected.items())
     except OSError:
@@ -127,6 +152,8 @@ def export_project(folder, images, previous=None):
     for name, detail in details.items():
         if detail['created']:
             freshness[name] = 'current'
+        elif not detail['repair_policy_matches']:
+            freshness[name] = 'stale'
         elif prior_raw and prior_raw != before:
             freshness[name] = 'stale'
         elif (prior_raw == before and prior_hashes.get(name) == hashes[name]
@@ -137,9 +164,17 @@ def export_project(folder, images, previous=None):
             # A previously diagnosed stale PSD stays stale until explicitly replaced.
             freshness[name] = ('stale' if prior_freshness.get(name) == 'stale' else 'unknown')
     current = all(value == 'current' for value in freshness.values())
+    repair_pages = sum(d['repair_required'] for d in details.values())
+    output = Path(paths['output']) / 'psd_assets'
     return {
         'status': 'success' if current else 'preserved', 'pages': len(images),
-        'png_files': len(images) * 3, 'created': result['created'], 'skipped': result['skipped'],
+        'repair_policy': REPAIR_POLICY, 'repair_pages': repair_pages,
+        'omitted_repair_pngs': [d['omitted_repair_png'] for d in details.values()
+                               if d['omitted_repair_png'] is not None and d['unused_repair_png'] is None],
+        'unused_repair_hashes': {d['unused_repair_png']: sha256(output / d['unused_repair_png'])
+                                for d in details.values() if d['unused_repair_png'] is not None},
+        'png_files': len(images) * 2 + repair_pages,
+        'created': result['created'], 'skipped': result['skipped'],
         'raw_hashes': before, 'export_hashes': hashes, 'psd_details': details,
         'psd_freshness': freshness, 'materials_current': True, 'psds_current': current,
         'output': str(Path(paths['output']) / 'psd_assets'),
