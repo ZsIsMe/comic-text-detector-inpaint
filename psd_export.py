@@ -7,10 +7,15 @@ Existing PSDs are skipped by default to protect subsequent Photoshop edits.
 from __future__ import annotations
 
 import io
+import hashlib
+import json
 import os
 from pathlib import Path
+import re
 import tempfile
+import time
 import unicodedata
+import uuid
 
 import cv2
 import numpy as np
@@ -19,6 +24,8 @@ from PIL import Image, ImageCms
 from image_io import imread, imwrite
 from lama_config import MODEL_NAME, MASK_EXPAND
 from lama_inpainter import inpaint_other
+
+REPAIR_WORKFLOW_ROOT = Path(__file__).resolve().parent / 'repair_workflows'
 
 
 def _api():
@@ -237,7 +244,7 @@ def export_repair_png(source_path, other_mask, destination, *, overlay_bgra=None
 
 def export_page_psd(source_path, overlay_bgra, other_mask, destination, *,
                     overwrite=False, lama_visible=True, repair_rgba=None, repair_path=None,
-                    edited=None, repair_mask=None):
+                    edited=None, repair_mask=None, repair_layers=()):
     """Create one PSD; return False when preserving an existing output.
 
     Input overlay uses the project's BGRA convention. LaMa receives RGB pixels,
@@ -289,6 +296,19 @@ def export_page_psd(source_path, overlay_bgra, other_mask, destination, *,
         layers.append(('overlay-manual', _at_depth(overlay[:, :, [2, 1, 0, 3]], depth), True))
     if repair is not None:
         layers.append((MODEL_NAME, _at_depth(repair, depth), bool(lama_visible)))
+    names = {layer[0] for layer in layers}
+    for entry in repair_layers:
+        name, pixels, visible = _additional_repair_layer(entry, (height, width))
+        if name in names:
+            raise ValueError(f'修補圖層名稱重複：{name}')
+        names.add(name)
+        if pixels is not None:
+            protected = overlay[:, :, 3] > 0
+            if edited is not None:
+                protected |= (np.asarray(edited) > 0) & ~_binary_other(other_mask)
+            if np.any((pixels[:, :, 3] > 0) & protected):
+                raise ValueError(f'修補圖層超出人工保護範圍：{name}')
+            layers.append((name, _at_depth(pixels, depth), visible))
     # Three document channels avoid a separate composite "Alpha 1" channel.
     # RGBA layer arrays still retain their own native -1 transparency channels.
     psd = PSDImage.new('RGB', (width, height), depth=depth)
@@ -315,7 +335,8 @@ def export_page_psd(source_path, overlay_bgra, other_mask, destination, *,
 
 
 def export_psds_from_assets(images, assets_dir, *, overwrite=False, lama_visible=True, progress=None,
-                            edited_loader=None):
+                            edited_loader=None, extra_methods=(), comfy_url='http://127.0.0.1:8188',
+                            model_map=None, export_name=None):
     """Generate all repair PNGs first, then build PSDs from those exact pixels.
 
     Existing solid/other_mask PNGs and project raw are read-only. Explicit export
@@ -328,12 +349,23 @@ def export_psds_from_assets(images, assets_dir, *, overwrite=False, lama_visible
     """
     images = validate_stems(images)
     root = Path(assets_dir)
-    if edited_loader is None and (root.parent / 'raw' / 'project.json').is_file():
-        project_folder = root.parent.parent.resolve()
-        if all(source.parent.resolve() == project_folder for source in images):
-            import project_store as store
-            raw_paths = {'raw': str(root.parent / 'raw')}
-            edited_loader = lambda source, shape: store.load_page(raw_paths, source, shape)['edited']
+    if edited_loader is None:
+        outputs = [root.parent]
+        if root.parent.name == 'ai_exports' and len(root.resolve().parents) > 2:
+            outputs.append(root.resolve().parents[2])
+        for output in outputs:
+            if ((output / 'raw' / 'project.json').is_file()
+                    and all(source.parent.resolve() == output.parent.resolve() for source in images)):
+                import project_store as store
+                raw_paths = {'raw': str(output / 'raw')}
+                edited_loader = lambda source, shape: store.load_page(raw_paths, source, shape)['edited']
+                break
+    if extra_methods or export_name is not None:
+        output, name = _multi_export_root(root, export_name)
+        return _export_multi_assets(images, root, output, export_name=name,
+            extra_methods=extra_methods, comfy_url=comfy_url, model_map=model_map,
+            edited_loader=edited_loader, overwrite=overwrite, lama_visible=lama_visible,
+            progress=progress)
     result = {'assets_dir': str(root), 'psds_dir': str(root / 'psds'),
               'repair_dir': str(root / MODEL_NAME), 'repair_mask_dir': str(root / 'repair_mask'),
               'repair_pngs': [], 'created': [], 'skipped': []}
@@ -375,12 +407,17 @@ def export_psds_from_assets(images, assets_dir, *, overwrite=False, lama_visible
     return result
 
 
-def export_project_assets(images, paths, *, overwrite=False, progress=None):
+def export_project_assets(images, paths, *, overwrite=False, progress=None, extra_methods=(),
+                          comfy_url='http://127.0.0.1:8188', model_map=None, export_name=None):
     """Export saved PNG materials and layered PSDs; never classify or modify raw."""
     import project_store as store
 
     images = validate_stems(images)
     root = Path(paths['output']) / 'psd_assets'
+    enhanced = bool(extra_methods) or export_name is not None
+    if enhanced:
+        root, export_name = _multi_export_root(root, export_name)
+        _read_multi_manifest(root, export_signature(extra_methods, comfy_url, model_map))
     for name in ('solid', 'other_mask'):
         (root / name).mkdir(parents=True, exist_ok=True)
     for source in images:
@@ -390,5 +427,304 @@ def export_project_assets(images, paths, *, overwrite=False, progress=None):
         page = store.load_page(paths, source, image.shape[:2])
         imwrite(root / 'solid' / f'{source.stem}.png', page['overlay'])
         imwrite(root / 'other_mask' / f'{source.stem}.png', page['other'])
+    edited_loader = lambda source, shape: store.load_page(paths, source, shape)['edited']
+    if enhanced:
+        return _export_multi_assets(images, root, root, export_name=export_name,
+            extra_methods=extra_methods, comfy_url=comfy_url, model_map=model_map,
+            edited_loader=edited_loader, overwrite=overwrite, progress=progress)
     return export_psds_from_assets(images, root, overwrite=overwrite, progress=progress,
-        edited_loader=lambda source, shape: store.load_page(paths, source, shape)['edited'])
+        edited_loader=edited_loader)
+
+
+def _additional_repair_layer(entry, shape):
+    """Read an independent difference layer; its mask is not limited to OTHER."""
+    if not isinstance(entry, dict):
+        raise ValueError('附加修補圖層必須為結構化資料。')
+    name = entry.get('name') or entry.get('method_id')
+    if not isinstance(name, str) or not name or name in ('bg', 'overlay-manual', MODEL_NAME):
+        raise ValueError('附加修補圖層名稱不符。')
+    path = entry.get('path') or entry.get('rgba_path')
+    if path is None:
+        if not entry.get('empty'):
+            raise ValueError(f'缺少修補 PNG：{name}')
+        return name, None, bool(entry.get('visible', False))
+    mask_path = entry.get('mask_path')
+    if not mask_path:
+        raise ValueError(f'缺少修補差分 Mask：{name}')
+    pixels = imread(path, cv2.IMREAD_UNCHANGED)
+    mask = imread(mask_path, cv2.IMREAD_UNCHANGED)
+    if (mask.shape != shape or mask.dtype != np.uint8
+            or not np.all((mask == 0) | (mask == 255))):
+        raise ValueError(f'修補差分 Mask 格式不符：{name}')
+    if pixels.ndim != 3 or pixels.shape[2] != 4:
+        raise ValueError(f'修補 PNG 必須為 RGBA：{name}')
+    rgba = cv2.cvtColor(pixels, cv2.COLOR_BGRA2RGBA)
+    _validate_repair(rgba, mask)
+    return name, rgba if np.any(mask) else None, bool(entry.get('visible', False))
+
+
+def _multi_export_root(assets_dir, export_name):
+    assets_dir = Path(assets_dir)
+    if export_name is None:
+        export_name = time.strftime('%Y%m%d-%H%M%S-') + uuid.uuid4().hex[:8]
+    if (not isinstance(export_name, str)
+            or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,79}', export_name) is None):
+        raise ValueError('export_name 必須為 1 到 80 字元的單一名稱，只能包含英數字、-、_。')
+    # Accept a returned run directory as an assets entry without nesting runs.
+    if assets_dir.parent.name == 'ai_exports':
+        assets_dir = assets_dir.parent.parent
+    return assets_dir / 'ai_exports' / export_name, export_name
+
+
+def export_signature(extra_methods=(), comfy_url='http://127.0.0.1:8188', model_map=None):
+    """Canonical configuration shared by enhanced exports and CLI resume."""
+    from lama_config import REPAIR_POLICY
+    if extra_methods:
+        from comfy_repair import validate_methods
+        methods = tuple(validate_methods(extra_methods))
+    else:
+        methods = ()
+    workflow_assets = {}
+    if methods:
+        setup_hash = _hash_file(REPAIR_WORKFLOW_ROOT / 'setup_manifest.json')
+        for method in methods:
+            folder = REPAIR_WORKFLOW_ROOT / method
+            workflow_assets[method] = {
+                'workflow_sha256': _hash_file(folder / 'workflow_api.json'),
+                'method_manifest_sha256': _hash_file(folder / 'manifest.json'),
+                'dependency_setup_manifest_sha256': setup_hash,
+            }
+    if model_map is not None and not isinstance(model_map, dict):
+        raise ValueError('model_map 必須為 JSON 物件。')
+    try:
+        model_map = json.loads(json.dumps(model_map or {}, sort_keys=True, ensure_ascii=False))
+    except (TypeError, ValueError) as exc:
+        raise ValueError('model_map 必須為可序列化的 JSON 物件。') from exc
+    return {'extra_methods': list(methods), 'comfy_url': comfy_url,
+            'model_map': model_map, 'lama_policy': REPAIR_POLICY,
+            'workflow_assets': workflow_assets, 'format': 2}
+
+
+def _hash_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _json_atomic(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f'.{path.stem}-', suffix='.json.tmp', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def _input_digest(source, solid, other, edited):
+    digest = hashlib.sha256()
+    digest.update(_hash_file(source).encode('ascii'))
+    for array in (solid, other, edited):
+        if array is None:
+            digest.update(b'none\0')
+        else:
+            value = np.ascontiguousarray(array)
+            digest.update(str(value.dtype).encode('ascii'))
+            digest.update(str(value.shape).encode('ascii'))
+            digest.update(value.tobytes())
+    return digest.hexdigest()
+
+
+def _read_multi_manifest(root, signature):
+    manifest_path = Path(root) / 'export_manifest.json'
+    previous = json.loads(manifest_path.read_text(encoding='utf-8')) if manifest_path.exists() else {}
+    if previous and previous.get('config') != signature:
+        raise ValueError('本次 export_name 已用於另一組模型或參數；請使用新名稱。')
+    return previous
+
+
+def _relative_artifacts(root, paths):
+    root = Path(root).resolve()
+    hashes = {}
+    for value in paths:
+        if value is None:
+            continue
+        path = Path(value).resolve()
+        try:
+            name = path.relative_to(root).as_posix()
+        except ValueError as exc:
+            raise ValueError(f'修補輸出不在本次目錄內：{path}') from exc
+        if not path.is_file():
+            raise ValueError(f'修補輸出遺失：{path}')
+        hashes[name] = _hash_file(path)
+    return hashes
+
+
+def _export_multi_assets(images, materials, root, *, export_name, extra_methods=(),
+                          comfy_url='http://127.0.0.1:8188', model_map=None,
+                          edited_loader=None, overwrite=False, lama_visible=True, progress=None):
+    """Finish all selected methods before assembling complete per-page PSDs."""
+    signature = export_signature(extra_methods, comfy_url, model_map)
+    methods = tuple(signature['extra_methods'])
+    root, materials = Path(root), Path(materials)
+    manifest_path = root / 'export_manifest.json'
+    previous = _read_multi_manifest(root, signature)
+    old_pages = previous.get('pages', {})
+    manifest = {'config': signature, 'export_name': export_name, 'pages': {}, 'complete': False}
+    result = {'assets_dir': str(root), 'psds_dir': str(root / 'psds'),
+              'repair_dir': str(root / MODEL_NAME), 'repair_mask_dir': str(root / 'repair_mask'),
+              'repair_pngs': [], 'created': [], 'skipped': [], 'preserved_stale': [],
+              'failed_pages': [], 'errors': {}, 'extra_methods': list(methods),
+              'export_name': export_name, 'manifest_path': str(manifest_path), 'complete': False}
+    total = len(images)
+    units, completed = total * (2 + len(methods)), 0
+    prepared = {}
+    client = None
+
+    def notify(stage, index, source):
+        if progress:
+            progress(stage, index, total, source.name, completed, units)
+
+    def fail(source, exc):
+        name = source.name
+        if name not in result['failed_pages']:
+            result['failed_pages'].append(name)
+        result['errors'][name] = str(exc)
+        manifest['pages'][name] = {'status': 'failed', 'error': str(exc)}
+        _json_atomic(manifest_path, manifest)
+
+    # Every page's selected materials finish before the first PSD assembly.
+    for index, source in enumerate(images, 1):
+        source = Path(source)
+        try:
+            notify('LaMa 修補', index, source)
+            solid_path = materials / 'solid' / f'{source.stem}.png'
+            solid = imread(solid_path, cv2.IMREAD_UNCHANGED) if solid_path.is_file() else None
+            other_path = materials / 'other_mask' / f'{source.stem}.png'
+            other = imread(other_path, cv2.IMREAD_GRAYSCALE)
+            edited = edited_loader(source, other.shape) if edited_loader is not None else None
+            background, _ = _source(source)
+            context, effective = prepare_repair_inputs(background, solid, other, edited)
+            protected = (solid[:, :, 3] > 0 if solid is not None else np.zeros(other.shape, bool))
+            original_other = _binary_other(other)
+            if edited is not None:
+                protected |= (np.asarray(edited) > 0) & ~original_other
+            input_digest = _input_digest(source, solid, other, edited)
+            outputs = []
+            for name, pixels in (('solid', solid), ('other_mask', other)):
+                if pixels is not None:
+                    destination = root / name / f'{source.stem}.png'
+                    if destination.resolve() != (materials / name / destination.name).resolve():
+                        _write_png_atomic(destination, pixels)
+                    outputs.append(destination)
+            mask_path = root / 'repair_mask' / f'{source.stem}.png'
+            lama_path = root / MODEL_NAME / f'{source.stem}.png'
+            exported = export_repair_png(source, other, lama_path, overlay_bgra=solid,
+                                          edited=edited, mask_destination=mask_path)
+            outputs.append(mask_path)
+            if exported:
+                outputs.append(exported)
+                result['repair_pngs'].append(exported)
+            completed += 1
+            notify('LaMa 修補', index, source)
+            extras = []
+            for method in methods:
+                notify(method, index, source)
+                if np.any(original_other):
+                    if client is None:
+                        from comfy_repair import ComfyRepairClient
+                        candidate = ComfyRepairClient(comfy_url, model_map=model_map)
+                        readiness = candidate.check(methods)
+                        if readiness is False or (isinstance(readiness, dict) and readiness.get('ready') is False):
+                            raise ValueError(f'ComfyUI 尚未就緒：{readiness}')
+                        client = candidate
+                    rgb8 = context[:, :, :3]
+                    if rgb8.dtype == np.uint16:
+                        rgb8 = (rgb8 >> 8).astype(np.uint8)
+                    response = client.run(method, rgb8.copy(), original_other.astype(np.uint8) * 255,
+                        root, key=source.stem, protected_mask=protected.copy())
+                else:
+                    response = {'method_id': method, 'empty': True, 'rgba_path': None,
+                                'mask_path': None, 'result_path': None, 'manifest_path': None}
+                entry = {'method_id': method, 'name': method, 'path': response.get('rgba_path'),
+                         'mask_path': response.get('mask_path'), 'empty': bool(response.get('empty')),
+                         'visible': False}
+                _, pixels, _ = _additional_repair_layer(entry, other.shape)
+                if pixels is not None and np.any((pixels[:, :, 3] > 0) & protected):
+                    raise ValueError(f'{method} 的修補差分覆蓋人工保護範圍。')
+                extras.append(entry)
+                for key in ('rgba_path', 'mask_path', 'result_path', 'manifest_path'):
+                    if response.get(key):
+                        outputs.append(response[key])
+                completed += 1
+                notify(method, index, source)
+            hashes = _relative_artifacts(root, outputs)
+            record = {'status': 'materials_ready', 'input_digest': input_digest,
+                      'material_hashes': hashes, 'extra_layers': extras}
+            manifest['pages'][source.name] = record
+            prepared[source.name] = {'source': source, 'extras': extras, 'record': record}
+            _json_atomic(manifest_path, manifest)
+        except Exception as exc:
+            fail(source, exc)
+            completed = index * (1 + len(methods))
+
+    for index, source in enumerate(images, 1):
+        source = Path(source)
+        notify('PSD 組裝', index, source)
+        page = prepared.get(source.name)
+        if page is not None:
+            destination = root / 'psds' / f'{source.stem}.psd'
+            record = page['record']
+            try:
+                solid_path = root / 'solid' / f'{source.stem}.png'
+                solid = imread(solid_path, cv2.IMREAD_UNCHANGED) if solid_path.is_file() else None
+                other = imread(root / 'other_mask' / f'{source.stem}.png', cv2.IMREAD_GRAYSCALE)
+                edited = edited_loader(source, other.shape) if edited_loader is not None else None
+                effective = imread(root / 'repair_mask' / f'{source.stem}.png', cv2.IMREAD_GRAYSCALE)
+                if _input_digest(source, solid, other, edited) != record['input_digest']:
+                    raise ValueError('原圖或頁面素材在兩個階段之間改變。')
+                artifact_paths = [root / name for name in record['material_hashes']]
+                if _relative_artifacts(root, artifact_paths) != record['material_hashes']:
+                    raise ValueError('修補素材在兩個階段之間改變。')
+                repair_options = {'repair_path': root / MODEL_NAME / f'{source.stem}.png'} if np.any(effective) else {}
+                created = export_page_psd(source, solid, other, destination,
+                    overwrite=overwrite, lama_visible=lama_visible, edited=edited,
+                    repair_mask=effective, repair_layers=page['extras'], **repair_options)
+                result['created' if created else 'skipped'].append(str(destination))
+                actual = _existing(destination)
+                digest = _hash_file(actual)
+                old = old_pages.get(source.name, {})
+                current = created or (old.get('status') == 'current'
+                    and old.get('input_digest') == record['input_digest']
+                    and old.get('material_hashes') == record['material_hashes']
+                    and old.get('psd_hash') == digest)
+                # Decode all layers even when retaining a previously certified PSD.
+                PSDImage, _, _ = _api()
+                saved = PSDImage.open(actual)
+                if saved.numpy() is None or any(layer.numpy() is None for layer in saved):
+                    raise ValueError('PSD 合成或圖層無法讀取。')
+                if (_relative_artifacts(root, artifact_paths) != record['material_hashes']
+                        or _input_digest(source, solid, other, edited) != record['input_digest']):
+                    raise ValueError('輸入或修補素材在 PSD 組裝期間改變。')
+                record.update(status='current' if current else 'preserved_stale',
+                              psd_path=str(actual), psd_hash=digest)
+                if not current:
+                    result['preserved_stale'].append(str(actual))
+                manifest['pages'][source.name] = record
+            except Exception as exc:
+                fail(source, exc)
+        completed += 1
+        notify('PSD 組裝', index, source)
+        _json_atomic(manifest_path, manifest)
+    result['complete'] = not result['failed_pages'] and not result['preserved_stale']
+    manifest['complete'] = result['complete']
+    _json_atomic(manifest_path, manifest)
+    result['artifact_hashes'] = _relative_artifacts(root,
+        [path for path in root.rglob('*') if path.is_file() and not path.name.endswith('.tmp')])
+    return result

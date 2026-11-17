@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import uuid
+from urllib.parse import urlsplit
 
 import cv2
 import numpy as np
@@ -290,7 +291,7 @@ class ControlServer(QObject):
         if method == 'get_job_status':
             job_id = params.get('job_id') or self.latest_job_id
             if job_id not in self.jobs:
-                raise ControlError('not_found', '找不到這次偵測任務。')
+                raise ControlError('not_found', '找不到這次背景任務。')
             return dict(self.jobs[job_id])
         if method == 'open_project':
             self._ensure_idle()
@@ -352,6 +353,9 @@ class ControlServer(QObject):
         if method == 'start_detection':
             self._ensure_idle()
             return self._start_detection(params)
+        if method == 'start_psd_export':
+            self._ensure_idle()
+            return self._start_psd_export(params)
         if method == 'get_page_view':
             return self._page_view(params)
         if method == 'get_review_bundle':
@@ -442,6 +446,101 @@ class ControlServer(QObject):
             w.settings.setValue(f'bubble/{key}', value)
         w.settings.sync()
         return dict(job)
+
+    def _start_psd_export(self, params):
+        """Flush the GUI before dispatching an optional multi-method export."""
+        w = self.window
+        if not w.folder or not w.paths or not w.imglist:
+            raise ControlError('no_project', '目前專案沒有圖片。')
+        allowed = {'extra_methods', 'start_page', 'end_page', 'comfy_url', 'model_map', 'export_name'}
+        if set(params) - allowed:
+            raise ControlError('bad_request', 'PSD 導出包含未知參數。')
+        try:
+            from comfy_repair import validate_methods
+            methods = validate_methods(params.get('extra_methods', []))
+        except (TypeError, ValueError) as exc:
+            raise ControlError('bad_request', str(exc)) from exc
+        start, end = params.get('start_page', 1), params.get('end_page')
+        end = len(w.imglist) if end is None else end
+        if type(start) is not int or type(end) is not int or not 1 <= start <= end <= len(w.imglist):
+            raise ControlError('bad_request', 'PSD 導出頁面範圍無效。')
+        url = params.get('comfy_url', 'http://127.0.0.1:8188')
+        try:
+            parts = urlsplit(url)
+            valid_url = (parts.scheme in ('http', 'https') and bool(parts.hostname)
+                         and not parts.username and not parts.password
+                         and not parts.query and not parts.fragment)
+            _ = parts.port
+        except (TypeError, ValueError, AttributeError):
+            valid_url = False
+        if not valid_url:
+            raise ControlError('bad_request', 'ComfyUI 地址須為 HTTP／HTTPS 服務地址。')
+        model_map = params.get('model_map')
+        if model_map is not None:
+            if not isinstance(model_map, dict) or set(model_map) - set(methods):
+                raise ControlError('bad_request', 'model_map 只可指定所選修補方法。')
+            for mapping in model_map.values():
+                if (not isinstance(mapping, dict) or set(mapping) - {'unet', 'clip', 'vae'}
+                        or any(not isinstance(value, str) or not value.strip() for value in mapping.values())):
+                    raise ControlError('bad_request', 'model_map 須以 unet／clip／vae 指定模型文件名。')
+        export_name = params.get('export_name')
+        if export_name is not None and (not isinstance(export_name, str) or not 1 <= len(export_name) <= 80
+                or export_name[0] not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+                or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for c in export_name)):
+            raise ControlError('bad_request', 'export_name 只可使用 1–80 個英數字、底線或連字號。')
+        if w.current_img_path and (w.current_base is None or w.current_page is None):
+            raise ControlError('page_unavailable', '目前頁面未能載入，無法確認保存。')
+        self._flush()
+        job_id = uuid.uuid4().hex
+        if methods and export_name is None:
+            export_name = job_id
+        images = w.imglist[start - 1:end]
+        options = {'extra_methods': list(methods), 'comfy_url': url,
+                   'model_map': model_map, 'export_name': export_name}
+        job = {'job_id': job_id, 'kind': 'psd_export', 'state': 'running',
+               'stage': '準備素材', 'current': 0, 'total': len(images),
+               'completed_units': 0, 'total_units': None, 'name': None,
+               'error': None, 'failed_pages': [], 'folder': w.folder,
+               'start_page': start, 'end_page': end, 'extra_methods': list(methods),
+               'export_name': export_name, 'image_names': [Path(p).name for p in images]}
+        self.jobs[job_id] = job
+        previous_id = self.latest_job_id
+        self.latest_job_id = job_id
+
+        def attach(worker):
+            worker.progress.connect(lambda *args, jid=job_id: self._psd_job_progress(jid, *args))
+            worker.finished.connect(lambda result, jid=job_id: self._psd_job_finished(jid, result))
+            worker.failed.connect(lambda message, jid=job_id: self._job_failed(jid, message))
+
+        try:
+            started = w.start_psd_export(images, options=options, silent=True, on_worker_ready=attach)
+        except Exception:
+            self.jobs.pop(job_id, None)
+            self.latest_job_id = previous_id
+            raise
+        if not started:
+            self.jobs.pop(job_id, None)
+            self.latest_job_id = previous_id
+            raise ControlError('start_failed', w._last_control_error or 'PSD 導出未啟動。')
+        for old_id in list(self.jobs)[:-20]:
+            self.jobs.pop(old_id, None)
+        return dict(job)
+
+    def _psd_job_progress(self, job_id, stage, current, total, name, completed, units):
+        if job_id in self.jobs:
+            self.jobs[job_id].update(stage=stage, current=current, total=total, name=name,
+                                     completed_units=completed, total_units=units)
+
+    def _psd_job_finished(self, job_id, result):
+        if job_id not in self.jobs:
+            return
+        complete = (result.get('complete', True) and not result.get('failed_pages')
+                    and not result.get('preserved_stale'))
+        self.jobs[job_id].update(state='completed' if complete else 'incomplete',
+                                 stage='完成' if complete else '未全部完成',
+                                 failed_pages=result.get('failed_pages', []),
+                                 error=None if complete else '部分頁面失敗或既有 PSD 未更新；請查看結果。',
+                                 result=result)
 
     @staticmethod
     def _validate_detector_params(detector, values):

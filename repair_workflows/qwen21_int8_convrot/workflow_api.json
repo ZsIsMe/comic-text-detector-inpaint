@@ -1,0 +1,244 @@
+{
+  "1": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "__IMAGE__.png"
+    }
+  },
+  "2": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "__MASK__.png"
+    }
+  },
+  "3": {
+    "class_type": "ImageToMask",
+    "inputs": {
+      "channel": "red",
+      "image": [
+        "2",
+        0
+      ]
+    }
+  },
+  "4": {
+    "class_type": "ThresholdMask",
+    "inputs": {
+      "value": 0.5,
+      "mask": [
+        "3",
+        0
+      ]
+    }
+  },
+  "5": {
+    "class_type": "GrowMaskWithBlur",
+    "inputs": {
+      "expand": 0,
+      "incremental_expandrate": 0,
+      "tapered_corners": true,
+      "flip_input": false,
+      "blur_radius": 0,
+      "lerp_alpha": 1,
+      "decay_factor": 1,
+      "fill_holes": true,
+      "mask": [
+        "4",
+        0
+      ]
+    }
+  },
+  "6": {
+    "class_type": "GrowMask",
+    "inputs": {
+      "expand": 8,
+      "tapered_corners": true,
+      "mask": [
+        "5",
+        0
+      ]
+    }
+  },
+  "7": {
+    "class_type": "MaskToImage",
+    "inputs": {
+      "mask": [
+        "6",
+        0
+      ]
+    }
+  },
+  "8": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "qwen_image_2.1_int8_convrot.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "9": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen3vl_8b_int8_convrot.safetensors",
+      "type": "qwen_image",
+      "device": "default"
+    }
+  },
+  "10": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "qwen_image_2.1_vae_bf16.safetensors"
+    }
+  },
+  "11": {
+    "class_type": "QwenImage21Cache",
+    "inputs": {
+      "device": "auto",
+      "dtype": "default",
+      "model": [
+        "8",
+        0
+      ]
+    }
+  },
+  "12": {
+    "class_type": "TextEncodeQwenImage21",
+    "inputs": {
+      "prompt": "移除遮罩区域内的普通文字、漫画拟声词、效果字及残留笔画，根据周围内容自然补全被文字遮挡的部分，保持原有色彩、明暗、线条、纹理与画风一致。文字位于气泡或文字框内时，保留其原有底色、透明效果、边框、形状和尾巴，不用背后的景物替代。保持人物、物体、构图及遮罩外区域不变，不新增画面元素，不生成任何文字、字母、数字或符号。",
+      "negative_prompt": "",
+      "resolution": 0,
+      "clip": [
+        "9",
+        0
+      ],
+      "images.image_1": [
+        "1",
+        0
+      ],
+      "vae": [
+        "10",
+        0
+      ],
+      "images.image_2": [
+        "7",
+        0
+      ]
+    }
+  },
+  "13": {
+    "class_type": "KSampler",
+    "inputs": {
+      "seed": 0,
+      "steps": 25,
+      "cfg": 1,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1,
+      "model": [
+        "21",
+        0
+      ],
+      "positive": [
+        "12",
+        0
+      ],
+      "negative": [
+        "12",
+        1
+      ],
+      "latent_image": [
+        "12",
+        2
+      ]
+    }
+  },
+  "14": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "13",
+        0
+      ],
+      "vae": [
+        "10",
+        0
+      ]
+    }
+  },
+  "15": {
+    "class_type": "SplitImageWithAlpha",
+    "inputs": {
+      "image": [
+        "14",
+        0
+      ]
+    }
+  },
+  "16": {
+    "class_type": "GetImageSize",
+    "inputs": {
+      "image": [
+        "1",
+        0
+      ]
+    }
+  },
+  "17": {
+    "class_type": "ImageScale",
+    "inputs": {
+      "upscale_method": "lanczos",
+      "width": [
+        "16",
+        0
+      ],
+      "height": [
+        "16",
+        1
+      ],
+      "crop": "disabled",
+      "image": [
+        "15",
+        0
+      ]
+    }
+  },
+  "18": {
+    "class_type": "ImageCompositeMasked",
+    "inputs": {
+      "x": 0,
+      "y": 0,
+      "resize_source": false,
+      "destination": [
+        "1",
+        0
+      ],
+      "source": [
+        "17",
+        0
+      ],
+      "mask": [
+        "6",
+        0
+      ]
+    }
+  },
+  "19": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "filename_prefix": "SolidInpaint/qwen21_int8_convrot",
+      "images": [
+        "18",
+        0
+      ]
+    }
+  },
+  "21": {
+    "class_type": "ModelAttentionBackend",
+    "inputs": {
+      "attention": "comfy kitchen attention",
+      "model": [
+        "11",
+        0
+      ]
+    }
+  }
+}

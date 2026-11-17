@@ -1,0 +1,4 @@
+interface:
+  display_name: "漫畫 PSD 修復素材導出"
+  short_description: "導出 LaMa 或可選 Klein、Qwen 修復素材並合成分層 PSD"
+  default_prompt: "使用 $comic-psd-export，按指定方法導出漫畫修復素材並同步組裝 PSD，保留原圖及既有成品，核對完成狀態。"

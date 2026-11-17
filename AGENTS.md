@@ -4,6 +4,8 @@
 
 漫畫去字的「開始偵測 → 逐頁校正 → 保存」工作流使用專案 Skill：[comic-detect-review](.agents/skills/comic-detect-review/SKILL.md)。
 
+AI 導出修復 PNG 及分層 PSD、配置可選的 Klein／Qwen ComfyUI 方法，使用 [comic-psd-export](.agents/skills/comic-psd-export/SKILL.md)。所有必要工作流和工具須在本倉庫交付，不能依賴作者其他工程或固定盤符；模型權重不提交 Git。
+
 ## 子代理委派
 
 本專案已在 `.codex/agents/` 配置 `explorer` 和 `worker`。對需要追查程式碼路徑、跨檔分析或修改程式的任務，主代理應主動委派適合的子代理，不必等使用者每次點名模型。

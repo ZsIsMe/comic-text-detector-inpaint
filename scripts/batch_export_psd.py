@@ -108,8 +108,12 @@ def verify_outputs(folder, images, created):
     return hashes, details
 
 
-def verified_resume(folder, previous):
+def verified_resume(folder, previous, *, extra_methods=(), comfy_url='http://127.0.0.1:8188',
+                    model_map=None, export_name=None):
     """Missing/corrupt exports invalidate resume; hand-edited PSDs are preserved."""
+    if extra_methods or export_name is not None or (previous or {}).get('kind') == 'multi_psd':
+        return _verified_multi_resume(folder, previous, extra_methods=extra_methods,
+            comfy_url=comfy_url, model_map=model_map, export_name=export_name)
     if not previous or previous.get('status') not in ('success', 'preserved'):
         return False
     if previous.get('repair_policy') != REPAIR_POLICY:
@@ -135,7 +139,11 @@ def verified_resume(folder, previous):
         return False
 
 
-def export_project(folder, images, previous=None):
+def export_project(folder, images, previous=None, *, extra_methods=(),
+                   comfy_url='http://127.0.0.1:8188', model_map=None, export_name=None):
+    if extra_methods or export_name is not None:
+        return _export_multi_project(folder, images, previous, extra_methods=extra_methods,
+            comfy_url=comfy_url, model_map=model_map, export_name=export_name)
     before = raw_hashes(folder)
     paths = paths_for(folder)
 
@@ -190,7 +198,93 @@ def export_project(folder, images, previous=None):
     }
 
 
-def run(root, report_dir, *, preflight_only=False):
+def _verified_multi_resume(folder, previous, *, extra_methods, comfy_url, model_map, export_name):
+    if not previous or previous.get('status') not in ('success', 'preserved'):
+        return False
+    signature = psd_export.export_signature(extra_methods, comfy_url, model_map)
+    if (previous.get('kind') != 'multi_psd' or previous.get('signature') != signature
+            or raw_hashes(folder) != previous.get('raw_hashes')
+            or (export_name is not None and previous.get('export_name') != export_name)):
+        return False
+    try:
+        expected_root, _ = psd_export._multi_export_root(
+            Path(paths_for(folder)['output']) / 'psd_assets', previous.get('export_name'))
+        root = Path(previous['output'])
+        if root.resolve() != expected_root.resolve():
+            return False
+        hashes = previous.get('export_hashes', {})
+        if not hashes or not all((root / name).is_file() and sha256(root / name) == digest
+                                 for name, digest in hashes.items()):
+            return False
+        manifest = json.loads((root / 'export_manifest.json').read_text(encoding='utf-8'))
+        if manifest.get('config') != signature:
+            return False
+        paths = paths_for(folder)
+        images = preflight_project(folder)
+        if set(manifest.get('pages', {})) != {Path(p).name for p in images}:
+            return False
+        for source in images:
+            image = read_image(source)
+            page = store.load_page(paths, source, image.shape[:2])
+            record = manifest['pages'][Path(source).name]
+            if (record.get('status') not in ('current', 'preserved_stale')
+                    or record.get('input_digest') != psd_export._input_digest(
+                        source, page['overlay'], page['other'], page['edited'])):
+                return False
+        return True
+    except (OSError, ValueError, KeyError):
+        return False
+
+
+def _export_multi_project(folder, images, previous, *, extra_methods, comfy_url, model_map, export_name):
+    before = raw_hashes(folder)
+    signature = psd_export.export_signature(extra_methods, comfy_url, model_map)
+    if (export_name is None and previous and previous.get('kind') == 'multi_psd'
+            and previous.get('signature') == signature):
+        export_name = previous.get('export_name')
+
+    def progress(stage, page, pages, filename, completed, total):
+        print(f'  {stage} {page}/{pages} {filename} [{completed}/{total}]', flush=True)
+
+    try:
+        result = psd_export.export_project_assets(images, paths_for(folder), overwrite=False,
+            progress=progress, extra_methods=extra_methods, comfy_url=comfy_url,
+            model_map=model_map, export_name=export_name)
+        output = Path(result['assets_dir'])
+        manifest = json.loads(Path(result['manifest_path']).read_text(encoding='utf-8'))
+        details = {}
+        for source in images:
+            source = Path(source)
+            record = manifest['pages'].get(source.name, {})
+            if record.get('status') not in ('current', 'preserved_stale'):
+                continue
+            from psd_tools import PSDImage
+            psd_path = Path(record['psd_path'])
+            psd = PSDImage.open(psd_path)
+            if psd.numpy() is None or any(layer.numpy() is None for layer in psd):
+                raise ValueError(f'PSD cannot be decoded: {psd_path}')
+            details[psd_path.relative_to(output).as_posix()] = {
+                'size': list(psd.size), 'depth': psd.depth, 'layers': [layer.name for layer in psd],
+                'status': record['status'], 'material_hashes': record['material_hashes']}
+        hashes = psd_export._relative_artifacts(output,
+            [p for p in output.rglob('*') if p.is_file() and not p.name.endswith('.tmp')])
+    finally:
+        if raw_hashes(folder) != before:
+            raise RuntimeError('Authoritative raw data changed during PSD export')
+    status = ('success' if result['complete'] else
+              'failed' if result['failed_pages'] else 'preserved')
+    return {'kind': 'multi_psd', 'status': status, 'pages': len(images), 'signature': signature,
+            'export_name': result['export_name'], 'output': str(output),
+            'created': result['created'], 'skipped': result['skipped'],
+            'failed_pages': result['failed_pages'], 'errors': result['errors'],
+            'preserved_stale': result['preserved_stale'], 'complete': result['complete'],
+            'raw_hashes': before, 'export_hashes': hashes, 'psd_details': details,
+            'materials_current': not result['failed_pages'], 'psds_current': result['complete'],
+            'png_files': sum(name.lower().endswith('.png') for name in hashes)}
+
+
+def run(root, report_dir, *, preflight_only=False, extra_methods=(),
+        comfy_url='http://127.0.0.1:8188', model_map=None, export_name=None):
     root = Path(root).resolve(strict=True)
     report_dir = Path(report_dir).resolve()
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -198,12 +292,18 @@ def run(root, report_dir, *, preflight_only=False):
     previous = json.loads(report_path.read_text(encoding='utf-8')) if report_path.exists() else {}
     if previous and previous.get('root') != str(root):
         raise ValueError('Report directory belongs to a different source root')
+    enhanced = bool(extra_methods) or export_name is not None
+    options = ({'extra_methods': extra_methods, 'comfy_url': comfy_url,
+                'model_map': model_map, 'export_name': export_name} if enhanced else {})
+    signature = psd_export.export_signature(extra_methods, comfy_url, model_map) if enhanced else None
     folders = discover_projects(root)
     if not folders:
         raise ValueError('No v2 projects found')
     report = {'root': str(root), 'kind': 'psd',
               'started': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
               'preflight_only': preflight_only, 'projects': {}}
+    if enhanced:
+        report['signature'] = signature
     queue = []
     for index, folder in enumerate(folders, 1):
         key = str(folder.relative_to(root))
@@ -225,11 +325,11 @@ def run(root, report_dir, *, preflight_only=False):
             started = time.monotonic()
             prior = previous.get('projects', {}).get(key)
             try:
-                if verified_resume(folder, prior):
+                if verified_resume(folder, prior, **options):
                     record = dict(prior, resumed=True, created_this_run=0, skipped_this_run=len(images))
                     print('  VERIFIED PREVIOUS OUTPUTS', flush=True)
                 else:
-                    record = export_project(folder, images, prior)
+                    record = export_project(folder, images, prior, **options)
                     record['created_this_run'] = len(record['created'])
                     record['skipped_this_run'] = len(record['skipped'])
             except Exception as exc:
@@ -257,9 +357,17 @@ def main(argv=None):
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--report-dir', type=Path, required=True)
     parser.add_argument('--preflight-only', action='store_true')
+    parser.add_argument('--extra-methods', nargs='*', default=[],
+                        help='Additional methods: klein9b_fp8_lanpaint qwen21_int8_convrot')
+    parser.add_argument('--comfy-url', default='http://127.0.0.1:8188')
+    parser.add_argument('--model-map', type=Path, help='JSON file with ComfyUI model role mappings')
+    parser.add_argument('--export-name', help='Reuse a named isolated export for resuming')
     args = parser.parse_args(argv)
     try:
-        return run(args.root, args.report_dir, preflight_only=args.preflight_only)
+        model_map = json.loads(args.model_map.read_text(encoding='utf-8')) if args.model_map else None
+        return run(args.root, args.report_dir, preflight_only=args.preflight_only,
+            extra_methods=args.extra_methods, comfy_url=args.comfy_url,
+            model_map=model_map, export_name=args.export_name)
     except (OSError, ValueError) as exc:
         print(f'STARTUP FAILED: {exc}', file=sys.stderr, flush=True)
         return 2

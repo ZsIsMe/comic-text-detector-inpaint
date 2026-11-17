@@ -1,0 +1,278 @@
+{
+  "297": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "__IMAGE__.png"
+    }
+  },
+  "304": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "__MASK__.png"
+    }
+  },
+  "400": {
+    "class_type": "ImageToMask",
+    "inputs": {
+      "channel": "red",
+      "image": [
+        "304",
+        0
+      ]
+    }
+  },
+  "401": {
+    "class_type": "GrowMask",
+    "inputs": {
+      "expand": 8,
+      "tapered_corners": true,
+      "mask": [
+        "400",
+        0
+      ]
+    }
+  },
+  "398": {
+    "class_type": "InpaintCropImproved",
+    "inputs": {
+      "downscale_algorithm": "bilinear",
+      "upscale_algorithm": "bicubic",
+      "preresize": false,
+      "preresize_mode": "ensure minimum resolution",
+      "preresize_min_width": 1024,
+      "preresize_min_height": 1024,
+      "preresize_max_width": 16384,
+      "preresize_max_height": 16384,
+      "mask_fill_holes": true,
+      "mask_expand_pixels": 0,
+      "mask_invert": false,
+      "mask_blend_pixels": 32,
+      "mask_hipass_filter": 0.1,
+      "extend_for_outpainting": false,
+      "extend_up_factor": 1,
+      "extend_down_factor": 1,
+      "extend_left_factor": 1,
+      "extend_right_factor": 1,
+      "context_from_mask_extend_factor": 1.2,
+      "output_resize_to_target_size": true,
+      "output_target_width": 1024,
+      "output_target_height": 1024,
+      "output_padding": "32",
+      "device_mode": "gpu (much faster)",
+      "image": [
+        "297",
+        0
+      ],
+      "mask": [
+        "401",
+        0
+      ]
+    }
+  },
+  "284": {
+    "class_type": "LayerUtility: ColorImage V2",
+    "inputs": {
+      "size": "custom",
+      "custom_width": 512,
+      "custom_height": 512,
+      "color": "#FFFFFF",
+      "size_as": [
+        "398",
+        1
+      ]
+    }
+  },
+  "295": {
+    "class_type": "LayerUtility: ImageBlend",
+    "inputs": {
+      "invert_mask": true,
+      "blend_mode": "normal",
+      "opacity": 100,
+      "background_image": [
+        "284",
+        0
+      ],
+      "layer_image": [
+        "398",
+        1
+      ],
+      "layer_mask": [
+        "398",
+        2
+      ]
+    }
+  },
+  "268": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen_3_8b_fp8mixed.safetensors",
+      "type": "flux2",
+      "device": "default"
+    }
+  },
+  "272": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "flux2-vae.safetensors"
+    }
+  },
+  "269": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "flux-2-klein-9b-fp8.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "281": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "移除遮罩区域内的普通文字、漫画拟声词、效果字及残留笔画，根据周围内容自然补全被文字遮挡的部分，保持原有色彩、明暗、线条、纹理与画风一致。文字位于气泡或文字框内时，保留其原有底色、透明效果、边框、形状和尾巴，不用背后的景物替代。保持人物、物体、构图及遮罩外区域不变，不新增画面元素，不生成任何文字、字母、数字或符号。",
+      "clip": [
+        "268",
+        0
+      ]
+    }
+  },
+  "294": {
+    "class_type": "VAEEncode",
+    "inputs": {
+      "pixels": [
+        "295",
+        0
+      ],
+      "vae": [
+        "272",
+        0
+      ]
+    }
+  },
+  "273": {
+    "class_type": "ReferenceLatent",
+    "inputs": {
+      "conditioning": [
+        "281",
+        0
+      ],
+      "latent": [
+        "294",
+        0
+      ]
+    }
+  },
+  "274": {
+    "class_type": "ConditioningZeroOut",
+    "inputs": {
+      "conditioning": [
+        "281",
+        0
+      ]
+    }
+  },
+  "275": {
+    "class_type": "ReferenceLatent",
+    "inputs": {
+      "conditioning": [
+        "274",
+        0
+      ],
+      "latent": [
+        "294",
+        0
+      ]
+    }
+  },
+  "318": {
+    "class_type": "LanPaint_KSampler",
+    "inputs": {
+      "seed": 906758784677861,
+      "steps": 4,
+      "cfg": 1,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1,
+      "LanPaint_NumSteps": 2,
+      "LanPaint_PromptMode": "Image First",
+      "LanPaint_Info": "LanPaint KSampler.",
+      "Inpainting_mode": "🖼️ Image Inpainting",
+      "model": [
+        "404",
+        0
+      ],
+      "positive": [
+        "273",
+        0
+      ],
+      "negative": [
+        "275",
+        0
+      ],
+      "latent_image": [
+        "403",
+        0
+      ]
+    }
+  },
+  "286": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "318",
+        0
+      ],
+      "vae": [
+        "272",
+        0
+      ]
+    }
+  },
+  "399": {
+    "class_type": "InpaintStitchImproved",
+    "inputs": {
+      "stitcher": [
+        "398",
+        0
+      ],
+      "inpainted_image": [
+        "286",
+        0
+      ]
+    }
+  },
+  "319": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "filename_prefix": "SolidInpaint/klein9b_fp8_lanpaint",
+      "images": [
+        "399",
+        0
+      ]
+    }
+  },
+  "403": {
+    "class_type": "LanPaint_ImageEncode",
+    "inputs": {
+      "image": [
+        "398",
+        1
+      ],
+      "vae": [
+        "272",
+        0
+      ],
+      "mask": [
+        "398",
+        2
+      ]
+    }
+  },
+  "404": {
+    "class_type": "ModelAttentionBackend",
+    "inputs": {
+      "attention": "comfy kitchen attention",
+      "model": [
+        "269",
+        0
+      ]
+    }
+  }
+}

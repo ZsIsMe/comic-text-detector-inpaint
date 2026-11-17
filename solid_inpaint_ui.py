@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import os.path as osp
 import math
+import copy
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import subprocess
@@ -3069,15 +3070,17 @@ class PsdExportWorker(QObject):
     failed = Signal(str)
     mode = 'psd_export'
 
-    def __init__(self, images, paths):
+    def __init__(self, images, paths, **options):
         super().__init__()
         self.images = tuple(images)
         self.paths = dict(paths)
+        self.options = copy.deepcopy(options)
 
     def run(self):
         try:
             from psd_export import export_project_assets
-            result = export_project_assets(self.images, self.paths, progress=self.progress.emit)
+            result = export_project_assets(self.images, self.paths, progress=self.progress.emit,
+                                           **self.options)
             self.finished.emit(result)
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -5893,30 +5896,65 @@ class MainWindow(QMainWindow):
         self.status.showMessage(f'已導出待精修圖片：{export_dir}')
 
     def export_psd_materials(self):
+        self.start_psd_export()
+
+    def start_psd_export(self, images=None, *, options=None, silent=False, on_worker_ready=None):
+        """Shared background entry; the existing menu uses the LaMa defaults."""
+        self._last_control_error = ''
         if not self.paths or not self.imglist:
-            return
+            self._last_control_error = '目前專案沒有圖片。'
+            return False
         if (self.worker_thread is not None or self.page_worker_thread is not None
                 or self.selection_detection_worker_thread is not None):
             self.status.showMessage('請等待目前任務完成再導出 PSD。')
-            return
-        if not self.save_all_edit_masks():
-            return
+            self._last_control_error = '目前有其他任務正在執行。'
+            return False
+        saved = self.save_all_edit_masks(silent=True) if silent else self.save_all_edit_masks()
+        if not saved:
+            return False
         self.progress.setValue(0)
         _set_state_label(self.progress_label, 'PSD 導出準備中')
-        self._control_worker_silent = False
-        self.worker_thread = QThread()
-        self.worker = PsdExportWorker(self.imglist, self.paths)
-        self.worker.moveToThread(self.worker_thread)
-        self.worker_thread.started.connect(self.worker.run)
-        self.worker.progress.connect(self.on_psd_export_progress)
-        self.worker.finished.connect(self.on_psd_export_finished)
-        self.worker.failed.connect(self.on_worker_failed)
-        self.worker.finished.connect(self.worker_thread.quit)
-        self.worker.failed.connect(self.worker_thread.quit)
-        self.worker_thread.finished.connect(self.cleanup_worker)
-        self.mask_view.setEnabled(False)
-        self.progress_row.show()
-        self.worker_thread.start()
+        self._control_worker_silent = silent
+        try:
+            self.worker_thread = QThread()
+            self.worker = PsdExportWorker(self.imglist if images is None else images,
+                                         self.paths, **(options or {}))
+            self.worker_thread.started.connect(self.worker.run)
+            self.worker.progress.connect(self.on_psd_export_progress)
+            self.worker.finished.connect(self.on_psd_export_finished)
+            self.worker.failed.connect(self.on_worker_failed)
+            self.worker.finished.connect(self.worker_thread.quit)
+            self.worker.failed.connect(self.worker_thread.quit)
+            self.worker_thread.finished.connect(self.cleanup_worker)
+            # Attach observers before moving the object: an attach failure then
+            # leaves no worker stranded in a thread that never starts.
+            if on_worker_ready is not None:
+                on_worker_ready(self.worker)
+            self.worker.moveToThread(self.worker_thread)
+            self.mask_view.setEnabled(False)
+            self.progress_row.show()
+            self.worker_thread.start()
+        except Exception as exc:
+            thread, worker = self.worker_thread, self.worker
+            # A running worker remains owned by its normal finished/failed
+            # handlers. Never abandon a task which actually began exporting.
+            if thread is not None and thread.isRunning():
+                self.status.showMessage(f'PSD 導出已啟動；啟動提示：{exc}')
+                return True
+            if worker is not None:
+                worker.deleteLater()
+            if thread is not None:
+                thread.deleteLater()
+            self.worker = None
+            self.worker_thread = None
+            self._control_worker_silent = False
+            self.mask_view.setEnabled(True)
+            self.progress_row.hide()
+            self._last_control_error = f'PSD 導出啟動失敗：{exc}'
+            _set_state_label(self.progress_label, 'PSD 導出啟動失敗')
+            self.status.showMessage(self._last_control_error)
+            return False
+        return True
 
     def on_psd_export_progress(self, stage, current, total, name, completed, units):
         self.progress.setValue(int(completed * 100 / max(1, units)))
@@ -5924,6 +5962,13 @@ class MainWindow(QMainWindow):
 
     def on_psd_export_finished(self, result):
         self.progress.setValue(100)
+        if result.get('complete') is False:
+            _set_state_label(self.progress_label, 'PSD 導出未全部完成')
+            self.status.showMessage(
+                f'PSD 素材：{result["assets_dir"]}；'
+                f'失敗 {len(result.get("failed_pages", []))} 頁，'
+                f'保留未更新 PSD {len(result.get("preserved_stale", []))} 份；請查看任務報告。')
+            return
         _set_state_label(self.progress_label, 'PSD 導出完成')
         self.status.showMessage(
             f'PNG 素材：{result["assets_dir"]}/solid、other_mask；'

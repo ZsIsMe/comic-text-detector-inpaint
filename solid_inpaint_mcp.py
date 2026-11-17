@@ -91,8 +91,55 @@ def start_detection(
 
 @mcp.tool()
 def get_job_status(job_id: str | None = None, instance_id: str | None = None) -> dict:
-    """Read detection progress, failed pages and final job result."""
+    """Read background detection or PSD export progress and final job result."""
     return _call('get_job_status', instance_id=instance_id, job_id=job_id)
+
+
+@mcp.tool()
+def check_repair_environment(
+    extra_methods: list[str],
+    comfy_url: str = 'http://127.0.0.1:8188',
+    model_map: dict | None = None,
+) -> dict:
+    """Check selected ComfyUI repair workflows without submitting generation.
+
+    Methods are klein9b_fp8_lanpaint and qwen21_int8_convrot. Missing nodes or
+    weights are reported for setup; filenames alone do not verify weight hashes.
+    This check runs in the bridge, never blocking the GUI's event loop.
+    """
+    from comfy_repair import ComfyRepairClient, validate_methods
+    methods = validate_methods(extra_methods)
+    return ComfyRepairClient(comfy_url, model_map=model_map, timeout=10).check(methods)
+
+
+@mcp.tool()
+def start_psd_export(
+    extra_methods: list[str] | None = None,
+    start_page: int = 1,
+    end_page: int | None = None,
+    comfy_url: str = 'http://127.0.0.1:8188',
+    model_map: dict | None = None,
+    export_name: str | None = None,
+    instance_id: str | None = None,
+) -> dict:
+    """Save GUI edits and start PSD materials plus layered PSD export.
+
+    LaMa works without ComfyUI when extra_methods is empty. Selected Klein/Qwen
+    methods each generate a transparent PNG and a matching hidden PSD layer.
+    Enhanced exports use a new version directory by default; keep export_name
+    to resume that run. Existing PSDs are preserved. Returns a job_id immediately;
+    use get_job_status until completed, incomplete or failed. Model mappings use
+    method IDs with unet/clip/vae roles. Page bounds are one-based and inclusive.
+    """
+    params = {'extra_methods': [] if extra_methods is None else extra_methods,
+              'start_page': start_page, 'comfy_url': comfy_url}
+    if end_page is not None:
+        params['end_page'] = end_page
+    if model_map is not None:
+        params['model_map'] = model_map
+    if export_name is not None:
+        params['export_name'] = export_name
+    return _call('start_psd_export', instance_id=instance_id, **params)
 
 
 @mcp.tool()

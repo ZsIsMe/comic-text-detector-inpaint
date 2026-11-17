@@ -10,6 +10,8 @@
 
 核心偵測與編輯流程仍保存 OTHER 分類，沒有自動修補複雜背景。明確導出 PSD 時提供獨立的 LaMa 修補擴展：由 OTHER 擴張並扣除人工保護後生成可隱藏、可繼續精修的圖層，不回寫原圖或正式頁面資料，也不代表修補品質已經人工驗收。
 
+AI 還可透過 [comic-psd-export](.agents/skills/comic-psd-export/SKILL.md)／MCP 選擇 Klein 9B FP8 LanPaint、Qwen Image 2.1 INT8 ConvRot，同次導出透明素材及預設隱藏的 PSD 候選圖層。GUI 不新增入口。`comfy_repair.py` 使用隨倉庫的 `repair_workflows/` API JSON；`scripts/setup_repair_workflows.py` 按固定 HF 模型與公開節點清單配置對方環境，不依賴其他本機工程、不提交權重。增強導出隔離於 `psd_assets/ai_exports/<export_name>/`，摘要及任務 ID 用於安全續跑。完整契約見 [AI PSD 導出](docs/ai_psd_export.md)；原有 LaMa 不需要 ComfyUI。
+
 ## 項目入口
 
 主要入口：

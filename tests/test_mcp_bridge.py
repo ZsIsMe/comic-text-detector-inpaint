@@ -31,7 +31,7 @@ class McpBridgeTests(unittest.TestCase):
         tool_names = ('get_app_status', 'open_project', 'get_detection_settings',
                       'start_detection', 'get_job_status', 'list_pages', 'go_to_page',
                       'get_page_view', 'get_review_bundle', 'apply_page_edits',
-                      'undo_page_edit', 'mark_page_reviewed', 'save_project')
+                      'undo_page_edit', 'mark_page_reviewed', 'save_project', 'start_psd_export')
         for name in tool_names:
             with self.subTest(name=name):
                 self.assertIn('instance_id', inspect.signature(getattr(bridge, name)).parameters)
@@ -39,6 +39,21 @@ class McpBridgeTests(unittest.TestCase):
                           return_value={'instances': [{'instance_id': 'a' * 32}]}) as discover:
             self.assertEqual(bridge.list_app_instances()['instances'][0]['instance_id'], 'a' * 32)
             discover.assert_called_once_with()
+
+    def test_psd_tool_forwards_selected_methods_and_resume_name(self):
+        import solid_inpaint_mcp as bridge
+
+        async def check():
+            with patch.object(bridge, 'request_control', return_value={'job_id': 'test'}) as call:
+                await bridge.mcp.call_tool('start_psd_export', {
+                    'extra_methods': ['qwen21_int8_convrot'], 'start_page': 2,
+                    'end_page': 3, 'export_name': 'trial_01', 'instance_id': 'b' * 32,
+                })
+                call.assert_called_once_with('start_psd_export', {
+                    'extra_methods': ['qwen21_int8_convrot'], 'start_page': 2, 'end_page': 3,
+                    'comfy_url': 'http://127.0.0.1:8188', 'export_name': 'trial_01',
+                }, instance_id='b' * 32)
+        asyncio.run(check())
 
 
 if __name__ == '__main__':

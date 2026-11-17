@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "method_id": "klein9b_fp8_lanpaint",
+  "title": "Klein 9B FP8 distilled + LanPaint",
+  "workflow_file": "workflow_api.json",
+  "io": {
+    "image_node": "297",
+    "mask_node": "304",
+    "output_node": "319"
+  },
+  "seed": {
+    "node": "318",
+    "input": "seed",
+    "default": 906758784677861
+  },
+  "model_nodes": {
+    "unet": {
+      "node": "269",
+      "input": "unet_name",
+      "class_type": "UNETLoader",
+      "filename": "flux-2-klein-9b-fp8.safetensors",
+      "sha256": "865ba09f5b4c3cbd3468a4bd3acb9fcb2f8740c54317482f0bcd4ed1d3655cee",
+      "identity_verified": false,
+      "setup_model_id": "klein_unet",
+      "size": 9433061528,
+      "category": "diffusion_models",
+      "sources": {
+        "huggingface": {
+          "repo": "black-forest-labs/FLUX.2-klein-9b-fp8",
+          "revision": "902d9d510b51533e07729f19211414a3648b77d2",
+          "path": "flux-2-klein-9b-fp8.safetensors",
+          "url": "https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8/resolve/902d9d510b51533e07729f19211414a3648b77d2/flux-2-klein-9b-fp8.safetensors",
+          "gated": true
+        }
+      }
+    },
+    "clip": {
+      "node": "268",
+      "input": "clip_name",
+      "class_type": "CLIPLoader",
+      "filename": "qwen_3_8b_fp8mixed.safetensors",
+      "sha256": "abad16806e0cbabc54e0325d6565847443fe396d5f0be38bb3cd3fe75a1201d6",
+      "identity_verified": false,
+      "setup_model_id": "klein_text_encoder",
+      "size": 8664848742,
+      "category": "text_encoders",
+      "sources": {
+        "huggingface": {
+          "repo": "Comfy-Org/flux2-klein-9B",
+          "revision": "1138ce884c8e977cdacacbe779784fec4426bb3f",
+          "path": "split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors",
+          "url": "https://huggingface.co/Comfy-Org/flux2-klein-9B/resolve/1138ce884c8e977cdacacbe779784fec4426bb3f/split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors",
+          "gated": false
+        }
+      }
+    },
+    "vae": {
+      "node": "272",
+      "input": "vae_name",
+      "class_type": "VAELoader",
+      "filename": "flux2-vae.safetensors",
+      "sha256": "868fe7b343cc8f3a19dbcfcafbc3d5f888802be3f89bd81b65b3621a066ce8f3",
+      "identity_verified": false,
+      "setup_model_id": "klein_vae",
+      "size": 336211292,
+      "category": "vae",
+      "sources": {
+        "huggingface": {
+          "repo": "Comfy-Org/flux2-klein-9B",
+          "revision": "1138ce884c8e977cdacacbe779784fec4426bb3f",
+          "path": "split_files/vae/flux2-vae.safetensors",
+          "url": "https://huggingface.co/Comfy-Org/flux2-klein-9B/resolve/1138ce884c8e977cdacacbe779784fec4426bb3f/split_files/vae/flux2-vae.safetensors",
+          "gated": false
+        }
+      }
+    }
+  },
+  "required_nodes": [
+    "CLIPLoader",
+    "CLIPTextEncode",
+    "ConditioningZeroOut",
+    "GrowMask",
+    "ImageToMask",
+    "InpaintCropImproved",
+    "InpaintStitchImproved",
+    "LanPaint_ImageEncode",
+    "LanPaint_KSampler",
+    "LayerUtility: ColorImage V2",
+    "LayerUtility: ImageBlend",
+    "LoadImage",
+    "ModelAttentionBackend",
+    "ReferenceLatent",
+    "SaveImage",
+    "UNETLoader",
+    "VAEDecode",
+    "VAEEncode",
+    "VAELoader"
+  ],
+  "tested_comfyui_version": "0.45.3",
+  "dependency_setup_manifest": "../setup_manifest.json",
+  "custom_node_dependencies": [
+    {
+      "package": "LanPaint",
+      "version": "2.1.0",
+      "repository": "https://github.com/scraed/LanPaint",
+      "commit": "2d7912f9a5efe5ece8de334c7ca18317b8288c39"
+    },
+    {
+      "package": "ComfyUI-Inpaint-CropAndStitch",
+      "version": "3.0.12",
+      "repository": "https://github.com/lquesada/ComfyUI-Inpaint-CropAndStitch",
+      "commit": "3617559bcb9d15ff60b24c6800701402eb2cd478"
+    },
+    {
+      "package": "ComfyUI_LayerStyle",
+      "version": "2.0.42",
+      "repository": "https://github.com/chflame163/ComfyUI_LayerStyle",
+      "commit": "2176b74083227cdf8d6e971e1d320d3fa8bfcbaa",
+      "pin_status": "installed source files matched the public pinned Git tree"
+    }
+  ],
+  "diff_policy": {
+    "version": "rgb-diff12-close3-area16-dilate8-protected-v1",
+    "max_rgb_delta_min": 12,
+    "close_ellipse_size": 3,
+    "component_min_area": 16,
+    "dilate_ellipse_radius": 8,
+    "intersect_other": false
+  },
+  "input_mask_policy": "original OTHER, unexpanded; workflow GrowMask performs its tested 8px growth",
+  "model_verification": "Readiness checks model dropdown filenames only; this is not SHA-256 model identity verification."
+}

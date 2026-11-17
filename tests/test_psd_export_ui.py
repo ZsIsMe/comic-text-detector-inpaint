@@ -45,6 +45,63 @@ class PsdExportUiTests(unittest.TestCase):
         worker.assert_not_called()
         self.assertIsNone(self.window.worker_thread)
 
+    def test_constructor_failure_restores_idle_state_and_allows_retry(self):
+        w = self.window
+        with patch.object(w, 'save_all_edit_masks', return_value=True), \
+                patch.object(ui, 'PsdExportWorker', side_effect=RuntimeError('cannot construct')), \
+                patch.object(ui.QThread, 'start') as start:
+            self.assertFalse(w.start_psd_export(silent=True))
+        start.assert_not_called()
+        self.assertIsNone(w.worker)
+        self.assertIsNone(w.worker_thread)
+        self.assertTrue(w.mask_view.isEnabled())
+        self.assertFalse(w.progress_row.isVisible())
+        self.assertFalse(w._control_worker_silent)
+        self.assertIn('cannot construct', w._last_control_error)
+        with patch.object(w, 'save_all_edit_masks', return_value=True), patch.object(ui.QThread, 'start'):
+            self.assertTrue(w.start_psd_export(silent=True))
+
+    def test_observer_attach_failure_cleans_worker_without_starting_export(self):
+        w = self.window
+
+        def failed_attach(worker):
+            raise RuntimeError('cannot attach observer')
+
+        with patch.object(w, 'save_all_edit_masks', return_value=True), \
+                patch.object(ui.QThread, 'start') as start:
+            self.assertFalse(w.start_psd_export(silent=True, on_worker_ready=failed_attach))
+        start.assert_not_called()
+        self.assertIsNone(w.worker)
+        self.assertIsNone(w.worker_thread)
+        self.assertTrue(w.mask_view.isEnabled())
+        self.assertFalse(w.progress_row.isVisible())
+        self.assertIn('cannot attach observer', w._last_control_error)
+        with patch.object(w, 'save_all_edit_masks', return_value=True), patch.object(ui.QThread, 'start'):
+            self.assertTrue(w.start_psd_export(silent=True))
+
+    def test_thread_start_failure_cleans_busy_state_and_keeps_saved_data(self):
+        w = self.window
+        with patch.object(w, 'save_all_edit_masks', return_value=True) as save, \
+                patch.object(ui.QThread, 'start', side_effect=RuntimeError('cannot start thread')):
+            self.assertFalse(w.start_psd_export(silent=True))
+        save.assert_called_once_with(silent=True)
+        self.assertIsNone(w.worker)
+        self.assertIsNone(w.worker_thread)
+        self.assertTrue(w.mask_view.isEnabled())
+        self.assertFalse(w.progress_row.isVisible())
+        self.assertIn('cannot start thread', w._last_control_error)
+
+    def test_ai_options_are_copied_and_forwarded_without_new_ui_controls(self):
+        options = {'extra_methods': ['qwen21_int8_convrot'], 'export_name': 'trial_01',
+                   'model_map': {'qwen21_int8_convrot': {'unet': 'model.safetensors'}}}
+        worker = ui.PsdExportWorker(['page.png'], {'raw': '/raw', 'output': '/output'}, **options)
+        options['model_map']['qwen21_int8_convrot']['unet'] = 'changed.safetensors'
+        with patch('psd_export.export_project_assets', return_value={}) as export:
+            worker.run()
+        self.assertEqual(export.call_args.kwargs['extra_methods'], ['qwen21_int8_convrot'])
+        self.assertEqual(export.call_args.kwargs['model_map']['qwen21_int8_convrot']['unet'],
+                         'model.safetensors')
+
     def test_worker_reports_progress_created_and_skipped_outputs_and_catches_failure(self):
         worker = ui.PsdExportWorker(['page.png'], {'raw': '/raw', 'output': '/output'})
         progress, finished, failed = [], [], []

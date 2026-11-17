@@ -33,6 +33,8 @@ tool_timeout_sec = 60
 | `open_project(path)` | 直接打開絕對資料夾路徑 |
 | `get_detection_settings` | 目前全局模型與氣泡填充預設值 |
 | `start_detection(...)` | 指定頁面範圍及選用設定，立即取得 job id |
+| `check_repair_environment(extra_methods,comfy_url,model_map)` | 獨立只讀檢查可選 Klein／Qwen 的 ComfyUI 節點與模型檔名，不要求 GUI，不驗證權重雜湊 |
+| `start_psd_export(extra_methods,start_page,end_page,...)` | 保存後在背景生成修復 PNG 並合成 PSD，回傳 job id；省略額外方法沿用 LaMa |
 | `get_job_status(job_id)` | 查詢進度、完成與失敗頁 |
 | `list_pages` | 依 GUI 順序列出頁面與校對狀態 |
 | `go_to_page(index/name)` | 切至頁碼或完整檔名，先保存目前修改 |
@@ -45,7 +47,7 @@ tool_timeout_sec = 60
 
 MCP 透過同使用者可存取的 Qt 本地 socket 與視窗通訊。耗時的偵測在 GUI 背景 worker 執行；MCP 工具用 job id 查進度。矩形／套索的精確編輯可透過 MCP 執行；筆刷、魔法棒及局部副本等使用 Computer Use。整頁圖用來掃描漏檢與誤判，小字和邊緣需以足夠解析度的局部圖或 GUI 放大核對；完成修改後仍要核對局部及整頁預覽。正式資料由 `project_store.py` 原子保存，MCP 不接受任意 Mask 陣列覆寫。
 
-每個 GUI 視窗都有獨立的本地控制端點及 `instance_id`，可以同時控制多個視窗。除了 `list_app_instances`，上述每個工具都接受可選的 `instance_id`。例如先從列表依資料夾辨認兩個視窗，再分別呼叫：
+每個 GUI 視窗都有獨立的本地控制端點及 `instance_id`，可以同時控制多個視窗。除了 `list_app_instances` 和 `check_repair_environment`，上述每個工具都接受可選的 `instance_id`。例如先從列表依資料夾辨認兩個視窗，再分別呼叫：
 
 ```text
 get_app_status(instance_id="視窗 A 的 ID")

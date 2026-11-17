@@ -10,6 +10,8 @@ Solid Inpaint 會先偵測漫畫圖片中的文字，對純色背景文字生成
 
 本項目從源碼運行，支援 macOS 和 Windows，暫不打包原生 App。
 
+AI 可用隨倉庫提供的 [PSD 導出 Skill](.agents/skills/comic-psd-export/SKILL.md) 或 MCP，在導出時額外生成 **FLUX.2 Klein 9B FP8 LanPaint**、**Qwen Image 2.1 INT8 ConvRot** 透明素材並同步加入 PSD。工作流 JSON、模型清單與配置腳本全部隨本工程提供；模型從 HF 按需下載，不放進 Git。不使用 ComfyUI 時仍可沿用 LaMa。詳見 [AI PSD 導出](docs/ai_psd_export.md)。
+
 ## 主要用途
 
 ```text
