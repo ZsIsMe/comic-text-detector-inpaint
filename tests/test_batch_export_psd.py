@@ -212,6 +212,20 @@ class BatchExportPsdTests(unittest.TestCase):
         self.assertEqual(changed['status'], 'preserved')
         self.assertEqual(set(changed['psd_freshness'].values()), {'stale'})
 
+    def test_previous_inference_policy_regenerates_pngs_and_preserves_psd_as_stale(self):
+        record = self.export()
+        psd = Path(record['created'][0])
+        before = psd.read_bytes()
+        record['repair_policy'] = 'nonempty-other-v1'
+        self.assertFalse(batch.verified_resume(self.folder, record))
+        with patch.object(psd_export, 'inpaint_other', side_effect=repair) as infer:
+            updated = batch.export_project(self.folder, preflight_project(self.folder), record)
+        infer.assert_called_once()
+        self.assertEqual(psd.read_bytes(), before)
+        self.assertEqual(updated['status'], 'preserved')
+        self.assertEqual(set(updated['psd_freshness'].values()), {'stale'})
+        self.assertTrue(batch.verified_resume(self.folder, updated))
+
     def test_concurrent_raw_change_is_never_reported_as_success(self):
         def concurrent_edit(image, mask):
             store.update_project(paths_for(self.folder)['raw'], settings={'edited': True})

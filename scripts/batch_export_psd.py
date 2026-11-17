@@ -26,7 +26,7 @@ from scripts.batch_export_common import (
     discover_projects, paths_for, preflight_project, raw_hashes, read_image, save_json, sha256,
 )
 
-REPAIR_POLICY = 'nonempty-other-v1'
+REPAIR_POLICY = 'nonempty-other-blocks1536-v2'
 
 
 def verify_outputs(folder, images, created):
@@ -153,6 +153,11 @@ def export_project(folder, images, previous=None):
         if detail['created']:
             freshness[name] = 'current'
         elif not detail['repair_policy_matches']:
+            freshness[name] = 'stale'
+        elif (detail['repair_required'] and previous
+              and previous.get('repair_policy') != REPAIR_POLICY):
+            # An unchanged PNG does not prove that an existing PSD used the
+            # current inference method; preserve it without certifying it.
             freshness[name] = 'stale'
         elif prior_raw and prior_raw != before:
             freshness[name] = 'stale'

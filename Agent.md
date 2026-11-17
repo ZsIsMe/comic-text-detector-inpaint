@@ -138,6 +138,8 @@ ctd_inpainted/raw/cache/<原圖檔名>.npz
 
 PSD 自下而上為原圖 `bg`、有純色 Alpha 時才建立的 `overlay-manual`、OTHER 非空時才建立並預設顯示的 `lama_large_512px` 普通 RGBA 圖層；修補層內容必須與中間 PNG 同源。空 OTHER 不執行推論、不生成修補 PNG，也不建立 LaMa 圖層；同頁已有尺寸相符且 RGBA 全零的舊修補 PNG 在重新導出時移除，非空或損壞舊檔保留且不採用。LaMa 的 8-bit 修補輸出只在 `other_mask > 0` 處有內容與 Alpha 255，區外 RGBA 全為 0；寫入 16-bit PSD 時按位深轉存，保持區內完全不透明。不把黑白 OTHER 放成 PSD 圖層或 `OTHER_CHANNEL`，旁邊的黑白 `other_mask` PNG 仍保留。
 
+LaMa 使用 BallonsTranslator 的區域尺寸上限與補邊思路：預設最長邊上限 1536，只縮小超限區域、不放大小區域；反射補成邊長為 64 倍數的正方形。正式資料無文字框，因此從當前 OTHER 全部連通區取框，16px 鄰近合併後按上游 `enlarge_window(ratio=1.7)` 外擴，極小框適配最小 32px 上下文並合併重疊裁窗。分塊只依賴正式 OTHER，不依賴可丟棄 cache，不過濾單像素區域。逐區修補、只貼回原始 OTHER，維持區外全零和原圖/raw 不變。修改此推論方法須同步升級批量 PSD 的 `REPAIR_POLICY`，舊方法的既有 PSD 保留並標 stale，不能僅憑素材哈希相同判為 current。
+
 新 PSD 保留原圖尺寸與位深；RGB 來源的既有 ICC 直接寫入，8-bit CMYK 或帶灰階 ICC 的來源先轉為 sRGB 並使用轉換後的 ICC。16-bit 灰階 ICC 或其他不能套用到 RGB PSD 的描述檔明確報錯，不能透過 8-bit 轉換降低精度。16-bit 背景保深，LaMa 輸入及修補內容使用 8-bit，不把整張背景降為 8-bit。每次明確導出依當次資料更新中間 PNG；已存在的同名 PSD 預設跳過，不覆寫 Photoshop 手改。舊 `create_psds_from_outputs.jsx` 可繼續選用，輸出仍為 `ctd_inpainted/psd/` 並沿用 `OTHER_CHANNEL` 流程，與程式直接生成的 `psd_assets/psds/` 分開。
 
 ## 核心處理邏輯
