@@ -52,7 +52,7 @@ class PsdExportTests(unittest.TestCase):
                 source or self.source, self.overlay if overlay is None else overlay,
                 self.other if other is None else other, destination or self.destination, **kwargs)
 
-    def test_layer_order_exact_pixels_alpha_hidden_repair_and_original_size(self):
+    def test_layer_order_exact_pixels_alpha_visible_repair_and_original_size(self):
         self.assertTrue(self.create())
         psd = PSDImage.open(self.destination)
         self.assertEqual(psd.size, (16, 12))
@@ -70,11 +70,13 @@ class PsdExportTests(unittest.TestCase):
         np.testing.assert_array_equal(read_pixels(psd[0], 8, 'color'), self.image[:, :, ::-1])
         np.testing.assert_array_equal(read_pixels(psd[1], 8), self.overlay[:, :, [2, 1, 0, 3]])
         np.testing.assert_array_equal(read_pixels(psd[2], 8), repair(self.image, self.other))
-        self.assertFalse(psd[2].visible)
-        # Hidden repair pixels do not alter the default composite.
-        self.assertEqual(psd.composite(apply_icc=False).getpixel((10, 8)), (220, 170, 120))
-        psd[2].visible = True
+        self.assertTrue(psd[2].visible)
         self.assertEqual(psd.composite(apply_icc=False).convert('RGB').getpixel((10, 8)), (21, 88, 155))
+        psd[2].visible = False
+        self.assertEqual(psd.composite(apply_icc=False).convert('RGB').getpixel((10, 8)), (220, 170, 120))
+        hidden_destination = self.root / 'explicitly-hidden.psd'
+        self.assertTrue(self.create(destination=hidden_destination, lama_visible=False))
+        self.assertFalse(PSDImage.open(hidden_destination)[2].visible)
 
     def test_no_solid_omits_overlay_and_empty_other_does_not_load_lama(self):
         empty = np.zeros_like(self.other)
@@ -82,7 +84,7 @@ class PsdExportTests(unittest.TestCase):
             self.assertTrue(export.export_page_psd(self.source, None, empty, self.destination))
         psd = PSDImage.open(self.destination)
         self.assertEqual([layer.name for layer in psd], ['bg', 'lama_large_512px'])
-        self.assertFalse(psd[1].visible)
+        self.assertTrue(psd[1].visible)
         self.assertFalse(np.any(read_pixels(psd[1], 8)))
 
     def test_8_and_16bit_gray_and_bgra_preserve_background_precision_and_alpha(self):

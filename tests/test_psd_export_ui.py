@@ -71,7 +71,7 @@ class PsdExportUiTests(unittest.TestCase):
         message = self.window.status.currentMessage()
         self.assertIn('/psds', message)
         self.assertIn('保留已有 1', message)
-        self.assertIn('預設隱藏', message)
+        self.assertIn('預設顯示', message)
         self.window.on_psd_export_progress('LaMa 修補', 1, 2, 'first.png', 0, 4)
         self.assertEqual(self.window.progress.value(), 0)
         self.assertIn('LaMa 修補 1/2', self.window.progress_label.text())

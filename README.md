@@ -269,13 +269,13 @@ PDF、PNG 和 PSD 按需導出到 `raw` 之外，日常保存不產生多組重�
 
 | 圖層 | 內容 | 初始狀態 |
 | --- | --- | --- |
-| `lama_large_512px` | 從同名透明修補 PNG 讀入，內容為 LaMa 對原圖 `other_mask > 0` 區域的修補結果 | 隱藏 |
+| `lama_large_512px` | 從同名透明修補 PNG 讀入，內容為 LaMa 對原圖 `other_mask > 0` 區域的修補結果 | 顯示 |
 | `overlay-manual` | 保存的純色填充 overlay；Alpha 非零時才建立 | 顯示 |
 | `bg` | 原圖背景 | 顯示 |
 
 `lama_large_512px` 是普通 RGBA 圖層，與落盤的修補 PNG 使用同一份內容。LaMa 的 8-bit 修補輸出在修補區內 Alpha 為 255，區外的 RGBA 全為 0；它不是黑白 Mask 圖層。寫入 16-bit PSD 時，修補內容按 PSD 位深轉存，區內仍為完全不透明。OTHER 為空時仍輸出全透明修補 PNG，但不載入或執行 LaMa，PSD 可保留空透明修補層。新 PSD 不建立黑白 `other_mask` 圖層或 `OTHER_CHANNEL`，需要黑白選區時可使用旁邊的 `other_mask` PNG。
 
-PSD 保留來源尺寸與位深，RGB 來源已有的 ICC 描述檔會直接寫入。8-bit CMYK 或帶灰階 ICC 的來源會先轉為 sRGB，並使用轉換後的 ICC；16-bit 灰階 ICC 或其他不能套用到 RGB PSD 的描述檔會明確回報錯誤。16-bit 原圖的背景仍保留 16-bit；LaMa 使用 8-bit 輸入與修補內容，不會因此把整張背景降為 8-bit。修補層預設隱藏，開啟 PSD 後可自行顯示並檢查修補品質。
+PSD 保留來源尺寸與位深，RGB 來源已有的 ICC 描述檔會直接寫入。8-bit CMYK 或帶灰階 ICC 的來源會先轉為 sRGB，並使用轉換後的 ICC；16-bit 灰階 ICC 或其他不能套用到 RGB PSD 的描述檔會明確回報錯誤。16-bit 原圖的背景仍保留 16-bit；LaMa 使用 8-bit 輸入與修補內容，不會因此把整張背景降為 8-bit。修補層預設顯示，開啟 PSD 後可直接檢查修補品質，也可自行隱藏以比較原圖。
 
 LaMa 只在明確執行 PSD 導出時處理 OTHER 選區，不重新偵測、不重新分類，也不回寫原圖或 `raw/` 正式頁面資料。每次明確批次導出都按當次資料更新 PNG 素材與修補 PNG；已存在的同名 PSD 預設跳過，保留 Photoshop 中的手動修改。需要另一版 PSD 時，先保留或改名舊檔，再明確導出。
 

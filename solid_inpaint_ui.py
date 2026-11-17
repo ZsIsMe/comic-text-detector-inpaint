@@ -5921,7 +5921,7 @@ class MainWindow(QMainWindow):
             f'PNG 素材：{result["assets_dir"]}/solid、other_mask；'
             f'LaMa PNG：{result["repair_dir"]}；'
             f'PSD：{result["psds_dir"]}（新增 {len(result["created"])}，'
-            f'保留已有 {len(result["skipped"])}）；LaMa 圖層預設隱藏。舊 JSX 仍可使用。')
+            f'保留已有 {len(result["skipped"])}）；LaMa 圖層預設顯示。舊 JSX 仍可使用。')
 
     def refresh_mask_preview(self, keep_view: bool = True) -> None:
         if self.is_mask_stroke_active or self.is_local_edit_active:

@@ -154,7 +154,7 @@ def export_repair_png(source_path, other_mask, destination):
 
 
 def export_page_psd(source_path, overlay_bgra, other_mask, destination, *,
-                    overwrite=False, lama_visible=False, repair_rgba=None, repair_path=None):
+                    overwrite=False, lama_visible=True, repair_rgba=None, repair_path=None):
     """Create one PSD; return False when preserving an existing output.
 
     Input overlay uses the project's BGRA convention. LaMa receives RGB pixels,
@@ -216,7 +216,7 @@ def export_page_psd(source_path, overlay_bgra, other_mask, destination, *,
     return True
 
 
-def export_psds_from_assets(images, assets_dir, *, overwrite=False, lama_visible=False, progress=None):
+def export_psds_from_assets(images, assets_dir, *, overwrite=False, lama_visible=True, progress=None):
     """Generate all repair PNGs first, then build PSDs from those exact pixels.
 
     Existing solid/other_mask PNGs and project raw are read-only. Explicit export

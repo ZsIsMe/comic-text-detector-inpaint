@@ -79,7 +79,7 @@ UI 以進度條和目前階段、該階段頁碼、檔名顯示進度，完成�
 
 - `bg`：原圖背景，保留來源尺寸與位深；RGB 來源的既有 ICC 直接寫入。
 - `overlay-manual`：正式保存的純色 overlay；Alpha 非零時才建立。
-- `lama_large_512px`：讀取同名透明修補 PNG，放置 LaMa 修補原圖 `other_mask > 0` 區域的普通 RGBA 圖層，預設隱藏。
+- `lama_large_512px`：讀取同名透明修補 PNG，放置 LaMa 修補原圖 `other_mask > 0` 區域的普通 RGBA 圖層，預設顯示。
 
 LaMa 的 8-bit 修補 PNG 在 OTHER 內 Alpha 為 255，區外 RGBA 全為 0；PSD 修補層與此 PNG 同源，寫入 16-bit PSD 時按位深轉存，區內仍為完全不透明。新 PSD 不建立黑白 `other_mask` 圖層或 `OTHER_CHANNEL`。原有 `other_mask` PNG 仍維持黑白 Mask，`solid` PNG 仍維持透明填色 overlay。OTHER 為空時仍輸出全透明修補 PNG，但不載入或執行模型，PSD 可留下空透明的 LaMa 圖層。
 
