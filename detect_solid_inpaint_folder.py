@@ -118,18 +118,9 @@ def read_page_state(paths, img_path, shape=None):
 
 
 def export_psd_assets(images, paths):
-    """Export Photoshop-readable PNGs only on request, outside raw."""
-    stems = [Path(image).stem for image in images]
-    if len(stems) != len(set(stems)):
-        raise ValueError('原圖有去除副檔名後同名的檔案，無法導出同名 PNG。')
-    root = Path(paths['output']) / 'psd_assets'
-    for name in ('solid', 'other_mask'):
-        (root/name).mkdir(parents=True, exist_ok=True)
-    for image, stem in zip(images, stems):
-        state = read_page_state(paths, image)
-        imwrite(str(root/'solid'/f'{stem}.png'), state['overlay'])
-        imwrite(str(root/'other_mask'/f'{stem}.png'), state['other'])
-    return str(root)
+    """Explicit PNG and layered PSD export, preserving the original return API."""
+    from psd_export import export_project_assets
+    return export_project_assets(images, paths)['assets_dir']
 
 
 def _background_sample_cache_path(paths, img_path):

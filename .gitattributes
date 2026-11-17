@@ -1,0 +1,2 @@
+models/koharu-layout-highres/model.safetensors filter=lfs diff=lfs merge=lfs -text
+models/lama_large_512px.ckpt filter=lfs diff=lfs merge=lfs -text

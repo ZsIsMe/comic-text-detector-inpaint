@@ -15,6 +15,7 @@ import detect_solid_inpaint_folder as pipeline
 import load_model
 import min_infer_rfdetr
 import rfdetr_config as config
+import lama_config
 from rfdetr_detector import RfDetrSegDetector
 
 
@@ -44,7 +45,9 @@ class HighResTests(unittest.TestCase):
                 patch.object(bootstrap, 'download_model') as download, \
                 patch.object(bootstrap, 'launch_app'):
             bootstrap.main()
-        download.assert_called_once_with(config.MODEL_URL, config.MODEL_FILE, config.MODEL_SHA256)
+        download.assert_any_call(config.MODEL_URL, config.MODEL_FILE, config.MODEL_SHA256)
+        download.assert_any_call(lama_config.MODEL_URL, lama_config.MODEL_PATH, lama_config.MODEL_SHA256)
+        self.assertEqual(download.call_count, 2)
         self.assertEqual(pipeline.detector_model_path('rfdetr'), config.MODEL_FILE)
         with patch.object(pipeline.osp, 'isfile', return_value=True), \
                 patch('rfdetr_detector.RfDetrSegDetector') as constructor:

@@ -8,6 +8,8 @@
 對不可靠背景生成 other_mask，方便人工或其他工具後續處理。
 ```
 
+核心偵測與編輯流程仍保存 OTHER 分類，沒有自動修補複雜背景。明確導出 PSD 時提供獨立的 LaMa 修補擴展：只在 OTHER 區域生成可隱藏、可繼續精修的圖層，不回寫原圖或正式頁面資料，也不代表修補品質已經人工驗收。
+
 ## 項目入口
 
 主要入口：
@@ -35,6 +37,9 @@ workflow_compare_ui.py
 
 detect_solid_inpaint_folder.py
   核心批量處理腳本。負責偵測文字、生成 mask、生成 inpainted overlay、生成 other_mask、寫入報告。
+
+psd_export.py / lama_inpainter.py / lama_config.py
+  按需導出透明修補 PNG 與分層 PSD。psd_export.py 先完成本批全部 LaMa PNG，再讀取原圖、solid 及修補 PNG，以 psd-tools 組裝 PSD；第二階段不重新推論。lama_inpainter.py 懶載入、校驗並序列化模型推論，lama_config.py 管理專用權重設定。只在明確 PSD 導出時使用，不屬於漫畫偵測或正式頁面保存流程。
 ```
 
 ## 運行方式
@@ -59,7 +64,7 @@ py -3 bootstrap.py
 .venv/bin/python detect_solid_inpaint_folder.py /path/to/image_folder
 ```
 
-預設跳過已有成功結果及人工資料，只處理未完成頁；成功但沒有選區的頁面也算已有結果。`--start-page 5 --end-page 8` 指定與 GUI 相同自然排序、從 1 開始的頁碼（包含首尾）；只有使用者明確要求重跑才加 `--redetect`。本分支唯一模型為 Koharu Layout HighRes，`--detector` 僅接受 `rfdetr`，可省略；另可用 `--device`、`--bubble`／`--no-bubble`。有效的 RF-DETR 與氣泡參數沿用專案設定，新專案使用預設值，不讀寫 GUI 全局偏好。舊 v2 專案若記錄了已移除的模型，仍可讀取其保存結果；新偵測或重新分類改用 HighRes 安全預設，不沿用舊模型專屬參數，也不因此自動重跑既有頁面。結果仍是相同的 v2 專案，之後可用 GUI 繼續逐頁校正。退出碼 0 為成功、1 為頁面失敗、2 為參數或啟動錯誤；完整參數見 README。不要同時用 CLI 和 GUI 修改同一專案。
+預設跳過已有成功結果及人工資料，只處理未完成頁；成功但沒有選區的頁面也算已有結果。`--start-page 5 --end-page 8` 指定與 GUI 相同自然排序、從 1 開始的頁碼（包含首尾）；只有使用者明確要求重跑才加 `--redetect`。本分支唯一文字偵測器為 Koharu Layout HighRes，`--detector` 僅接受 `rfdetr`，可省略；另可用 `--device`、`--bubble`／`--no-bubble`。有效的 RF-DETR 與氣泡參數沿用專案設定，新專案使用預設值，不讀寫 GUI 全局偏好。舊 v2 專案若記錄了已移除的模型，仍可讀取其保存結果；新偵測或重新分類改用 HighRes 安全預設，不沿用舊模型專屬參數，也不因此自動重跑既有頁面。結果仍是相同的 v2 專案，之後可用 GUI 繼續逐頁校正。退出碼 0 為成功、1 為頁面失敗、2 為參數或啟動錯誤；完整參數見 README。不要同時用 CLI 和 GUI 修改同一專案。命令列偵測不執行 LaMa 或 PSD 導出。
 
 ## 依賴注意
 
@@ -73,27 +78,32 @@ PySide6-Essentials
 
 NumPy 限制依 Python 版本選擇相容系列，修改時須同時核對 OpenCV、PyTorch 與 RF-DETR 的相容性。
 
+分層 PSD 導出使用 `psd-tools==1.26.1`。LaMa 沿用 PyTorch 推論，模型架構包含頻域運算；不要只因 GPU 可見就假定該後端能正確執行，沿用 adapter 的裝置檢查及回退處理。
+
 `PySide6-Essentials` 是為了避免安裝完整 `PySide6` 時拉入大型 Qt Addons。當前 GUI 主要使用 `QtCore`、`QtGui`、`QtWidgets`，Essentials 應該足夠。
 
 如果後續加入 QtCharts、QtWebEngine、QtMultimedia 等功能，需要重新檢查是否仍能只依賴 `PySide6-Essentials`。
 
 ## 模型文件
 
-模型不提交到 git。
+依使用者要求，目前使用的 HighRes 與 LaMa 權重透過 Git LFS 提交；`.gitattributes` 只追蹤這兩個指定模型，其餘權重仍忽略。拉取前安裝 Git LFS，已有指標檔時執行 `git lfs pull` 取得實體模型。
 
 首次啟動時 `bootstrap.py` 會下載：
 
 ```text
 models/koharu-layout-highres/model.safetensors
+models/lama_large_512px.ckpt
 ```
 
-模型來源：
+HighRes 模型來源：
 
 ```text
 https://huggingface.co/mayocream/koharu-layout-highres
 ```
 
-模型授權與歸屬屬於原項目。`rfdetr_config.py` 統一權重來源、路徑、SHA-256、1920 輸入尺寸與分類門檻；bootstrap 只下載此模型，文字及氣泡填充共用權重。
+模型授權與歸屬屬於原項目。`rfdetr_config.py` 統一 HighRes 權重來源、路徑、SHA-256、1920 輸入尺寸與分類門檻；文字及氣泡填充共用此權重。
+
+PSD 匯出專用 LaMa 權重來源為 `https://huggingface.co/dreMaz/AnimeMangaInpainting/resolve/main/lama_large_512px.ckpt`，大小 204,544,673 bytes，SHA-256 為 `11d30fbb3000fb2eceae318b75d9ced9229d99ae990a7f8b3ac35c8d31f2c935`。`lama_config.py` 管理來源與校驗值；bootstrap 下載並校驗上述兩個模型，已存在且校驗相符時不重複下載。LaMa 不是第二個文字偵測器，只在明確 PSD 導出且 OTHER 非空時推論。
 
 ## 輸入與輸出
 
@@ -123,6 +133,12 @@ ctd_inpainted/raw/cache/<原圖檔名>.npz
 `project_store.py` 管理唯一正式頁面資料（填色 overlay、OTHER、人工修改保護範圍）與原子保存。編輯只有純色填充和圖像修補兩類；偵測 Mask 是內部快取，普通編輯不重新分類。重新偵測保留人工修改與擦除。
 
 `export_pair`、`psd_assets`、`preview_report.pdf` 按需生成在 `raw` 外。格式和行為見 `docs/two_class_project.md`。
+
+「導出 PSD 素材」先保存目前編輯，再由背景 worker 做兩階段整批導出。第一階段「LaMa 修補」完成全部 `psd_assets/solid`、`other_mask` 素材與 `psd_assets/lama_large_512px/<stem>.png` 透明修補圖；第二階段「PSD 組裝」才從原圖、solid 和落盤修補 PNG 生成 `psd_assets/psds/<stem>.psd`，不重跑模型。視窗顯示進度條、階段、該階段頁碼與檔名；整批以 2N 個頁面工作單位更新進度。
+
+PSD 自下而上為原圖 `bg`、有純色 Alpha 時才建立的 `overlay-manual`、預設隱藏的 `lama_large_512px` 普通 RGBA 圖層；修補層內容必須與中間 PNG 同源。空 OTHER 仍輸出全透明修補 PNG，但不載入模型，可留下空透明修補層。LaMa 的 8-bit 修補輸出只在 `other_mask > 0` 處有內容與 Alpha 255，區外 RGBA 全為 0；寫入 16-bit PSD 時按位深轉存，保持區內完全不透明。不把黑白 OTHER 放成 PSD 圖層或 `OTHER_CHANNEL`，旁邊的黑白 `other_mask` PNG 仍保留。
+
+新 PSD 保留原圖尺寸與位深；RGB 來源的既有 ICC 直接寫入，8-bit CMYK 或帶灰階 ICC 的來源先轉為 sRGB 並使用轉換後的 ICC。16-bit 灰階 ICC 或其他不能套用到 RGB PSD 的描述檔明確報錯，不能透過 8-bit 轉換降低精度。16-bit 背景保深，LaMa 輸入及修補內容使用 8-bit，不把整張背景降為 8-bit。每次明確導出依當次資料更新中間 PNG；已存在的同名 PSD 預設跳過，不覆寫 Photoshop 手改。舊 `create_psds_from_outputs.jsx` 可繼續選用，輸出仍為 `ctd_inpainted/psd/` 並沿用 `OTHER_CHANNEL` 流程，與程式直接生成的 `psd_assets/psds/` 分開。
 
 ## 核心處理邏輯
 
@@ -202,9 +218,11 @@ AI 監修介面獨立顯示目前頁、保存狀態與編輯模式，支援路�
 對不可靠背景，優先標記 other_mask，而不是硬修。
 ```
 
+PSD 修補擴展只處理使用者明確要求的導出，不改 OTHER 分類或自動完成校對。測試時按授權頁數處理，保留既有 PSD 樣本；不得為單頁驗證自行展開整話批量匯出。
+
 修改依賴時要注意普通用戶首次啟動成本。完整 PySide6 會顯著增加下載量和磁碟佔用。
 
-偵測器只有 `rfdetr_detector.py`；通用影像 I/O 與 Mask 幾何分別位於 `image_io.py`、`mask_utils.py`。舊 detector 的 vendor 程式已移除；氣泡填充的衍生設計仍須保留來源標註及 `vendor/LICENSE-BallonsTranslator`。
+文字偵測器只有 `rfdetr_detector.py`；通用影像 I/O 與 Mask 幾何分別位於 `image_io.py`、`mask_utils.py`。舊 detector 的 vendor 程式已移除；PSD 匯出專用 LaMa 架構在 `vendor/lama_large.py`。氣泡填充與 LaMa 的衍生設計仍須保留來源標註及相關授權，包括 `vendor/LICENSE-BallonsTranslator`。
 
 ## 驗證建議
 
@@ -234,6 +252,8 @@ export_pair/
 preview_report.pdf（按需生成）
 ```
 
+修改 PSD 導出時，以授權的單頁副本驗證 `psd_assets/lama_large_512px/` 及 `psd_assets/psds/`：確認整批 PNG 先完成、PSD 組裝不重新推論，重讀圖層順序、可見性、ICC、尺寸與位深；核對 LaMa 層與中間 PNG 同源、區外 RGBA 全零、區內 Alpha 為該位深最大值（8-bit 為 255），且非空 OTHER 才執行推論。同時核對原圖與 `raw/` 資料未改動，以及 PNG 按當次資料更新、同名既有 PSD 預設跳過。
+
 ## 不應提交
 
 不要提交：
@@ -243,5 +263,4 @@ preview_report.pdf（按需生成）
 __pycache__/
 .DS_Store
 ctd_inpainted/
-models/koharu-layout-highres/model.safetensors
 ```

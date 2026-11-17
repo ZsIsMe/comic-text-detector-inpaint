@@ -3055,6 +3055,26 @@ class ConvertMasksWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class PsdExportWorker(QObject):
+    progress = Signal(str, int, int, str, int, int)
+    finished = Signal(dict)
+    failed = Signal(str)
+    mode = 'psd_export'
+
+    def __init__(self, images, paths):
+        super().__init__()
+        self.images = tuple(images)
+        self.paths = dict(paths)
+
+    def run(self):
+        try:
+            from psd_export import export_project_assets
+            result = export_project_assets(self.images, self.paths, progress=self.progress.emit)
+            self.finished.emit(result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class ConvertMasksDialog(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -3959,7 +3979,7 @@ class MainWindow(QMainWindow):
         self.undo_stack: list[dict[str, np.ndarray]] = []
         self.redo_stack: list[dict[str, np.ndarray]] = []
         self.worker_thread: QThread | None = None
-        self.worker: FolderWorker | ConvertMasksWorker | None = None
+        self.worker: FolderWorker | ConvertMasksWorker | PsdExportWorker | None = None
         self.page_worker_thread: QThread | None = None
         self.page_worker: PageRegenerateWorker | None = None
         self.selection_detection_worker_thread: QThread | None = None
@@ -5348,7 +5368,8 @@ class MainWindow(QMainWindow):
     def on_worker_progress(self, current: int, total: int, name: str) -> None:
         percent = int(current * 100 / max(1, total))
         self.progress.setValue(percent)
-        action = '處理' if getattr(self.worker, 'mode', None) == 'keep_original' else '偵測'
+        action = {'keep_original': '處理', 'psd_export': '導出 PSD'}.get(
+            getattr(self.worker, 'mode', None), '偵測')
         _set_state_label(self.progress_label, f'{action}進度 {current} / {total} · {name}')
 
     def on_worker_finished(self, report: dict) -> None:
@@ -5388,7 +5409,8 @@ class MainWindow(QMainWindow):
         self.status.showMessage('選區轉換完成。')
 
     def on_worker_failed(self, message: str) -> None:
-        action = '處理' if getattr(self.worker, 'mode', None) == 'keep_original' else '偵測'
+        action = {'keep_original': '處理', 'psd_export': '導出 PSD'}.get(
+            getattr(self.worker, 'mode', None), '偵測')
         _set_state_label(self.progress_label, f'{action}任務失敗')
         self.status.showMessage(f'執行失敗：{message}')
         if self._control_worker_silent:
@@ -5865,14 +5887,41 @@ class MainWindow(QMainWindow):
     def export_psd_materials(self):
         if not self.paths or not self.imglist:
             return
-        if self.worker_thread is not None or not self.save_all_edit_masks():
+        if (self.worker_thread is not None or self.page_worker_thread is not None
+                or self.selection_detection_worker_thread is not None):
+            self.status.showMessage('請等待目前任務完成再導出 PSD。')
             return
-        try:
-            folder = export_psd_assets(self.imglist, self.paths)
-        except (OSError, ValueError) as exc:
-            QMessageBox.warning(self, '導出失敗', str(exc))
+        if not self.save_all_edit_masks():
             return
-        self.status.showMessage(f'PSD 素材已導出：{folder}；可執行 create_psds_from_outputs.jsx。')
+        self.progress.setValue(0)
+        _set_state_label(self.progress_label, 'PSD 導出準備中')
+        self._control_worker_silent = False
+        self.worker_thread = QThread()
+        self.worker = PsdExportWorker(self.imglist, self.paths)
+        self.worker.moveToThread(self.worker_thread)
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker.progress.connect(self.on_psd_export_progress)
+        self.worker.finished.connect(self.on_psd_export_finished)
+        self.worker.failed.connect(self.on_worker_failed)
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker.failed.connect(self.worker_thread.quit)
+        self.worker_thread.finished.connect(self.cleanup_worker)
+        self.mask_view.setEnabled(False)
+        self.progress_row.show()
+        self.worker_thread.start()
+
+    def on_psd_export_progress(self, stage, current, total, name, completed, units):
+        self.progress.setValue(int(completed * 100 / max(1, units)))
+        _set_state_label(self.progress_label, f'{stage} {current}/{total} · {name}')
+
+    def on_psd_export_finished(self, result):
+        self.progress.setValue(100)
+        _set_state_label(self.progress_label, 'PSD 導出完成')
+        self.status.showMessage(
+            f'PNG 素材：{result["assets_dir"]}/solid、other_mask；'
+            f'LaMa PNG：{result["repair_dir"]}；'
+            f'PSD：{result["psds_dir"]}（新增 {len(result["created"])}，'
+            f'保留已有 {len(result["skipped"])}）；LaMa 圖層預設隱藏。舊 JSX 仍可使用。')
 
     def refresh_mask_preview(self, keep_view: bool = True) -> None:
         if self.is_mask_stroke_active or self.is_local_edit_active:
@@ -6835,6 +6884,10 @@ class MainWindow(QMainWindow):
         return self.flush_pending_edits(silent=silent)
 
     def closeEvent(self, event):
+        if isinstance(self.worker, PsdExportWorker) and self.worker_thread is not None:
+            self.status.showMessage('PSD 正在導出，請等待任務完成後關閉。')
+            event.ignore()
+            return
         if not self.flush_pending_edits():
             event.ignore()
             return

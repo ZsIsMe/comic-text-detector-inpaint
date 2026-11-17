@@ -17,6 +17,7 @@ from rfdetr_config import (
     MODEL_FILE as RF_DETR_MODEL_PATH,
     MODEL_SHA256 as RF_DETR_MODEL_SHA256,
 )
+from lama_config import MODEL_URL as LAMA_MODEL_URL, MODEL_PATH as LAMA_MODEL_PATH, MODEL_SHA256 as LAMA_MODEL_SHA256
 
 APP_NAME = '塗白'
 ROOT = Path(__file__).resolve().parent
@@ -170,6 +171,7 @@ def main() -> None:
     ensure_dependencies(python)
     # Text and bubble inference share this one verified HighRes checkpoint.
     download_model(RF_DETR_MODEL_URL, RF_DETR_MODEL_PATH, RF_DETR_MODEL_SHA256)
+    download_model(LAMA_MODEL_URL, LAMA_MODEL_PATH, LAMA_MODEL_SHA256)
     launch_app(python)
 
 

@@ -31,9 +31,11 @@ ctd_inpainted/
     01.png
     other_mask/01.png
     colored/01.png
-  psd_assets/                  # 導出 PSD 素材時生成
+  psd_assets/                  # 按需導出 PNG 與分層 PSD
     solid/01.png
     other_mask/01.png
+    lama_large_512px/01.png    # 先整批生成的 RGBA 透明修補圖
+    psds/01.psd                # psd-tools 直接生成，含 LaMa 修補層
   psd/                        # Photoshop 腳本輸出
 ```
 
@@ -51,7 +53,7 @@ ctd_inpainted/
 清除快取不影響顏色、分類、重開或導出；重新分類會使用 HighRes 重新偵測文字，沿用有效的 RF-DETR 參數。舊 v2 專案若記錄了已移除的模型，改用 HighRes 安全預設，不沿用舊模型專屬參數；單純重開或跳過已處理頁面不會因此重新偵測，也不改寫其人工修改。
 
 不再自動生成 `raw/mask`、`manual_solid`、`manual_other`、`other_mask`、`inpainted`、獨立取樣／氣泡快取目錄，以及獨立設定／報告 JSON。
-PDF、標記圖與 Photoshop 可讀的 PNG 只在導出時產生。
+PDF、標記圖、Photoshop 可讀的 PNG 與分層 PSD 只在導出時產生。普通保存、重開或偵測不執行 LaMa 修補。
 
 ## 保存與錯誤處理
 
@@ -64,9 +66,27 @@ v2 不讀取或遷移舊格式。遇到舊 `ctd_inpainted/raw` 會提示先將 `
 
 主視窗或局部編輯視窗中，按住 Cmd（macOS）或 Ctrl（Windows/Linux）並用右鍵拖出矩形，可把框內**已有**的「純色填充」與「圖像修補」逐像素互換。兩類混在同一矩形也會各自互換；空白與框外不變，與目前工具及 F1/F2 編輯類型無關。普通右鍵拖曳仍清除兩類。主視窗的互換可一次撤銷／重做並自動保存；局部視窗限於目前 ROI，按「套用」才寫回主頁，按「取消」則捨棄。
 
-## Photoshop
+## PSD 導出與 Photoshop
 
-在程式中按「導出 PSD 素材」，再於 Photoshop 執行 `create_psds_from_outputs.jsx`。
-腳本讀取 `ctd_inpainted/psd_assets/solid` 與 `other_mask`，輸出到 `ctd_inpainted/psd`。
+在程式中按「導出 PSD 素材」。程式先保存目前編輯，再由背景 worker 分兩階段整批導出：
+
+1. 「LaMa 修補」：先完成全部 `psd_assets/solid`、`psd_assets/other_mask` PNG 與 `psd_assets/lama_large_512px/<stem>.png` 透明修補圖。
+2. 「PSD 組裝」：全部修補 PNG 完成後，使用 `psd-tools==1.26.1` 從原圖、solid 和落盤修補 PNG 生成 `ctd_inpainted/psd_assets/psds/<stem>.psd`；這一階段不再推論模型。
+
+UI 以進度條和目前階段、該階段頁碼、檔名顯示進度，完成後顯示 PSD 所在路徑。PNG 素材與修補 PNG 每次明確導出都依當次資料更新；同名既有 PSD 預設跳過，避免覆蓋 Photoshop 手動修改。
+
+新 PSD 自下而上為：
+
+- `bg`：原圖背景，保留來源尺寸與位深；RGB 來源的既有 ICC 直接寫入。
+- `overlay-manual`：正式保存的純色 overlay；Alpha 非零時才建立。
+- `lama_large_512px`：讀取同名透明修補 PNG，放置 LaMa 修補原圖 `other_mask > 0` 區域的普通 RGBA 圖層，預設隱藏。
+
+LaMa 的 8-bit 修補 PNG 在 OTHER 內 Alpha 為 255，區外 RGBA 全為 0；PSD 修補層與此 PNG 同源，寫入 16-bit PSD 時按位深轉存，區內仍為完全不透明。新 PSD 不建立黑白 `other_mask` 圖層或 `OTHER_CHANNEL`。原有 `other_mask` PNG 仍維持黑白 Mask，`solid` PNG 仍維持透明填色 overlay。OTHER 為空時仍輸出全透明修補 PNG，但不載入或執行模型，PSD 可留下空透明的 LaMa 圖層。
+
+8-bit CMYK 或帶灰階 ICC 的來源會先轉為 sRGB，並寫入轉換後的 ICC。16-bit 灰階 ICC 或其他不能套用到 RGB PSD 的描述檔會明確報錯。
+
+LaMa 只在明確導出 PSD 時推論，不更新兩類分類、人工修改記錄、原圖或 `raw/` 正式頁面。16-bit 背景保留原位深；LaMa 使用 8-bit 輸入與修補內容，不將整張背景降為 8-bit。修補結果需在 Photoshop 中自行開啟圖層檢查和精修，不代表已完成頁面校對。
+
+舊 `create_psds_from_outputs.jsx` 仍可選用。腳本讀取 `ctd_inpainted/psd_assets/solid` 與 `other_mask`，維持輸出到 `ctd_inpainted/psd`，並保留原本的 `OTHER_CHANNEL` 與 Photoshop 動作流程；它與新 `psd_assets/psds/` 輸出分開。
 
 左側 F1「純色填充」和 F2「圖像修補」預覽中的白色均為正式 overlay 的完整塗白選區，包含氣泡內縮填色。「轉為圖像修補」會搬移所選白區。黃色背景取樣提示以固定 28% 不透明度疊加，不覆蓋已填色或圖像修補的像素；由「顯示背景選區」獨立控制。擦除後不再顯示白色。滑桿 100% 為黑底選區，0% 為原圖；預設 70%，沿用舊版保存的滑桿比例。筆刷及局部視窗使用相同顯示規則。
