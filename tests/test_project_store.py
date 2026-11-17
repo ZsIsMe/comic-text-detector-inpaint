@@ -267,6 +267,23 @@ class ProjectTests(unittest.TestCase):
             _ensure_dirs(str(self.root/'legacy'))
         self.assertEqual(file.read_bytes(), b'original')
 
+    def test_reclassify_removed_detector_uses_highres_without_legacy_parameters(self):
+        self.classify()
+        page = read_page_state(self.paths, self.path)
+        solid = page['overlay'][:, :, 3].copy()
+        solid[70:80, 82:90] = 0
+        save_page_edits(self.path, self.paths, solid, page['other'])
+        for old_model in ('legacy_ctd', 'ctbd', 'ysgyolo'):
+            with self.subTest(model=old_model):
+                store.update_project(self.paths['raw'], detector=old_model,
+                                     detector_params={'text_region_filter': 'text_free', 'labels': []})
+                with patch('detect_solid_inpaint_folder.create_detector') as factory, \
+                        patch('detect_solid_inpaint_folder.detect_bubbles', return_value=([], 'detected')):
+                    factory.return_value.return_value = (None, self.mask, None)
+                    regenerate_image_from_mask(self.path, self.paths, reclassify=True)
+                factory.assert_called_once_with('rfdetr', {})
+                self.assertFalse(np.any(read_page_state(self.paths, self.path)['overlay'][70:80, 82:90]))
+
     def test_missing_import_does_not_mark_unprocessed_page_complete(self):
         report = regenerate_image_from_imported_mask(self.path, self.paths, str(self.root/'missing'), 'replace')
         self.assertFalse(report['processed'])
@@ -294,6 +311,45 @@ class EditorTests(unittest.TestCase):
         self.window.close()
         self.sample_patch.stop();self.settings_patch.stop()
         ProjectTests.tearDown(self)
+
+    def test_old_model_project_reopens_without_inference_or_changing_saved_pages(self):
+        w = self.window
+        self.assertFalse(hasattr(w, 'selection_ctd_btn'))
+        self.assertFalse(hasattr(w, 'start_ctd_selection_detection'))
+        for old_model in ('legacy_ctd', 'ctbd', 'ysgyolo'):
+            with self.subTest(model=old_model):
+                store.update_project(self.paths['raw'], detector=old_model, detector_params={'labels': []})
+                before = store.page_path(self.paths, self.path).read_bytes()
+                before_project = store.project_path(self.paths['raw']).read_bytes()
+                with patch('solid_inpaint_ui.create_detector', side_effect=AssertionError('read only')):
+                    self.assertTrue(w.load_folder(str(self.root)))
+                self.assertEqual(store.page_path(self.paths, self.path).read_bytes(), before)
+                self.assertEqual(store.project_path(self.paths['raw']).read_bytes(), before_project)
+
+    def test_workers_without_text_detection_preserve_historical_model_metadata(self):
+        from solid_inpaint_ui import FolderWorker, ConvertMasksWorker
+        imported = self.root / 'imported'
+        imported.mkdir()
+        cv2.imwrite(str(imported / '01.png'), np.full(self.mask.shape, 255, np.uint8))
+        expected = {'detector': 'ysgyolo', 'detector_label': 'Historical detector',
+                    'detector_params': {'labels': ['old']}, 'model': '/removed/checkpoint.pt',
+                    'device': 'old-device'}
+        workers = [
+            FolderWorker(str(self.root), 'imported_mask', [self.path],
+                         imported_mask_dir=str(imported), imported_mask_mode='intersect'),
+            ConvertMasksWorker(str(self.root), self.paths, [self.path], 'manual_other'),
+            FolderWorker(str(self.root), 'keep_original', [self.path]),
+        ]
+        for worker in workers:
+            with self.subTest(worker=type(worker).__name__, mode=getattr(worker, 'mode', 'convert')):
+                store.update_project(self.paths['raw'], **expected)
+                failures = []
+                worker.failed.connect(failures.append)
+                with patch('solid_inpaint_ui.create_detector', side_effect=AssertionError('no detector')):
+                    worker.run()
+                self.assertEqual(failures, [])
+                actual = store.load_project(self.paths['raw'])
+                self.assertEqual({key: actual[key] for key in expected}, expected)
 
     def test_saved_page_refresh_reuses_memory_and_explicit_reload_reads_disk(self):
         import solid_inpaint_ui as ui
@@ -773,7 +829,7 @@ class EditorTests(unittest.TestCase):
 
         selections = []
         view.selectionCreated.connect(lambda selection: selections.append(selection))
-        for mode in ('transfer_from_other', 'ctd_detect_selection',
+        for mode in ('transfer_from_other',
                      'rfdetr_detect_selection', 'local_edit_selection'):
             view.set_selection_combine_mode(mode)
             view._start_magic_stroke((39, 39))
@@ -1491,7 +1547,7 @@ class EditorTests(unittest.TestCase):
         np.testing.assert_array_equal(redone['other'], after['other'])
 
     def test_rfdetr_selection_worker_uses_saved_model_and_crops_to_selection(self):
-        from solid_inpaint_ui import CtdSelectionWorker, DETECTOR_RFDETR
+        from solid_inpaint_ui import SelectionDetectionWorker, DETECTOR_RFDETR
         image = np.full((100, 100, 3), 175, np.uint8)
         selection = np.zeros((100, 100), bool)
         selection[40, 42] = True
@@ -1503,7 +1559,7 @@ class EditorTests(unittest.TestCase):
             calls.append((crop.shape, kwargs))
             return None, np.full(crop.shape[:2], 255, np.uint8), None
 
-        worker = CtdSelectionWorker(7, self.path, image, selection, DETECTOR_RFDETR, params)
+        worker = SelectionDetectionWorker(7, self.path, image, selection, DETECTOR_RFDETR, params)
         params['device'] = 'cpu'
         results = []
         worker.finished.connect(lambda *args: results.append(args))
@@ -1518,9 +1574,9 @@ class EditorTests(unittest.TestCase):
         self.assertEqual((request_id, path, count), (7, self.path, 2))
         np.testing.assert_array_equal(detected > 0, selection)
 
-        ctd = CtdSelectionWorker(8, self.path, image, selection)
+        default_worker = SelectionDetectionWorker(8, self.path, image, selection)
         with patch('solid_inpaint_ui.create_detector', return_value=detector) as factory:
-            ctd.run()
+            default_worker.run()
         factory.assert_called_once_with()
 
     def test_rfdetr_selection_reads_saved_settings_with_fallbacks(self):
@@ -1576,28 +1632,28 @@ class EditorTests(unittest.TestCase):
         selection = np.zeros_like(self.mask, bool); selection[70:72, 85:87] = True
         with patch.object(QThread, 'start'):
             w.start_rfdetr_selection_detection(selection)
-        worker = w.ctd_selection_worker
+        worker = w.selection_detection_worker
         self.assertEqual(worker.detector_name, DETECTOR_RFDETR)
         self.assertEqual(worker.detector_params,
             {'device': 'cpu', 'inpaint_mask_dilate': 5, 'mask_mode': 'onomatopoeia'})
-        self.assertEqual(w.ctd_selection_detector_label, 'RF-DETR')
-        request_id = w.ctd_selection_request_id
+        self.assertEqual(w.selection_detection_detector_label, 'RF-DETR')
+        request_id = w.selection_detection_request_id
         with patch('solid_inpaint_ui.QMessageBox.information') as info:
-            w.start_ctd_selection_detection(selection)
-        self.assertEqual(w.ctd_selection_request_id, request_id)
+            w.start_rfdetr_selection_detection(selection)
+        self.assertEqual(w.selection_detection_request_id, request_id)
         self.assertIn('RF-DETR', info.call_args.args[2])
-        w.cleanup_ctd_selection_worker()
+        w.cleanup_selection_detection_worker()
 
     def test_rfdetr_selection_result_saves_other_and_undo_restores_solid(self):
         w = self.window
         before = read_page_state(self.paths, self.path)
         w.set_edit_mode('manual_other')
-        w.ctd_selection_request_id = 17
-        w.ctd_selection_edit_mode = 'manual_other'
-        w.ctd_selection_detector_label = 'RF-DETR'
+        w.selection_detection_request_id = 17
+        w.selection_detection_edit_mode = 'manual_other'
+        w.selection_detection_detector_label = 'RF-DETR'
         detected = np.zeros_like(self.mask)
         detected[70:74, 86:90] = 255
-        w.on_ctd_selection_finished(17, self.path, detected, 16)
+        w.on_selection_detection_finished(17, self.path, detected, 16)
         after = read_page_state(self.paths, self.path)
         self.assertTrue(np.all(after['other'][70:74, 86:90] == 255))
         self.assertFalse(np.any(after['overlay'][70:74, 86:90, 3]))
@@ -1618,7 +1674,7 @@ class EditorTests(unittest.TestCase):
         np.testing.assert_array_equal(redone['overlay'], after['overlay'])
         np.testing.assert_array_equal(redone['other'], after['other'])
         undo_count = len(w.undo_stack)
-        w.on_ctd_selection_finished(17, self.path, detected, 16)
+        w.on_selection_detection_finished(17, self.path, detected, 16)
         self.assertEqual(len(w.undo_stack), undo_count)
         self.assertIn('RF-DETR 檢測結果已在目前 mask 中', w.status.currentMessage())
 
@@ -1626,21 +1682,21 @@ class EditorTests(unittest.TestCase):
         w = self.window
         before = read_page_state(self.paths, self.path)
         detected = np.zeros_like(self.mask); detected[70:72, 86:88] = 255
-        w.ctd_selection_request_id = 31
-        w.ctd_selection_edit_mode = 'manual_solid'
-        w.ctd_selection_detector_label = 'RF-DETR'
+        w.selection_detection_request_id = 31
+        w.selection_detection_edit_mode = 'manual_solid'
+        w.selection_detection_detector_label = 'RF-DETR'
         initial_undo = len(w.undo_stack)
-        w.on_ctd_selection_finished(30, self.path, detected, 4)
-        w.on_ctd_selection_finished(31, '/different/page.png', detected, 4)
+        w.on_selection_detection_finished(30, self.path, detected, 4)
+        w.on_selection_detection_finished(31, '/different/page.png', detected, 4)
         w.set_edit_mode('manual_other')
-        w.on_ctd_selection_finished(31, self.path, detected, 4)
+        w.on_selection_detection_finished(31, self.path, detected, 4)
         self.assertIn('RF-DETR', w.status.currentMessage())
-        w.ctd_selection_edit_mode = 'manual_other'
-        w.on_ctd_selection_finished(31, self.path, np.zeros((5, 5), np.uint8), 4)
-        w.on_ctd_selection_finished(31, self.path, np.zeros_like(self.mask), 0)
+        w.selection_detection_edit_mode = 'manual_other'
+        w.on_selection_detection_finished(31, self.path, np.zeros((5, 5), np.uint8), 4)
+        w.on_selection_detection_finished(31, self.path, np.zeros_like(self.mask), 0)
         self.assertEqual(len(w.undo_stack), initial_undo)
-        w.on_ctd_selection_failed(30, self.path, 'stale')
-        w.on_ctd_selection_failed(31, self.path, 'model error')
+        w.on_selection_detection_failed(30, self.path, 'stale')
+        w.on_selection_detection_failed(31, self.path, 'model error')
         self.assertIn('RF-DETR 選區檢測失敗：model error', w.status.currentMessage())
         after = read_page_state(self.paths, self.path)
         for key in before:

@@ -16,17 +16,9 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 from bubble_solid import detect_bubbles, fill_bubbles, load_settings, spatial_spread
+from rfdetr_config import MODEL_FILE as RF_DETR_MODEL_PATH
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-VENDOR_DIR = SCRIPT_DIR / 'vendor'
-if str(VENDOR_DIR) not in sys.path:
-    sys.path.insert(0, str(VENDOR_DIR))
-
-from inference import TextDetector
-from ctbd_detector import ComicTextAndBubbleDetector
-from utils.io_utils import find_all_imgs, imread, imwrite
-from utils.textmask import REFINEMASK_ANNOTATION
-
+from image_io import find_all_imgs, imread, imwrite
 
 import project_store as store
 
@@ -34,25 +26,10 @@ OUTPUT_DIR = 'ctd_inpainted'
 RAW_DIR = 'raw'
 EXPORT_PAIR_DIR = 'export_pair'
 PREVIEW_PDF = 'preview_report.pdf'
-MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'comictextdetector.pt'
-CTBD_MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'comic-text-and-bubble-detector.onnx'
-YSG_MODEL_PATH = SCRIPT_DIR / 'models' / 'ysgyolo_yolo26_2.0.pt'
-RF_DETR_MODEL_PATH = (
-    Path(__file__).resolve().parent
-    / 'models'
-    / 'koharu-layout-rfdetr-seg-2xl-1152'
-    / 'model.safetensors'
-)
-DETECTOR_CTBD = 'ctbd'
-DETECTOR_LEGACY_CTD = 'legacy_ctd'
 DETECTOR_RFDETR = 'rfdetr'
-DETECTOR_YSGYOLO = 'ysgyolo'
-DEFAULT_DETECTOR = DETECTOR_LEGACY_CTD
+DEFAULT_DETECTOR = DETECTOR_RFDETR
 DETECTOR_LABELS = {
-    DETECTOR_CTBD: 'CTBD',
-    DETECTOR_LEGACY_CTD: 'CTD',
     DETECTOR_RFDETR: 'RF-DETR',
-    DETECTOR_YSGYOLO: 'YSGYOLO 2.0',
 }
 NATURAL_SORT_RE = re.compile(r'(\d+)')
 
@@ -967,15 +944,19 @@ def natural_sort_key(name: str) -> tuple:
 
 
 def detector_model_path(detector_name: str) -> Path:
-    if detector_name == DETECTOR_CTBD:
-        return CTBD_MODEL_PATH
-    if detector_name == DETECTOR_LEGACY_CTD:
-        return MODEL_PATH
     if detector_name == DETECTOR_RFDETR:
         return RF_DETR_MODEL_PATH
-    if detector_name == DETECTOR_YSGYOLO:
-        return YSG_MODEL_PATH
     raise ValueError(f'不支援的 detector：{detector_name}')
+
+
+def project_detector_settings(project: dict) -> tuple[str, dict]:
+    """Resolve saved metadata only; explicit API choices must pass validation.
+
+    Projects from removed detectors keep their existing page data. The next
+    explicitly requested detection uses HighRes with fresh compatible params.
+    """
+    params = project.get('detector_params') if project.get('detector') == DETECTOR_RFDETR else None
+    return DETECTOR_RFDETR, dict(params) if isinstance(params, dict) else {}
 
 
 def create_detector(
@@ -985,38 +966,35 @@ def create_detector(
     model_path = osp.abspath(str(detector_model_path(detector_name)))
     if not osp.isfile(model_path):
         raise FileNotFoundError(f'找不到模型檔：{model_path}')
-    if detector_name == DETECTOR_CTBD:
-        return ComicTextAndBubbleDetector(model_path, **(detector_params or {}))
-    if detector_name == DETECTOR_YSGYOLO:
-        from ysg_detector import YSGYoloDetector
-        return YSGYoloDetector(model_path, **(detector_params or {}))
-    if detector_name == DETECTOR_RFDETR:
-        try:
-            from rfdetr_detector import RfDetrSegDetector
-        except ImportError as exc:
-            raise RuntimeError(
-                'RF-DETR 需要 rfdetr 與相關依賴，請先完成依賴安裝（參考 HANDOFF_RFDETR.md）。'
-            ) from exc
-        return RfDetrSegDetector(model_path, **(detector_params or {}))
-    return TextDetector(model_path=model_path, input_size=1024, device='cpu', act='leaky')
+    from rfdetr_detector import RfDetrSegDetector
+    return RfDetrSegDetector(model_path, **(detector_params or {}))
 
 
 def process_image_with_detector(
     img_path: str,
     paths: dict[str, str],
-    detector: TextDetector,
+    detector,
 ) -> dict:
     img = imread(img_path, cv2.IMREAD_UNCHANGED)
     if img is None:
         raise FileNotFoundError(f'無法讀取原圖：{img_path}')
     detect_img = img[:, :, :3] if len(img.shape) == 3 else cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    _, mask_refined, _ = detector(
-        detect_img,
-        refine_mode=REFINEMASK_ANNOTATION,
-        keep_undetected_mask=True,
-    )
+    mask_refined, shared_bubbles = _detect_with_optional_bubbles(
+        detector, detect_img, load_settings(paths['raw'])['enabled'])
     mask_refined = np.where(mask_refined > 0, 255, 0).astype(np.uint8)
-    return regenerate_image_from_mask(img_path, paths, mask_refined)
+    return regenerate_image_from_mask(img_path, paths, mask_refined, shared_bubbles=shared_bubbles)
+
+
+def _detect_with_optional_bubbles(detector, image, enabled):
+    shared = None
+    kwargs = {'keep_undetected_mask': True}
+    # Inspect the explicit API on the type, rather than inventing a capability
+    # on generic dynamic proxies (including legacy detector mocks).
+    if enabled and callable(getattr(type(detector), 'detect_with_bubbles', None)):
+        result, shared = detector.detect_with_bubbles(image, **kwargs)
+    else:
+        result = detector(image, **kwargs)
+    return result[1], shared
 
 
 ADD_DETECTION_TARGET_MODES = ('manual_solid', 'manual_other')
@@ -1133,7 +1111,7 @@ def add_detection_to_mask(img_path, paths, detector, target_mode='manual_other')
     image = imread(img_path, cv2.IMREAD_COLOR)
     if image is None:
         raise FileNotFoundError(f'無法讀取原圖：{img_path}')
-    _, detected, _ = detector(image, refine_mode=REFINEMASK_ANNOTATION, keep_undetected_mask=True)
+    _, detected, _ = detector(image, keep_undetected_mask=True)
     state = read_page_state(paths, img_path, image.shape[:2])
     solid, other = state['overlay'][:, :, 3].copy(), state['other'].copy()
     target, opposite = (solid, other) if target_mode == 'manual_solid' else (other, solid)
@@ -1142,7 +1120,8 @@ def add_detection_to_mask(img_path, paths, detector, target_mode='manual_other')
     return summary
 
 
-def regenerate_image_from_mask(img_path, paths, mask=None, *, reclassify=False):
+def regenerate_image_from_mask(img_path, paths, mask=None, *, reclassify=False,
+                               shared_bubbles=None):
     image = imread(img_path, cv2.IMREAD_COLOR)
     if image is None:
         raise FileNotFoundError(f'無法讀取原圖：{img_path}')
@@ -1160,12 +1139,14 @@ def regenerate_image_from_mask(img_path, paths, mask=None, *, reclassify=False):
     cache_path = store.cache_path(paths, img_path)
     if mask is None:
         report = load_report(paths)
-        detector = create_detector(report.get('detector', DEFAULT_DETECTOR), report.get('detector_params'))
-        _, mask, _ = detector(image, refine_mode=REFINEMASK_ANNOTATION, keep_undetected_mask=True)
+        detector = create_detector(*project_detector_settings(report))
+        mask, shared_bubbles = _detect_with_optional_bubbles(
+            detector, image, load_settings(paths['raw'])['enabled'])
     mask = np.where(mask > 0, 255, 0).astype(np.uint8)
     if mask.shape != image.shape[:2]:
         raise ValueError('偵測 Mask 尺寸與原圖不一致。')
-    polygons, settings, bubble_status = bubble_context(image, mask, paths, img_path)
+    polygons, settings, bubble_status = bubble_context(
+        image, mask, paths, img_path, shared_bubbles=shared_bubbles)
     jpeg_source = Path(img_path).suffix.lower() in ('.jpg', '.jpeg')
     overlay, other, sample, diagnostics = _solid_overlay_from_mask(
         image, mask, polygons, settings['shrink_percent']/100,
@@ -1183,13 +1164,17 @@ def regenerate_image_from_mask(img_path, paths, mask=None, *, reclassify=False):
     return store.save_page(paths, img_path, page, diagnostics)
 
 
-def bubble_context(detect_img, mask, paths, img_path):
+def bubble_context(detect_img, mask, paths, img_path, *, shared_bubbles=None):
     settings = load_settings(paths['raw'])
     polygons = []
     status = {'status': 'disabled' if not settings['enabled'] else 'no_text'}
     if settings['enabled'] and (settings['direct_white'] or np.any(mask)):
         try:
-            polygons, source = detect_bubbles(detect_img, store.cache_path(paths, img_path))
+            cache = store.cache_path(paths, img_path)
+            if shared_bubbles is None:
+                polygons, source = detect_bubbles(detect_img, cache)
+            else:
+                polygons, source = detect_bubbles(detect_img, cache, shared_prediction=shared_bubbles)
             status = {'status': source, 'instances': len(polygons)}
         except Exception as exc:
             status = {'status': 'unavailable', 'error': str(exc)}
@@ -1283,23 +1268,13 @@ def run(img_dir: str, detector_name: str | None = None, *, start_page: int = 1,
         if any((raw / name).exists() for name in legacy):
             raise ValueError('此資料夾是舊格式專案。請先將 ctd_inpainted 改名保留，再重新偵測建立新版專案。')
     existing = store.load_project(raw)
-    saved_detector = existing.get('detector', DEFAULT_DETECTOR)
+    saved_detector, detector_params = project_detector_settings(existing)
     detector_name = saved_detector if detector_name is None else detector_name
     model_path = osp.abspath(str(detector_model_path(detector_name)))
-    detector_params = (dict(existing.get('detector_params') or {})
-                       if detector_name == saved_detector and
-                       isinstance(existing.get('detector_params'), dict) else {})
     if device is not None:
         if device not in ('auto', 'cpu', 'mps', 'cuda'):
             raise ValueError(f'不支援的裝置：{device}')
-        if detector_name in (DETECTOR_CTBD, DETECTOR_LEGACY_CTD):
-            if device not in ('auto', 'cpu'):
-                raise ValueError(f'{DETECTOR_LABELS[detector_name]} 只支援 CPU。')
-            detector_params.pop('device', None)
-        else:
-            detector_params['device'] = device
-    elif detector_name in (DETECTOR_CTBD, DETECTOR_LEGACY_CTD):
-        detector_params.pop('device', None)
+        detector_params['device'] = device
     print(f'資料夾：{img_dir}')
     print(f'輸出：{paths["output"]}')
     print(f'專案圖片數：{len(imglist)}；本次頁面：{start_page}–{end_page}（{len(selected)} 頁）')
@@ -1382,19 +1357,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('img_dir', help='輸入圖片資料夾路徑')
     parser.add_argument(
         '--detector',
-        choices=(DETECTOR_CTBD, DETECTOR_LEGACY_CTD, DETECTOR_RFDETR, DETECTOR_YSGYOLO),
+        choices=(DETECTOR_RFDETR,),
         default=None,
         help=(
-            '文字偵測模型；ctbd 使用 RT-DETR-V2 ONNX 模型，'
-            'rfdetr 使用 RF-DETR 分割模型，ysgyolo 使用 YSGYOLO 2.0，legacy_ctd 使用 CTD 模型；'
-            '未指定時沿用專案原模型，新專案使用 legacy_ctd。'
+            '使用 Koharu Layout HighRes（1920）分割模型；'
+            '舊專案使用其他模型時，僅在要求偵測的頁面改用 HighRes。'
         ),
     )
     parser.add_argument('--start-page', type=int, default=1, help='起始頁（依檔名自然排序，從 1 開始）')
     parser.add_argument('--end-page', type=int, help='結束頁（包含此頁，預設最後一頁）')
     parser.add_argument('--redetect', action='store_true', help='明確重跑選定範圍內已有結果')
     parser.add_argument('--device', choices=('auto', 'cpu', 'mps', 'cuda'),
-                        help='運算裝置；CTD 和 CTBD 僅支援 auto/cpu')
+                        help='運算裝置；自動依序選擇 CUDA、MPS、CPU')
     parser.add_argument('--bubble', action=argparse.BooleanOptionalAction, default=None,
                         help='本次是否啟用氣泡填充；未指定時沿用專案設定')
     args = parser.parse_args(argv)

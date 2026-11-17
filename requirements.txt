@@ -1,17 +1,12 @@
 numpy<2; python_version < "3.13"
 numpy>=2,<3; python_version >= "3.13"
 opencv-python
-onnxruntime
 Pillow
 PySide6-Essentials
 packaging
 tqdm
 torch
 torchvision
-shapely
-pyclipper
-ultralytics>=8.4.14
-networkx
 rfdetr==1.7.0
 transformers==5.15.0
 supervision==0.28.0

@@ -155,9 +155,9 @@ class HeadlessDetectionTests(unittest.TestCase):
         self.assertEqual(self.report()['summary']['failed'], 0)
         self.assertTrue(store.is_page_reviewed(self.report()['pages']['10.png']))
 
-    def test_bad_range_missing_model_and_unsupported_device_fail_before_writes(self):
+    def test_bad_range_and_missing_model_fail_before_writes(self):
         for args in (('--start-page', '0'), ('--end-page', '4'),
-                     ('--start-page', '3', '--end-page', '2'), ('--device', 'mps')):
+                     ('--start-page', '3', '--end-page', '2')):
             with self.subTest(args=args):
                 status, _, create, _, _ = self.execute(arguments=args)
                 self.assertEqual(status, 2)
@@ -173,23 +173,23 @@ class HeadlessDetectionTests(unittest.TestCase):
 
     def test_model_parameters_and_bubble_preference_follow_project(self):
         status, _, create, _, _ = self.execute(arguments=(
-            '--start-page', '1', '--end-page', '1', '--detector', 'ysgyolo',
+            '--start-page', '1', '--end-page', '1', '--detector', 'rfdetr',
             '--device', 'mps', '--no-bubble'))
         self.assertEqual(status, 0)
-        create.assert_called_once_with('ysgyolo', {'device': 'mps'})
+        create.assert_called_once_with('rfdetr', {'device': 'mps'})
         self.assertEqual(self.report()['settings']['solid_fill']['enabled'], False)
         self.assertEqual(self.report()['detector_params'], {'device': 'mps'})
         status, _, create, _, _ = self.execute(arguments=('--start-page', '2', '--end-page', '2'))
         self.assertEqual(status, 0)
-        create.assert_called_once_with('ysgyolo', {'device': 'mps'})
+        create.assert_called_once_with('rfdetr', {'device': 'mps'})
         self.assertEqual(self.report()['settings']['solid_fill']['enabled'], False)
         status, _, create, _, _ = self.execute(arguments=(
-            '--start-page', '3', '--end-page', '3', '--detector', 'ctbd', '--device', 'auto',
+            '--start-page', '3', '--end-page', '3', '--detector', 'rfdetr', '--device', 'auto',
             '--bubble'))
         self.assertEqual(status, 0)
-        create.assert_called_once_with('ctbd', {})
+        create.assert_called_once_with('rfdetr', {'device': 'auto'})
         self.assertEqual(self.report()['settings']['solid_fill']['enabled'], True)
-        self.assertEqual(self.report()['detector_params'], {})
+        self.assertEqual(self.report()['detector_params'], {'device': 'auto'})
 
     def test_importing_cli_does_not_start_qt_gui(self):
         source = ('import sys; import detect_solid_inpaint_folder; '
@@ -198,6 +198,43 @@ class HeadlessDetectionTests(unittest.TestCase):
         child = subprocess.run([sys.executable, '-c', source], cwd=str(Path(cli.__file__).parent),
                                capture_output=True, text=True)
         self.assertEqual(child.returncode, 0, child.stderr)
+
+    def test_legacy_model_metadata_is_read_only_on_skip_and_falls_back_on_redetect(self):
+        self.assertEqual(self.execute()[0], 0)
+        image = self.folder / '2.png'
+        page = store.load_page(self.paths, image, (24, 24))
+        page['other'][15, 15] = page['edited'][15, 15] = 255
+        store.save_page(self.paths, image, page)
+        untouched = store.page_path(self.paths, '10.png').read_bytes()
+        for old_model in ('legacy_ctd', 'ctbd', 'ysgyolo'):
+            with self.subTest(model=old_model):
+                store.update_project(self.paths['raw'], detector=old_model,
+                                     detector_params={'labels': ['old'], 'text_region_filter': 'all'})
+                before_project = store.project_path(self.paths['raw']).read_bytes()
+                before_page = store.page_path(self.paths, image).read_bytes()
+                status, _, create, _, _ = self.execute(model=Path('/missing/model'))
+                self.assertEqual(status, 0)
+                create.assert_not_called()
+                self.assertEqual(store.project_path(self.paths['raw']).read_bytes(), before_project)
+                self.assertEqual(store.page_path(self.paths, image).read_bytes(), before_page)
+                status, _, create, _, _ = self.execute(arguments=(
+                    '--start-page', '2', '--end-page', '2', '--redetect'))
+                self.assertEqual(status, 0)
+                create.assert_called_once_with('rfdetr', {})
+                self.assertEqual(self.report()['detector'], 'rfdetr')
+                self.assertEqual(self.report()['detector_params'], {})
+                after = store.load_page(self.paths, image, (24, 24))
+                self.assertEqual(int(after['other'][15, 15]), 255)
+                self.assertEqual(int(after['edited'][15, 15]), 255)
+                self.assertEqual(store.page_path(self.paths, '10.png').read_bytes(), untouched)
+
+    def test_explicit_removed_models_are_rejected_before_writes(self):
+        for old_model in ('legacy_ctd', 'ctbd', 'ysgyolo'):
+            with self.subTest(model=old_model), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as failure:
+                    cli.main([str(self.folder), '--detector', old_model])
+                self.assertEqual(failure.exception.code, 2)
+                self.assertFalse((self.folder / 'ctd_inpainted').exists())
 
 
 if __name__ == '__main__':

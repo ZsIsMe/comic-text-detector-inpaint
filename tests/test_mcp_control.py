@@ -41,8 +41,7 @@ class DummyButton:
 class DetectorSelectorWidget(QWidget):
     def __init__(self, settings):
         super().__init__()
-        self.buttons = {name: DummyButton(name == settings.value('detector/last_name', 'legacy_ctd'))
-                        for name in ('legacy_ctd', 'ctbd', 'rfdetr', 'ysgyolo')}
+        self.buttons = {'rfdetr': DummyButton(True)}
 
     def selected_detector(self):
         return next(name for name, button in self.buttons.items() if button.checked)
@@ -70,7 +69,7 @@ class DummyWindow(QWidget):
         self.list_widget.currentRowChanged.connect(self._selected)
         self.worker_thread = None
         self.page_worker_thread = None
-        self.ctd_selection_worker_thread = None
+        self.selection_detection_worker_thread = None
         self.render_timer = DummyTimer()
         self.is_local_edit_active = False
         self.is_mask_stroke_active = False
@@ -226,6 +225,7 @@ class McpControlTests(unittest.TestCase):
         self.assertFalse(self.window.folder)
         self.call('open_project', {'path': str(self.root)})
         for params in ({'start_page': 0}, {'end_page': 3},
+                       {'detector': 'legacy_ctd'}, {'detector': 'ctbd'}, {'detector': 'ysgyolo'},
                        {'bubble': {'shrink_percent': 50}},
                        {'bubble': {'shrink_percent': True}},
                        {'detector_params': {'bad_key': 1}}):

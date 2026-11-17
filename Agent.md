@@ -59,18 +59,19 @@ py -3 bootstrap.py
 .venv/bin/python detect_solid_inpaint_folder.py /path/to/image_folder
 ```
 
-預設跳過已有成功結果及人工資料，只處理未完成頁；成功但沒有選區的頁面也算已有結果。`--start-page 5 --end-page 8` 指定與 GUI 相同自然排序、從 1 開始的頁碼（包含首尾）；只有使用者明確要求重跑才加 `--redetect`。可用 `--detector`、`--device`、`--bubble`／`--no-bubble`；未指定模型與氣泡設定時，舊專案沿用其已保存參數，新專案使用預設值，不讀寫 GUI 全局偏好。結果仍是相同的 v2 專案，之後可用 GUI 繼續逐頁校正。退出碼 0 為成功、1 為頁面失敗、2 為參數或啟動錯誤；完整參數見 README。不要同時用 CLI 和 GUI 修改同一專案。
+預設跳過已有成功結果及人工資料，只處理未完成頁；成功但沒有選區的頁面也算已有結果。`--start-page 5 --end-page 8` 指定與 GUI 相同自然排序、從 1 開始的頁碼（包含首尾）；只有使用者明確要求重跑才加 `--redetect`。本分支唯一模型為 Koharu Layout HighRes，`--detector` 僅接受 `rfdetr`，可省略；另可用 `--device`、`--bubble`／`--no-bubble`。有效的 RF-DETR 與氣泡參數沿用專案設定，新專案使用預設值，不讀寫 GUI 全局偏好。舊 v2 專案若記錄了已移除的模型，仍可讀取其保存結果；新偵測或重新分類改用 HighRes 安全預設，不沿用舊模型專屬參數，也不因此自動重跑既有頁面。結果仍是相同的 v2 專案，之後可用 GUI 繼續逐頁校正。退出碼 0 為成功、1 為頁面失敗、2 為參數或啟動錯誤；完整參數見 README。不要同時用 CLI 和 GUI 修改同一專案。
 
 ## 依賴注意
 
 `requirements.txt` 有兩個重要點：
 
 ```text
-numpy<2
+numpy<2（Python 3.13 之前）
+numpy>=2,<3（Python 3.13 以上）
 PySide6-Essentials
 ```
 
-`numpy<2` 是為了避免舊 detector 程式遇到 NumPy 2.x 移除舊別名後啟動失敗。
+NumPy 限制依 Python 版本選擇相容系列，修改時須同時核對 OpenCV、PyTorch 與 RF-DETR 的相容性。
 
 `PySide6-Essentials` 是為了避免安裝完整 `PySide6` 時拉入大型 Qt Addons。當前 GUI 主要使用 `QtCore`、`QtGui`、`QtWidgets`，Essentials 應該足夠。
 
@@ -83,16 +84,16 @@ PySide6-Essentials
 首次啟動時 `bootstrap.py` 會下載：
 
 ```text
-models/comictextdetector.pt
+models/koharu-layout-highres/model.safetensors
 ```
 
 模型來源：
 
 ```text
-https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.2.1/comictextdetector.pt
+https://huggingface.co/mayocream/koharu-layout-highres
 ```
 
-模型授權與歸屬屬於原項目。
+模型授權與歸屬屬於原項目。`rfdetr_config.py` 統一權重來源、路徑、SHA-256、1920 輸入尺寸與分類門檻；bootstrap 只下載此模型，文字及氣泡填充共用權重。
 
 ## 輸入與輸出
 
@@ -128,7 +129,7 @@ ctd_inpainted/raw/cache/<原圖檔名>.npz
 核心流程在 `detect_solid_inpaint_folder.py`：
 
 ```text
-1. 使用 TextDetector 偵測文字 mask
+1. 使用 RfDetrSegDetector（Koharu Layout HighRes）偵測文字 mask
 2. 將 mask 連通區合併成文字區塊
 3. 對每個區塊建立 repair area
 4. 在 repair area 外建立 sample ring
@@ -137,7 +138,9 @@ ctd_inpainted/raw/cache/<原圖檔名>.npz
 7. 若背景不可靠，寫入 other_mask
 ```
 
-啟用 MangaLens 時，它只提供氣泡輪廓，不再次分類背景。氣泡填充預設開啟「直接對氣泡塗白」：對每個偵測到的氣泡內縮後塗白，即使沒有文字或只有 OTHER。取消此子選項則沿用已判純色文字的底色擴張：氣泡內須有純色文字才填色，只有 OTHER 不觸發。兩種模式都會清除填色範圍內的自動 OTHER；重新偵測後仍逐像素還原人工分類、填色與擦除。GUI「偵測並生成」的氣泡填充選擇存於全局 QSettings，跨專案及重開沿用；當次實際處理設定也寫入 `raw/project.json` 的 `settings.solid_fill`，供專案處理及 CLI 使用。舊專案缺 `direct_white` 時預設開啟。
+啟用氣泡填充時，使用 Koharu Layout HighRes 的 `bubble` 類（信心門檻 0.50）提供逐實例輪廓，不再次分類背景。一般頁共用同一次推論的獨立氣泡結果；按來源像素及模型簽章核對後才使用，不從文字 Mask 推導氣泡。外部 Mask 需要氣泡填充時會懶載入 HighRes 氣泡模型，自動使用 CUDA、MPS 或 CPU；長圖仍用重疊裁窗並優先沿用已載入的偵測器。關閉氣泡填充不讀氣泡快取或另載入氣泡模型。新版快取與舊模型快取隔離，既有正式頁面不自動重跑。
+
+氣泡填充預設開啟「直接對氣泡塗白」：對每個偵測到的氣泡內縮後塗白，即使沒有文字或只有 OTHER。取消此子選項則沿用已判純色文字的底色擴張：氣泡內須有純色文字才填色，只有 OTHER 不觸發。兩種模式都會清除填色範圍內的自動 OTHER；重新偵測後仍逐像素還原人工分類、填色與擦除。GUI「偵測並生成」的氣泡填充選擇存於全局 QSettings，跨專案及重開沿用；當次實際處理設定也寫入 `raw/project.json` 的 `settings.solid_fill`，供專案處理及 CLI 使用。舊專案缺 `direct_white` 時預設開啟。
 
 「偵測並生成」可選起始頁與結束頁，依左側圖片列表順序、包含首尾，預設第一頁至最後一頁；只重跑所選頁面。
 此視窗的「保留原圖（不去字）」模式不載入模型或執行偵測，將所選頁的填色、OTHER、人工修改與擦除全部清空，保存為已處理的空白頁；既有選區會先要求確認，校對標記不會因此成立。原圖與範圍外頁面不變。
@@ -201,7 +204,7 @@ AI 監修介面獨立顯示目前頁、保存狀態與編輯模式，支援路�
 
 修改依賴時要注意普通用戶首次啟動成本。完整 PySide6 會顯著增加下載量和磁碟佔用。
 
-修改 detector/vendor 相關代碼時要小心。`vendor/` 是外部 detector 程式的拷貝版本，不會自動跟上游同步。
+偵測器只有 `rfdetr_detector.py`；通用影像 I/O 與 Mask 幾何分別位於 `image_io.py`、`mask_utils.py`。舊 detector 的 vendor 程式已移除；氣泡填充的衍生設計仍須保留來源標註及 `vendor/LICENSE-BallonsTranslator`。
 
 ## 驗證建議
 
@@ -212,7 +215,7 @@ AI 監修介面獨立顯示目前頁、保存狀態與編輯模式，支援路�
 ```
 
 ```bash
-.venv/bin/python -c "import sys; sys.path.insert(0, 'vendor'); from detect_solid_inpaint_folder import TextDetector; print('detector import ok')"
+.venv/bin/python -c "from rfdetr_detector import RfDetrSegDetector; from detect_solid_inpaint_folder import create_detector; print('detector import ok')"
 ```
 
 如果改動核心處理邏輯，應該用一個小圖片資料夾跑：
@@ -240,5 +243,5 @@ preview_report.pdf（按需生成）
 __pycache__/
 .DS_Store
 ctd_inpainted/
-models/comictextdetector.pt
+models/koharu-layout-highres/model.safetensors
 ```

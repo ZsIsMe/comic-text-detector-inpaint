@@ -2,6 +2,10 @@
 
 MCP 控制正在執行的 Solid Inpaint GUI。開啟專案、啟動偵測、跳頁、原圖座標選區及保存沿用 GUI 的兩類資料與撤銷流程，改動顯示在同一個視窗。影像內容與去字品質仍由使用者或 AI 逐頁視覺確認。
 
+本分支只提供 RF-DETR（Koharu Layout HighRes）。`get_detection_settings` 回傳 HighRes 與氣泡填充設定；`start_detection` 的 `detector` 可省略，明確指定時僅接受 `"rfdetr"`。已移除的模型名稱不再是 MCP 入口，傳入會回報 `bad_request`。可用的偵測器參數為 `device`、`inpaint_mask_dilate`、`mask_mode`；氣泡填充也使用同一 HighRes 權重。
+
+舊 v2 專案的已保存結果仍可開啟。若專案記錄了已移除的模型，新偵測或重新分類會回退至 HighRes 安全預設；不會因切換模型而自動重跑已處理頁面或清除人工修改。
+
 先按原本方式啟動 GUI，另安裝選用依賴：
 
 ```bash

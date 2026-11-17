@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sys
+from typing import Literal
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -65,7 +66,7 @@ def get_detection_settings(instance_id: str | None = None) -> dict:
 def start_detection(
     start_page: int = 1,
     end_page: int | None = None,
-    detector: str | None = None,
+    detector: Literal['rfdetr'] | None = None,
     detector_params: dict | None = None,
     bubble: dict | None = None,
     allow_redetect: bool = False,

@@ -13,7 +13,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from load_model import CLASS_NAMES, CLASS_THRESHOLDS, load_rfdetr_model
+from load_model import load_rfdetr_model
+from rfdetr_config import CLASS_NAMES, CLASS_THRESHOLDS, RESOLUTION
 
 
 def _save_mask(mask: np.ndarray, path: Path) -> None:
@@ -25,8 +26,8 @@ def run_device(model, image: np.ndarray, device: str, out_dir: Path) -> dict:
     t0 = time.time()
     detections = model.predict(
         image,
-        threshold=0.20,
-        shape=(1152, 1152),
+        threshold=min(CLASS_THRESHOLDS.values()),
+        shape=(RESOLUTION, RESOLUTION),
         include_source_image=False,
     )
     elapsed = time.time() - t0

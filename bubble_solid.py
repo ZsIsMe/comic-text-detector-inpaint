@@ -1,11 +1,10 @@
-"""MangaLens bubble geometry for white fills or verified solid text expansion.
+"""Koharu Layout HighRes bubble geometry for white fills or solid text expansion.
 
 The polygon/2% inset approach follows manga-translator-ui's ballon_fill.py and
 mangalens_detector.py (GPL-3.0; see vendor/LICENSE-BallonsTranslator).
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import threading
 from pathlib import Path
@@ -13,11 +12,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 import project_store as store
+from rfdetr_config import MODEL_FILE as MODEL_PATH, MODEL_URL, MODEL_SHA256, RESOLUTION, CLASS_THRESHOLDS
+from rfdetr_detector import RfDetrSegDetector, model_signature, source_key
 
-MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'mangalens.pt'
-MODEL_URL = 'https://www.modelscope.cn/models/hgmzhn/manga-translator-ui/resolve/master/mangalens.pt'
-MODEL_SHA256 = '4028152940f7c910f40192f46ede3b3f6c7129e5c76849c324d3564f8ac50198'
-CACHE_VERSION = 1
+CACHE_VERSION = 2
+TILE_VERSION = 1
 _model = None
 _model_signature = None
 _model_lock = threading.Lock()
@@ -66,17 +65,18 @@ def _tiles(shape):
         yield (0, start, w, start + length) if vertical else (start, 0, start + length, h)
 
 
-def detect_bubbles(image: np.ndarray, cache_path: Path) -> tuple[list[np.ndarray], str]:
+def detect_bubbles(image: np.ndarray, cache_path: Path, *,
+                   shared_prediction=None) -> tuple[list[np.ndarray], str]:
     """Cache per-instance polygons by source pixels and model version, never text mask.
 
     No detection-box fallback: a box is not a safe whole-bubble fill boundary.
     Inference prefers CUDA, then MPS, and is serialized because workers share the model.
     """
     global _model, _model_signature
-    stat = MODEL_PATH.stat()
-    signature = (str(MODEL_PATH), stat.st_size, stat.st_mtime_ns)
-    digest = hashlib.sha256(np.ascontiguousarray(image).tobytes()).hexdigest()
-    key = [CACHE_VERSION, list(image.shape), digest, list(signature)]
+    signature = model_signature(MODEL_PATH)
+    source = source_key(image)
+    key = [CACHE_VERSION, source[0], list(source[1]), source[2], list(signature),
+           MODEL_SHA256, RESOLUTION, CLASS_THRESHOLDS['bubble'], TILE_VERSION]
     try:
         cached = json.loads(str(store.read_cache_file(cache_path)['bubble_json']))
         if cached['key'] == key:
@@ -86,44 +86,46 @@ def detect_bubbles(image: np.ndarray, cache_path: Path) -> tuple[list[np.ndarray
                 return polygons, 'cache'
     except (OSError, ValueError, KeyError, TypeError):
         pass
-    polygons = []
-    with _model_lock:
-        import torch
-
-        if torch.cuda.is_available():
-            device = 'cuda:0'
-        elif getattr(torch.backends, 'mps', None) is not None and torch.backends.mps.is_available():
-            device = 'mps'
-        else:
-            device = 'cpu'
-        if _model is None or _model_signature != signature:
-            from ultralytics import YOLO
-            _model = YOLO(str(MODEL_PATH), task='segment')
-            _model_signature = signature
-        for x1, y1, x2, y2 in _tiles(image.shape):
-            crop = np.ascontiguousarray(image[y1:y2, x1:x2])
-            result = _model.predict(crop, imgsz=1600, conf=0.25, iou=0.7,
-                                    device=device, retina_masks=True, verbose=False)[0]
-            if result.masks is None:
-                continue
-            for polygon, class_id in zip(result.masks.xy, result.boxes.cls.cpu().numpy()):
-                if result.names[int(class_id)] != 'balloon':
-                    continue
-                pts = np.asarray(polygon, dtype=np.float32)
-                if len(pts) < 3 or not np.isfinite(pts).all():
-                    continue
-                # Reject bubbles cut by internal tile seams; overlapping windows
-                # can contribute the complete instance instead.
-                if ((x1 > 0 and pts[:, 0].min() <= 2)
-                        or (y1 > 0 and pts[:, 1].min() <= 2)
-                        or (x2 < image.shape[1] and pts[:, 0].max() >= x2-x1-3)
-                        or (y2 < image.shape[0] and pts[:, 1].max() >= y2-y1-3)):
-                    continue
-                polygons.append(pts + np.array([x1, y1], dtype=np.float32))
+    tiles = list(_tiles(image.shape))
+    shared = (shared_prediction is not None and len(tiles) == 1
+              and shared_prediction.source == source and shared_prediction.model == signature)
+    if shared:
+        if shared_prediction.error:
+            raise RuntimeError(shared_prediction.error)
+        polygons = shared_prediction.polygons
+        status = 'shared'
+    else:
+        polygons = []
+        with _model_lock:
+            if (shared_prediction is not None and shared_prediction.model == signature
+                    and shared_prediction.predictor is not None):
+                # Different pixels or long-page crops need fresh predictions,
+                # but can use the same loaded model and its per-instance lock.
+                predictor = shared_prediction.predictor
+            else:
+                if _model is None or _model_signature != signature:
+                    _model = RfDetrSegDetector(MODEL_PATH, device='auto', inpaint_mask_dilate=0)
+                    _model_signature = signature
+                predictor = _model
+            for x1, y1, x2, y2 in tiles:
+                crop = np.ascontiguousarray(image[y1:y2, x1:x2])
+                for polygon in predictor.predict_bubbles(crop):
+                    pts = np.asarray(polygon, dtype=np.float32)
+                    if len(pts) < 3 or not np.isfinite(pts).all():
+                        continue
+                    # Reject bubbles cut by internal tile seams; overlapping
+                    # windows can contribute the complete instance instead.
+                    if ((x1 > 0 and pts[:, 0].min() <= 2)
+                            or (y1 > 0 and pts[:, 1].min() <= 2)
+                            or (x2 < image.shape[1] and pts[:, 0].max() >= x2-x1-3)
+                            or (y2 < image.shape[0] and pts[:, 1].max() >= y2-y1-3)):
+                        continue
+                    polygons.append(pts + np.array([x1, y1], dtype=np.float32))
+        status = 'detected'
     polygons = _deduplicate(polygons, image.shape[:2])
     store.update_cache_file(cache_path, bubble_json=np.array(json.dumps(
         {'key': key, 'polygons': [p.tolist() for p in polygons]})))
-    return polygons, 'detected'
+    return polygons, status
 
 
 def _polygon_mask(polygon, shape):
@@ -179,7 +181,7 @@ def fill_bubbles(text_mask: np.ndarray, solid_seeds: np.ndarray,
                  polygons: list[np.ndarray], shrink_ratio: float = 0.02,
                  protected: np.ndarray | None = None,
                  direct_white: bool = False) -> tuple[np.ndarray, list[dict]]:
-    """Fill MangaLens polygons white, or expand verified solid text using its BGR.
+    """Fill HighRes polygons white, or expand verified solid text using its BGR.
 
     solid_seeds contains only text pixels already classified as solid, with the
     local classifier's colour in BGRA. The direct white mode needs no text.

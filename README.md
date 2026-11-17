@@ -55,11 +55,11 @@ Windows：
 ```text
 1. 建立 .venv
 2. 安裝 requirements.txt
-3. 下載 CTBD、CTD、YSGYOLO 2.0、MangaLens 與 RF-DETR 模型
+3. 下載 Koharu Layout HighRes 模型（文字與氣泡共用權重）
 4. 啟動圖形界面
 ```
 
-CTBD 與 CTD 使用 CPU；YSGYOLO 可選自動、MPS、CPU 或 CUDA，RF-DETR 可選 MPS 或 CPU。
+本分支只使用 RF-DETR（Koharu Layout HighRes）。運算裝置可選自動、MPS、CPU 或 CUDA；自動模式依序使用可用的 CUDA、MPS 或 CPU。
 
 ## 手動啟動
 
@@ -110,7 +110,7 @@ Mask / 原圖疊加預覽
 手動編輯 mask
 矩形、筆刷、魔法棒工具：配合「添加 / 減去」編輯目前 mask
 套索工具：左鍵逐點建立多邊形，雙擊或 Enter 閉合並套用
-套索支援添加、減去、局部交集、從其他轉入和選區 CTD 檢測
+套索支援添加、減去、局部交集、從其他轉入和選區 RF-DETR 偵測
 局部視窗：矩形框選 ROI，在獨立放大視窗編輯副本；選擇頂部「調整邊框」工具後，可拖動上下左右四條邊界線，也可輸入 X、Y、寬、高；筆刷、矩形、套索和魔法棒的計算與 mask 修改都強制限制在邊框內，套用後才回寫主頁
 右鍵拖曳矩形：清除範圍內所有 mask 層
 撤銷 / 重做
@@ -128,7 +128,7 @@ Inpainted 合成預覽
 
 介面只保留 **F1 純色填充**、**F2 圖像修補**。首次偵測自動分配兩類；人工編輯後直接保存顏色與範圍，不會反覆重新分類。加入一類會移除另一類，擦除後保留原圖。重新偵測與重新分類會保留人工修改，包括擦除。
 
-MangaLens 通過整泡驗證時，以氣泡估色填充內縮區；人工圖像修補會阻止整泡填色。左側白色選區顯示實際塗白範圍，轉為圖像修補時會搬移所選白區。既有頁面需執行「重新分類」才套用新的整泡判定，人工修改仍會保留。
+氣泡填充使用 Koharu Layout HighRes 的 `bubble` 實例輪廓，預設將內縮區直接塗白；取消「直接對氣泡塗白」時，只用氣泡內已判為純色文字的底色擴張。兩種模式均保留人工修改、擦除及重疊接縫。左側白色選區顯示實際填色範圍，轉為圖像修補時會搬移所選白區；既有頁面不會自動重跑。詳見 [氣泡填充](docs/mangalens_solid_fill.md)。
 
 「使用傳入 Mask 運行」的取代模式以傳入 Mask 重新分類並保留人工決定；交集模式同時收窄兩類並保留填色顏色。沒有同名 PNG 的頁面保持原狀。
 
@@ -172,7 +172,7 @@ Ctrl+Shift+Z：重做
 
 ## 無界面批量偵測
 
-已安裝依賴及所選模型後，可直接對圖片資料夾執行偵測，不啟動 GUI，也不需要 MCP：
+已安裝依賴及 HighRes 模型後，可直接對圖片資料夾執行偵測，不啟動 GUI，也不需要 MCP：
 
 macOS：
 
@@ -202,19 +202,21 @@ Windows：
 
 人工修改的保留適用於同一版原圖。原圖已更換時，明確重跑會按核心既有行為建立新頁，舊人工選區不會沿用；重跑前先核對來源及保留需要的舊成果。
 
-可選模型、裝置及是否填充氣泡，例如：
+可指定運算裝置及是否填充氣泡；模型固定為 HighRes，例如：
 
 ```bash
-.venv/bin/python detect_solid_inpaint_folder.py "/path/to/image_folder" --detector ysgyolo --device cpu --no-bubble
+.venv/bin/python detect_solid_inpaint_folder.py "/path/to/image_folder" --detector rfdetr --device cpu --no-bubble
 ```
 
 | 參數 | 用途 |
 | --- | --- |
-| `--detector` | `legacy_ctd`、`ctbd`、`rfdetr` 或 `ysgyolo`；新專案預設 CTD，舊專案未指定時沿用已保存模型及其參數 |
-| `--device` | `auto`、`cpu`、`mps` 或 `cuda`；CTD／CTBD 僅支援 `auto`／`cpu` |
+| `--detector` | 僅接受 `rfdetr`，可省略；使用 Koharu Layout HighRes |
+| `--device` | `auto`、`cpu`、`mps` 或 `cuda`；未指定時沿用有效的專案參數，新專案預設自動 |
 | `--bubble`／`--no-bubble` | 開啟／關閉氣泡填充；未指定時沿用專案設定，新專案使用預設值 |
 | `--start-page`／`--end-page` | 從 1 開始、包含首尾的頁碼；省略結束頁時取最後一頁 |
 | `--redetect` | 允許重新偵測選定範圍的已有結果 |
+
+舊 v2 專案即使記錄了已移除的模型，仍可開啟和保留已保存結果。執行新偵測或重新分類時，改用 HighRes 安全預設，不沿用舊模型專屬參數；原本的 RF-DETR 參數可繼續沿用。明確指定已移除的模型名稱會回報參數錯誤。
 
 命令列不讀寫 GUI 的全局偏好。結果保存為相同的 `ctd_inpainted/raw/` 專案資料，之後開 GUI 可直接繼續校正；不自動導出 PDF、PNG 或 PSD。終端會顯示偵測、跳過及失敗計數；退出碼 `0` 表示本次任務成功、`1` 表示有頁面失敗，`2` 表示參數或啟動錯誤。
 
@@ -299,82 +301,25 @@ OTHER_CHANNEL
 
 ## 模型文件
 
-模型不包含在 git 倉庫中。首次啟動時 `bootstrap.py` 會下載：
+本分支只保留 RF-DETR（Koharu Layout HighRes）。模型不包含在 git 倉庫中，首次啟動時 `bootstrap.py` 只會下載並校驗以下權重：
 
 ```text
-models/comic-text-and-bubble-detector.onnx
-models/comictextdetector.pt
-models/ysgyolo_yolo26_2.0.pt
-models/mangalens.pt
-models/koharu-layout-rfdetr-seg-2xl-1152/model.safetensors
+models/koharu-layout-highres/model.safetensors
 ```
 
-CTBD 模型來源：
+模型來源：[mayocream/koharu-layout-highres](https://huggingface.co/mayocream/koharu-layout-highres)。模型授權與歸屬屬於原項目。
 
-```text
-https://huggingface.co/ogkalu/comic-text-and-bubble-detector
-```
+HighRes 使用 `RFDETRSeg2XLarge`、1920 × 1920 輸入及最多 160 個偵測結果，類別為 `text`、`onomatopoeia`、`bubble`、`panel`。依官方設定，四類信心門檻分別為 0.25、0.30、0.50、0.40；預設只合併文字與狀聲詞的 Mask。下載、SHA-256 校驗、載入與推論設定集中於 `rfdetr_config.py`。建議使用 GPU。
 
-CTD 模型來源：
+「偵測並生成」和「添加偵測」均只顯示「RF-DETR（Koharu Layout HighRes）」，可設定運算裝置、Mask 膨脹尺寸與塗白範圍。設定會保存，下次開啟沿用；原先保存的其他模型選擇回退到 HighRes。矩形、套索等選區工具保留「添加RF-DETR選區」，使用上次保存的 RF-DETR 設定。
 
-```text
-https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.2.1/comictextdetector.pt
-```
+文字與氣泡共用 HighRes 權重：一般頁面共用一次推論，氣泡使用獨立的 `bubble` 實例遮罩（門檻 0.50），不受文字塗白類別、Mask 合併或膨脹設定影響。外部 Mask 需要氣泡填充時，才另外懶載入 HighRes 氣泡模型；長圖使用重疊裁窗並優先沿用已載入的偵測器。關閉氣泡填充不讀取氣泡快取，也不另外執行氣泡推論。
 
-RF-DETR 模型來源：
+其他模型的入口、下載設定及適配程式已移除。新氣泡快取包含模型雜湊、解析度、門檻及裁窗版本，與舊模型快取隔離；既有正式頁面與人工修改不會因模型更新而重新偵測。
 
-```text
-https://huggingface.co/mayocream/koharu-layout-rfdetr-seg-2xl-1152
-```
+偵測器依賴包含 `rfdetr==1.7.0`、`transformers==5.15.0`、`supervision==0.28.0`。Python 3.10 的 Apple Silicon macOS 固定使用 `scipy==1.14.1`，避開在該環境無法載入的 1.15.3 wheel；其他環境由 pip 選擇相容版本。Python 3.13 以上使用 NumPy 2，較舊 Python 沿用 NumPy 1 的限制。舊模型專用套件不再列為直接依賴；PyTorch 等套件仍會安裝自身所需的間接依賴。
 
-模型授權與歸屬屬於原項目。
-
-點擊「偵測並生成」後可以選擇：
-
-```text
-1. YSGYOLO 2.0
-2. CTBD（文字＋氣泡偵測）
-3. RF-DETR
-4. CTD
-```
-
-選擇 CTBD 時，可以在執行前設定 Mask 膨脹尺寸、Mask 合併方式和文字區域篩選。
-選擇與 CTBD 設定會自動保存，下一次打開對話框時沿用。
-
-YSGYOLO 2.0 也支援「添加偵測」。它沿用 BallonsTranslator 的推理設定（信心閾值 0.3、IoU 0.5、偵測尺寸 1024），由偵測框生成 Mask，再交給現有純色塗白流程。
-模型與文本行合併程式已移入本專案，執行時不依賴 BallonsTranslator 的安裝目錄。啟動腳本會檢查模型 SHA-256，缺少時從 `dreMaz/mit_models` 下載。
-
-YSGYOLO 設定會自動保存：
-
-- 運算裝置預設自動，優先 GPU（本機 Apple Silicon 使用 MPS），無可用 GPU 時使用 CPU。
-- 合併文本行預設開啟。它只整理文字區塊資料，不會填滿行間空白，不影響塗白 Mask。
-- 豎排文本預設關閉（自動判斷方向）；開啟後以豎排方向整理區塊與行順序，不會篩掉橫排文字。
-- Mask 擴張尺寸預設 0。數值為擴張半徑，使用與 BallonsTranslator 相同的橢圓核心。
-- Mask 圓角半徑預設 0（關閉），可設為 1–1000 px；12 px 為 BallonsTranslator 圓角工具的預設值。先擴張，再按每個連通區的外接矩形削掉四角，只縮減遮罩。半徑會限制在區域寬、高的一半以內；已相連的偵測框視為同一區域。「添加偵測」只對新偵測的 Mask 做圓角，再加入所選層，保留既有遮罩。
-- 標籤預設勾選前五項，不勾選 `other`。全部取消時產生空白 Mask；添加偵測時不會加入新區域。
-
-| 標籤 | 說明 |
-| --- | --- |
-| `balloon` | 氣泡外的文字 |
-| `qipao` | 氣泡內的文字 |
-| `shuqing` | 豎斜：豎著的氣泡內和氣泡外的傾斜文字 |
-| `changfangtiao` | 長方條：全部橫向文字，不區分氣泡或矩形框內外 |
-| `hengxie` | 橫斜：長方條的上位版，所有橫著的傾斜文字 |
-| `other` | 框體：氣泡，以及任意包含文字的垂直、水平框體 |
-
-這份 `ysgyolo_yolo26_2.0.pt` 的實際類別為 `balloon/qipao/fangkuai/changfangtiao/kuangwai/other`。
-依使用者選擇，介面保留 BallonsTranslator 的六個選項：`shuqing`、`hengxie` 標明「此模型無效」；不將 `fangkuai`、`kuangwai` 擅自對應到它們，這兩個原始類別會被略過。
-滑鼠停在各標籤上可查看完整說明。
-
-命令行使用預設 YSGYOLO 設定：
-
-```bash
-.venv/bin/python detect_solid_inpaint_folder.py /path/to/image_folder --detector ysgyolo
-```
-
-偵測器依賴包含 `ultralytics>=8.4.14`、`networkx`，以及 RF-DETR 所需的 `rfdetr==1.7.0`、`transformers==5.15.0`、`supervision==0.28.0`。Python 3.10 的 Apple Silicon macOS 固定使用 `scipy==1.14.1`，避開在該環境無法載入的 1.15.3 wheel；其他環境由 pip 選擇相容版本。Python 3.13 以上使用 NumPy 2，以兼容新 Python 的套件；較舊 Python 沿用 NumPy 1 的限制。
-
-如果缺少所選模型，命令行和圖形界面都會提示找不到模型文件。
+如果缺少 HighRes 權重，命令行和圖形界面都會提示找不到模型文件。
 
 ## GitHub Pages
 
@@ -412,16 +357,20 @@ https://zsisme.github.io/comic-text-detector-inpaint/
 README.md
 requirements.txt
 bootstrap.py
-launch.command
+塗白.command
 launch.bat
 detect_solid_inpaint_folder.py
 solid_inpaint_ui.py
 create_psds_from_outputs.jsx
 models/.gitkeep
-ctbd_detector.py
+rfdetr_config.py
+load_model.py
+rfdetr_detector.py
+image_io.py
+mask_utils.py
 docs/
 icons/
-vendor/
+vendor/LICENSE-BallonsTranslator
 ```
 
 不要提交：
@@ -431,15 +380,14 @@ vendor/
 __pycache__/
 .DS_Store
 ctd_inpainted/
-models/comictextdetector.pt
-models/comic-text-and-bubble-detector.onnx
+models/koharu-layout-highres/model.safetensors
 ```
 
 ## 開發注意
 
-- `vendor/` 是 detector 程式的拷貝版本，不會自動跟外部程式同步。
+- 氣泡填充的衍生設計保留來源標註，相關授權正文見 `vendor/LICENSE-BallonsTranslator`。
 - 建議用 Python 3.10-3.12 測試發佈流程。
-- `requirements.txt` 鎖定 `numpy<2`，避免舊 detector 程式遇到 NumPy 2.x 移除舊別名的兼容問題。
+- `requirements.txt` 依 Python 版本限制 NumPy：Python 3.13 之前使用 NumPy 1，Python 3.13 以上使用 NumPy 2。
 - `inpainted` 是完整畫布尺寸的透明 PNG，不需要 Photoshop 圖層用的四角 anchor pixel。
 - `other_mask` 表示不能自動純色填補、需要後續處理的 repair area。
 - 每次調整純色判斷參數後，建議手動生成並查看 `preview_report.pdf`。

@@ -12,22 +12,13 @@ import urllib.request
 import venv
 from pathlib import Path
 
+from rfdetr_config import (
+    MODEL_URL as RF_DETR_MODEL_URL,
+    MODEL_FILE as RF_DETR_MODEL_PATH,
+    MODEL_SHA256 as RF_DETR_MODEL_SHA256,
+)
 
 APP_NAME = '塗白'
-MODEL_URL = 'https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.2.1/comictextdetector.pt'
-MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'comictextdetector.pt'
-CTBD_MODEL_URL = 'https://huggingface.co/ogkalu/comic-text-and-bubble-detector/resolve/main/detector.onnx'
-CTBD_MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'comic-text-and-bubble-detector.onnx'
-CTBD_MODEL_SHA256 = '065744e91c0594ad8663aa8b870ce3fb27222942eded5a3cc388ce23421bd195'
-YSG_MODEL_URL = 'https://huggingface.co/dreMaz/mit_models/resolve/main/ysgyolo_yolo26_2.0.pt'
-YSG_MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'ysgyolo_yolo26_2.0.pt'
-YSG_MODEL_SHA256 = '889347d65c8636dd188a8ed4f312b29658543faaa69016b5958ddf0559980e22'
-MANGALENS_MODEL_URL = 'https://www.modelscope.cn/models/hgmzhn/manga-translator-ui/resolve/master/mangalens.pt'
-MANGALENS_MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'mangalens.pt'
-MANGALENS_MODEL_SHA256 = '4028152940f7c910f40192f46ede3b3f6c7129e5c76849c324d3564f8ac50198'
-RF_DETR_MODEL_URL = 'https://huggingface.co/mayocream/koharu-layout-rfdetr-seg-2xl-1152/resolve/main/model.safetensors'
-RF_DETR_MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'koharu-layout-rfdetr-seg-2xl-1152' / 'model.safetensors'
-RF_DETR_MODEL_SHA256 = '9bf6d2cbd7793c956d8c857bb1672a396eb7f100eb0682f86830d05e31168efb'
 ROOT = Path(__file__).resolve().parent
 VENV_DIR = ROOT / '.venv'
 REQUIREMENTS = ROOT / 'requirements.txt'
@@ -177,12 +168,7 @@ def main() -> None:
     ensure_python_version()
     python = ensure_venv()
     ensure_dependencies(python)
-    # Download bundled choices so selecting a detector never starts an
-    # unexpected network operation inside the UI worker thread.
-    download_model(CTBD_MODEL_URL, CTBD_MODEL_PATH, CTBD_MODEL_SHA256)
-    download_model(MODEL_URL, MODEL_PATH)
-    download_model(YSG_MODEL_URL, YSG_MODEL_PATH, YSG_MODEL_SHA256)
-    download_model(MANGALENS_MODEL_URL, MANGALENS_MODEL_PATH, MANGALENS_MODEL_SHA256)
+    # Text and bubble inference share this one verified HighRes checkpoint.
     download_model(RF_DETR_MODEL_URL, RF_DETR_MODEL_PATH, RF_DETR_MODEL_SHA256)
     launch_app(python)
 

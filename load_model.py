@@ -1,8 +1,8 @@
-"""RF-DETR 模型載入工具（koharu-layout-rfdetr-seg-2xl-1152）。
+"""RF-DETR 模型載入工具（koharu-layout-highres）。
 
 載入邏輯對應 HANDOFF_RFDETR.md 中的官方 loader：
 
-    RFDETRSeg2XLarge(pretrain_weights=None, resolution=1152,
+    RFDETRSeg2XLarge(pretrain_weights=None, resolution=1920,
                      num_select=160, num_classes=4)
     model.model.model.load_state_dict(load_file(...), strict=True)
 """
@@ -14,15 +14,10 @@ from pathlib import Path
 
 from safetensors.torch import load_file
 
-
-MODEL_DIR = Path(__file__).parent / 'models' / 'koharu-layout-rfdetr-seg-2xl-1152'
-MODEL_FILE = MODEL_DIR / 'model.safetensors'
-MODEL_SHA256 = '9bf6d2cbd7793c956d8c857bb1672a396eb7f100eb0682f86830d05e31168efb'
-
-CLASS_NAMES = ('text', 'onomatopoeia', 'bubble', 'panel')
-CLASS_THRESHOLDS = {'text': 0.25, 'onomatopoeia': 0.20, 'bubble': 0.50, 'panel': 0.50}
-RESOLUTION = 1152
-NUM_SELECT = 160
+from rfdetr_config import (
+    MODEL_DIR, MODEL_FILE, MODEL_SHA256,
+    CLASS_NAMES, CLASS_THRESHOLDS, RESOLUTION, NUM_SELECT,
+)
 
 
 def verify_model_sha256(model_path: Path, expected: str = MODEL_SHA256) -> bool:

@@ -27,7 +27,7 @@ class UnifiedDetectionTests(unittest.TestCase):
     def dialog(self, accepted=True):
         dialog = MagicMock()
         dialog.exec.return_value = QDialog.DialogCode.Accepted if accepted else QDialog.DialogCode.Rejected
-        dialog.selected_detector.return_value = ui.DETECTOR_YSGYOLO
+        dialog.selected_detector.return_value = ui.DETECTOR_RFDETR
         dialog.selected_detector_params.return_value = {'device': 'cpu'}
         dialog.selected_solid_settings.return_value = {'enabled': False, 'shrink_percent': 4.5,
                                                         'direct_white': False}
@@ -40,7 +40,7 @@ class UnifiedDetectionTests(unittest.TestCase):
             cv2.imwrite(str(self.fixture.root / f'{index:02d}.png'), self.fixture.image)
         self.w.load_folder(str(self.fixture.root))
 
-    def test_inline_options_are_shared_by_all_models(self):
+    def test_inline_options_are_shared_by_detection_and_keep_original_modes(self):
         from PySide6.QtGui import QAction
         dialog = ui.DetectorSelectionDialog(self.w.settings, self.w,
             solid_settings={'enabled': False, 'shrink_percent': 6.0}, image_paths=self.w.imglist)

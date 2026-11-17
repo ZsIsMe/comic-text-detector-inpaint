@@ -74,15 +74,12 @@ from detect_solid_inpaint_folder import (
     build_report,
     create_detector,
     DEFAULT_DETECTOR,
-    DETECTOR_CTBD,
     DETECTOR_LABELS,
-    DETECTOR_LEGACY_CTD,
     DETECTOR_RFDETR,
-    DETECTOR_YSGYOLO,
     image_files_in_folder,
     load_report,
     process_image_with_detector,
-    REFINEMASK_ANNOTATION,
+    project_detector_settings,
     regenerate_image_from_mask,
     regenerate_image_from_imported_mask,
     write_report,
@@ -91,8 +88,7 @@ from detect_solid_inpaint_folder import (
     prepare_page_edits,
     export_psd_assets,
 )
-from utils.io_utils import imread, imwrite
-from ysg_detector import YSG_DEFAULT_LABELS, YSG_LABEL_DESCRIPTIONS, YSG_UNSUPPORTED_LABELS
+from image_io import imread, imwrite
 import project_store as store
 from bubble_solid import save_settings as save_solid_settings
 
@@ -127,7 +123,7 @@ MAX_MAGIC_DWELL_MS = 1000
 DEFAULT_LOCAL_INTERSECT_OFFSET_PX = 0
 MIN_LOCAL_INTERSECT_OFFSET_PX = -80
 MAX_LOCAL_INTERSECT_OFFSET_PX = 80
-CTD_SELECTION_PADDING_PX = 16
+SELECTION_DETECTION_PADDING_PX = 16
 MASK_DISPLAY_COLORS: dict[str, tuple[int, int, int]] = {
     '白色': (255, 255, 255),
     '紅色': (60, 80, 255),
@@ -184,7 +180,6 @@ SELECTION_COMBINE_LABELS = {
     'selection_inner': '選區內部',
     'add_selection_inner': '添加＋內部',
     'transfer_from_other': '從其他轉入',
-    'ctd_detect_selection': '添加CTD檢測選區',
     'rfdetr_detect_selection': '添加RF-DETR選區',
     'local_edit_selection': '局部視窗',
 }
@@ -1468,7 +1463,7 @@ class MaskEditorView(ImageView):
         operation = self.selection_combine_mode
         if operation in ('subtract', 'restore_original'):
             pen = self._rect_pen_remove
-        elif operation in ('ctd_detect_selection', 'rfdetr_detect_selection'):
+        elif operation in ('rfdetr_detect_selection',):
             pen = self._rect_pen_detect
         elif operation in ('local_intersect', 'transfer_from_other'):
             pen = self._rect_pen_intersect
@@ -2091,7 +2086,6 @@ class MaskEditorView(ImageView):
             button == Qt.MouseButton.LeftButton
             and self.selection_combine_mode in (
                 'transfer_from_other',
-                'ctd_detect_selection',
                 'rfdetr_detect_selection',
                 'local_edit_selection',
                 'restore_original',
@@ -2248,7 +2242,7 @@ class MaskEditorView(ImageView):
         operation = self._selection_operation_for_button(button)
         if operation in ('subtract', 'restore_original'):
             self._rubber_band.setPen(self._rect_pen_remove)
-        elif operation in ('ctd_detect_selection', 'rfdetr_detect_selection', 'local_edit_selection'):
+        elif operation in ('rfdetr_detect_selection', 'local_edit_selection'):
             self._rubber_band.setPen(self._rect_pen_detect)
         elif operation in ('local_intersect', 'selection_inner', 'add_selection_inner', 'transfer_from_other'):
             self._rubber_band.setPen(self._rect_pen_intersect)
@@ -2989,12 +2983,12 @@ class FolderWorker(QObject):
                     pages[name] = {'error': str(exc)}
             report_detector = (
                 self.detector_name
-                if self.mode == 'detect'
-                else existing.get('detector', DEFAULT_DETECTOR)
+                if self.mode in ('detect', 'add_detection')
+                else project_detector_settings(existing)[0]
             )
             report_device = (
                 getattr(detector, 'device', 'cpu')
-                if self.mode == 'detect'
+                if self.mode in ('detect', 'add_detection')
                 else existing.get('device', 'cpu')
             )
             report = build_report(
@@ -3005,8 +2999,13 @@ class FolderWorker(QObject):
                 report_detector,
                 device=report_device,
             )
-            if self.mode == 'detect':
-                report['detector_params'] = self.detector_params
+            report['detector_params'] = (self.detector_params if self.mode in ('detect', 'add_detection')
+                                         else project_detector_settings(existing)[1])
+            if self.mode in ('keep_original', 'imported_mask'):
+                # These operations do not choose a new text detector.
+                for key in ('detector', 'detector_label', 'detector_params', 'model', 'device'):
+                    if key in existing:
+                        report[key] = existing[key]
             write_report(paths, report)
             self.finished.emit(load_report(paths))
         except Exception as exc:
@@ -3043,8 +3042,13 @@ class ConvertMasksWorker(QObject):
                 self.paths,
                 self.imglist,
                 pages,
-                existing.get('detector', DEFAULT_DETECTOR),
+                project_detector_settings(existing)[0],
             )
+            # Converting saved selections does not run a text detector. Keep
+            # its historical metadata without resolving a removed model path.
+            for key in ('detector', 'detector_label', 'detector_params', 'model', 'device'):
+                if key in existing:
+                    report[key] = existing[key]
             write_report(self.paths, report)
             self.finished.emit(report)
         except Exception as exc:
@@ -3217,37 +3221,20 @@ class DetectorSelectorWidget(QWidget):
         layout.setContentsMargins(20, 18, 20, 16)
         layout.setSpacing(12)
 
-        description = QLabel('選擇這次要使用的文字偵測模型，並調整該模型的設定。')
+        description = QLabel('使用 Koharu Layout HighRes 偵測文字，並調整偵測設定。')
         description.setWordWrap(True)
         layout.addWidget(description)
 
         self.group = QButtonGroup(self)
         self.buttons: dict[str, QRadioButton] = {}
-        saved_detector = str(self.settings.value('detector/last_name', DETECTOR_CTBD))
+        saved_detector = str(self.settings.value('detector/last_name', DEFAULT_DETECTOR))
         if saved_detector not in DETECTOR_LABELS:
-            saved_detector = DETECTOR_CTBD
-        options = (
-            (
-                DETECTOR_YSGYOLO,
-                DETECTOR_LABELS[DETECTOR_YSGYOLO],
-                'ysgyolo_yolo26_2.0.pt；按標籤篩選文字或框體，生成偵測框 Mask。',
-            ),
-            (
-                DETECTOR_CTBD,
-                DETECTOR_LABELS[DETECTOR_CTBD],
-                'RT-DETR-V2 ONNX 模型；先偵測文字區域，再生成文字 Mask。',
-            ),
-            (
-                DETECTOR_RFDETR,
-                DETECTOR_LABELS[DETECTOR_RFDETR],
-                'RF-DETR 分割模型；直接輸出文字、狀聲詞、氣泡與分格的實例分割 Mask。',
-            ),
-            (
-                DETECTOR_LEGACY_CTD,
-                DETECTOR_LABELS[DETECTOR_LEGACY_CTD],
-                'comictextdetector.pt；使用原有的偵測與 Mask 流程。',
-            ),
-        )
+            saved_detector = DEFAULT_DETECTOR
+        options = ((
+            DETECTOR_RFDETR,
+            f'{DETECTOR_LABELS[DETECTOR_RFDETR]}（Koharu Layout HighRes）',
+            'Koharu Layout HighRes（1920 × 1920）；輸出文字、狀聲詞、氣泡與分格的實例分割 Mask。',
+        ),)
         for detector_name, label, detail in options:
             frame = QFrame()
             frame.setFrameShape(QFrame.Shape.StyledPanel)
@@ -3268,59 +3255,6 @@ class DetectorSelectorWidget(QWidget):
             option_layout.addWidget(detail_label)
             layout.addWidget(frame)
 
-        self.ctbd_config_frame = QFrame()
-        self.ctbd_config_frame.setFrameShape(QFrame.Shape.StyledPanel)
-        config_layout = QGridLayout(self.ctbd_config_frame)
-        config_layout.setContentsMargins(14, 12, 14, 12)
-        config_layout.setHorizontalSpacing(14)
-        config_layout.setVerticalSpacing(10)
-
-        config_title = QLabel('CTBD 設定')
-        config_title_font = config_title.font()
-        config_title_font.setBold(True)
-        config_title.setFont(config_title_font)
-        config_layout.addWidget(config_title, 0, 0, 1, 2)
-
-        config_layout.addWidget(QLabel('Mask 膨脹尺寸'), 1, 0)
-        self.dilate_spin = QSpinBox()
-        self.dilate_spin.setRange(0, 64)
-        self.dilate_spin.setSuffix(' px')
-        self.dilate_spin.setToolTip('對每個文字區域的 Mask 進行膨脹，用來連接文字碎片。')
-        try:
-            saved_dilate = int(self.settings.value('detector/ctbd/inpaint_mask_dilate', 4))
-        except (TypeError, ValueError):
-            saved_dilate = 4
-        self.dilate_spin.setValue(max(0, min(64, saved_dilate)))
-        config_layout.addWidget(self.dilate_spin, 1, 1)
-
-        config_layout.addWidget(QLabel('Mask 合併方式'), 2, 0)
-        self.unification_combo = QComboBox()
-        self.unification_combo.addItem('不合併', 'none')
-        self.unification_combo.addItem('外接矩形', 'rectangle')
-        self.unification_combo.addItem('凸包', 'hull')
-        self.unification_combo.setToolTip('決定每個文字區域內的 Mask 碎片如何合併。')
-        saved_unification = str(
-            self.settings.value('detector/ctbd/mask_unification_method', 'none')
-        )
-        unification_index = self.unification_combo.findData(saved_unification)
-        self.unification_combo.setCurrentIndex(max(0, unification_index))
-        config_layout.addWidget(self.unification_combo, 2, 1)
-
-        config_layout.addWidget(QLabel('文字區域篩選'), 3, 0)
-        self.region_filter_combo = QComboBox()
-        self.region_filter_combo.addItem('全部文字', 'all')
-        self.region_filter_combo.addItem('僅氣泡內文字', 'text_bubble')
-        self.region_filter_combo.addItem('僅氣泡外文字', 'text_free')
-        self.region_filter_combo.setToolTip('根據文字框與氣泡框的關係，篩選要生成 Mask 的文字。')
-        saved_region_filter = str(
-            self.settings.value('detector/ctbd/text_region_filter', 'all')
-        )
-        region_filter_index = self.region_filter_combo.findData(saved_region_filter)
-        self.region_filter_combo.setCurrentIndex(max(0, region_filter_index))
-        config_layout.addWidget(self.region_filter_combo, 3, 1)
-        config_layout.setColumnStretch(1, 1)
-        layout.addWidget(self.ctbd_config_frame)
-
         self.rfdetr_config_frame = QFrame()
         self.rfdetr_config_frame.setFrameShape(QFrame.Shape.StyledPanel)
         rfdetr_config_layout = QGridLayout(self.rfdetr_config_frame)
@@ -3328,7 +3262,7 @@ class DetectorSelectorWidget(QWidget):
         rfdetr_config_layout.setHorizontalSpacing(14)
         rfdetr_config_layout.setVerticalSpacing(10)
 
-        rfdetr_config_title = QLabel('RF-DETR 設定')
+        rfdetr_config_title = QLabel('RF-DETR HighRes 設定')
         rfdetr_config_title_font = rfdetr_config_title.font()
         rfdetr_config_title_font.setBold(True)
         rfdetr_config_title.setFont(rfdetr_config_title_font)
@@ -3369,138 +3303,15 @@ class DetectorSelectorWidget(QWidget):
         rfdetr_config_layout.setColumnStretch(1, 1)
         layout.addWidget(self.rfdetr_config_frame)
 
-        self.ysg_config_frame = QFrame()
-        self.ysg_config_frame.setFrameShape(QFrame.Shape.StyledPanel)
-        ysg_layout = QGridLayout(self.ysg_config_frame)
-        ysg_layout.setContentsMargins(14, 12, 14, 12)
-        ysg_layout.setHorizontalSpacing(14)
-        ysg_layout.setVerticalSpacing(10)
-        ysg_title = QLabel('YSGYOLO 2.0 設定')
-        ysg_font = ysg_title.font()
-        ysg_font.setBold(True)
-        ysg_title.setFont(ysg_font)
-        ysg_layout.addWidget(ysg_title, 0, 0, 1, 2)
-
-        ysg_layout.addWidget(QLabel('運算裝置'), 1, 0)
-        self.ysg_device_combo = QComboBox()
-        for label, value in (
-            ('自動（GPU 優先）', 'auto'), ('MPS (Apple Silicon)', 'mps'),
-            ('CPU', 'cpu'), ('CUDA (NVIDIA)', 'cuda'),
-        ):
-            self.ysg_device_combo.addItem(label, value)
-        saved_device = str(self.settings.value('detector/ysgyolo/device', 'auto'))
-        self.ysg_device_combo.setCurrentIndex(max(0, self.ysg_device_combo.findData(saved_device)))
-        ysg_layout.addWidget(self.ysg_device_combo, 1, 1)
-
-        ysg_layout.addWidget(QLabel('標籤'), 2, 0, alignment=Qt.AlignmentFlag.AlignTop)
-        labels_layout = QGridLayout()
-        self.ysg_label_checks: dict[str, QCheckBox] = {}
-        saved_labels = self.settings.value('detector/ysgyolo/labels', list(YSG_DEFAULT_LABELS))
-        if isinstance(saved_labels, str):
-            saved_labels = [saved_labels]
-        if not isinstance(saved_labels, (list, tuple)):
-            saved_labels = YSG_DEFAULT_LABELS
-        short_names = ('氣泡外', '氣泡內', '豎斜', '長方條', '橫斜', '框體')
-        for index, ((key, description), short_name) in enumerate(
-            zip(YSG_LABEL_DESCRIPTIONS.items(), short_names)
-        ):
-            suffix = '，此模型無效' if key in YSG_UNSUPPORTED_LABELS else ''
-            checkbox = QCheckBox(f'{key}（{short_name}{suffix}）')
-            checkbox.setToolTip(description + ('\n此權重沒有這個標籤，勾選不影響偵測。' if suffix else ''))
-            checkbox.setChecked(key in saved_labels)
-            self.ysg_label_checks[key] = checkbox
-            labels_layout.addWidget(checkbox, index // 2, index % 2)
-        ysg_layout.addLayout(labels_layout, 2, 1)
-
-        self.ysg_merge_check = QCheckBox('合併文本行')
-        self.ysg_merge_check.setChecked(self.settings.value(
-            'detector/ysgyolo/merge_text_lines', True, type=bool,
-        ))
-        self.ysg_merge_check.setToolTip('合併文字區塊資料；不會填滿行間空白，也不改變塗白 Mask。')
-        ysg_layout.addWidget(self.ysg_merge_check, 3, 1)
-        self.ysg_vertical_check = QCheckBox('豎排文本')
-        self.ysg_vertical_check.setChecked(self.settings.value(
-            'detector/ysgyolo/source_text_vertical', False, type=bool,
-        ))
-        self.ysg_vertical_check.setToolTip(
-            '勾選後以豎排方向整理文字區塊與行順序；未勾選時自動判斷。\n'
-            '不會篩掉橫排文字，也不改變 Mask。'
-        )
-        ysg_layout.addWidget(self.ysg_vertical_check, 4, 1)
-        ysg_layout.addWidget(QLabel('Mask 擴張尺寸'), 5, 0)
-        self.ysg_dilate_spin = QSpinBox()
-        self.ysg_dilate_spin.setRange(0, 64)
-        self.ysg_dilate_spin.setSuffix(' px')
-        self.ysg_dilate_spin.setToolTip('向外擴張的半徑；0 表示不擴張。使用與 BallonsTranslator 相同的橢圓核心。')
-        try:
-            saved_ysg_dilate = int(self.settings.value('detector/ysgyolo/mask_dilate_size', 0))
-        except (TypeError, ValueError):
-            saved_ysg_dilate = 0
-        self.ysg_dilate_spin.setValue(max(0, min(64, saved_ysg_dilate)))
-        ysg_layout.addWidget(self.ysg_dilate_spin, 5, 1)
-        ysg_layout.addWidget(QLabel('Mask 圓角半徑'), 6, 0)
-        self.ysg_corner_spin = QSpinBox()
-        self.ysg_corner_spin.setRange(0, 1000)
-        self.ysg_corner_spin.setSuffix(' px')
-        self.ysg_corner_spin.setSpecialValueText('關閉（0 px）')
-        self.ysg_corner_spin.setToolTip(
-            '在 Mask 擴張後，按每個連通區削掉四角，只縮減、不增加遮罩。\n'
-            '0 表示關閉；BallonsTranslator 圓角工具的預設半徑為 12 px。\n'
-            '添加偵測時只處理新偵測的 Mask，保留既有遮罩。'
-        )
-        try:
-            saved_corner_radius = int(self.settings.value('detector/ysgyolo/mask_corner_radius', 0))
-        except (TypeError, ValueError):
-            saved_corner_radius = 0
-        self.ysg_corner_spin.setValue(max(0, min(1000, saved_corner_radius)))
-        ysg_layout.addWidget(self.ysg_corner_spin, 6, 1)
-        label_hint = QLabel(
-            '滑鼠停留在標籤上可查看說明。other 包含氣泡與框體。\n'
-            '此權重的 fangkuai、kuangwai 依 BallonsTranslator 的篩選方式略過。'
-        )
-        label_hint.setWordWrap(True)
-        label_hint.setProperty('secondary', True)
-        ysg_layout.addWidget(label_hint, 7, 0, 1, 2)
-        ysg_layout.setColumnStretch(1, 1)
-        layout.addWidget(self.ysg_config_frame)
-
-        self.buttons[DETECTOR_CTBD].toggled.connect(self.ctbd_config_frame.setVisible)
-        self.ctbd_config_frame.setVisible(self.buttons[DETECTOR_CTBD].isChecked())
-        self.buttons[DETECTOR_RFDETR].toggled.connect(self.rfdetr_config_frame.setVisible)
-        self.rfdetr_config_frame.setVisible(self.buttons[DETECTOR_RFDETR].isChecked())
-        self.buttons[DETECTOR_YSGYOLO].toggled.connect(self.ysg_config_frame.setVisible)
-        self.ysg_config_frame.setVisible(self.buttons[DETECTOR_YSGYOLO].isChecked())
-
     def selected_detector(self) -> str:
-        for detector_name, button in self.buttons.items():
-            if button.isChecked():
-                return detector_name
-        return DETECTOR_CTBD
+        return DEFAULT_DETECTOR
 
     def selected_detector_params(self) -> dict:
-        selected = self.selected_detector()
-        if selected == DETECTOR_YSGYOLO:
-            return {
-                'device': self.ysg_device_combo.currentData(),
-                'labels': [key for key, checkbox in self.ysg_label_checks.items() if checkbox.isChecked()],
-                'merge_text_lines': self.ysg_merge_check.isChecked(),
-                'source_text_vertical': self.ysg_vertical_check.isChecked(),
-                'mask_dilate_size': self.ysg_dilate_spin.value(),
-                'mask_corner_radius': self.ysg_corner_spin.value(),
-            }
-        if selected == DETECTOR_CTBD:
-            return {
-                'inpaint_mask_dilate': self.dilate_spin.value(),
-                'mask_unification_method': self.unification_combo.currentData(),
-                'text_region_filter': self.region_filter_combo.currentData(),
-            }
-        if selected == DETECTOR_RFDETR:
-            return {
-                'device': self.rfdetr_device_combo.currentData(),
-                'inpaint_mask_dilate': self.rfdetr_dilate_spin.value(),
-                'mask_mode': self.rfdetr_mask_mode_combo.currentData(),
-            }
-        return {}
+        return {
+            'device': self.rfdetr_device_combo.currentData(),
+            'inpaint_mask_dilate': self.rfdetr_dilate_spin.value(),
+            'mask_mode': self.rfdetr_mask_mode_combo.currentData(),
+        }
 
     def save_settings(self) -> None:
         detector_name = self.selected_detector()
@@ -3536,9 +3347,7 @@ class DetectorSelectionDialog(QDialog):
 
         self.selector = DetectorSelectorWidget(settings, self)
         self.buttons = self.selector.buttons
-        self.ctbd_config_frame = self.selector.ctbd_config_frame
         self.rfdetr_config_frame = self.selector.rfdetr_config_frame
-        self.ysg_config_frame = self.selector.ysg_config_frame
         content = QWidget()
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(0, 0, 0, 0)
@@ -3598,7 +3407,7 @@ class DetectorSelectionDialog(QDialog):
         bubble_title.setFont(bubble_title_font)
         bubble_layout.addWidget(bubble_title)
         values = solid_settings if solid_settings is not None else self._saved_solid_settings()
-        self.bubble_enabled = QCheckBox('啟用氣泡填充（MangaLens）')
+        self.bubble_enabled = QCheckBox('啟用氣泡填充（Koharu Layout HighRes）')
         self.bubble_enabled.setChecked(values['enabled'])
         bubble_layout.addWidget(self.bubble_enabled)
         self.bubble_direct_white = QCheckBox('直接對氣泡塗白')
@@ -3606,7 +3415,7 @@ class DetectorSelectionDialog(QDialog):
         self.bubble_direct_white.setEnabled(self.bubble_enabled.isChecked())
         self.bubble_enabled.toggled.connect(self.bubble_direct_white.setEnabled)
         bubble_layout.addWidget(self.bubble_direct_white)
-        hint = QLabel('勾選「直接對氣泡塗白」時，MangaLens 偵測到的氣泡會直接塗白，即使沒有文字或只有圖像修補文字。\n'
+        hint = QLabel('勾選「直接對氣泡塗白」時，HighRes 偵測到的氣泡會直接塗白，即使沒有文字或只有圖像修補文字。\n'
                       '取消此子選項時，只有氣泡內已有純色填充文字，才以該文字的底色填滿氣泡。'
                       '兩種模式都保留內縮邊框及人工修改與擦除。')
         hint.setWordWrap(True)
@@ -3814,7 +3623,7 @@ class AddDetectionDialog(QDialog):
         return 'current'
 
 
-class CtdSelectionWorker(QObject):
+class SelectionDetectionWorker(QObject):
     finished = Signal(int, str, object, int)
     failed = Signal(int, str, str)
 
@@ -3839,10 +3648,10 @@ class CtdSelectionWorker(QObject):
 
             ys, xs = np.where(self.selection)
             height, width = self.selection.shape[:2]
-            x1 = max(0, int(xs.min()) - CTD_SELECTION_PADDING_PX)
-            x2 = min(width - 1, int(xs.max()) + CTD_SELECTION_PADDING_PX)
-            y1 = max(0, int(ys.min()) - CTD_SELECTION_PADDING_PX)
-            y2 = min(height - 1, int(ys.max()) + CTD_SELECTION_PADDING_PX)
+            x1 = max(0, int(xs.min()) - SELECTION_DETECTION_PADDING_PX)
+            x2 = min(width - 1, int(xs.max()) + SELECTION_DETECTION_PADDING_PX)
+            y1 = max(0, int(ys.min()) - SELECTION_DETECTION_PADDING_PX)
+            y2 = min(height - 1, int(ys.max()) + SELECTION_DETECTION_PADDING_PX)
 
             crop = self.image[y1:y2 + 1, x1:x2 + 1]
             detect_img = crop[:, :, :3] if len(crop.shape) == 3 else cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR)
@@ -3853,7 +3662,6 @@ class CtdSelectionWorker(QObject):
             )
             _, mask_refined, _ = detector(
                 detect_img,
-                refine_mode=REFINEMASK_ANNOTATION,
                 keep_undetected_mask=True,
             )
             detected_crop = np.where(mask_refined > 0, 255, 0).astype(np.uint8)
@@ -4154,11 +3962,11 @@ class MainWindow(QMainWindow):
         self.worker: FolderWorker | ConvertMasksWorker | None = None
         self.page_worker_thread: QThread | None = None
         self.page_worker: PageRegenerateWorker | None = None
-        self.ctd_selection_worker_thread: QThread | None = None
-        self.ctd_selection_worker: CtdSelectionWorker | None = None
-        self.ctd_selection_request_id = 0
-        self.ctd_selection_edit_mode = ''
-        self.ctd_selection_detector_label = 'CTD'
+        self.selection_detection_worker_thread: QThread | None = None
+        self.selection_detection_worker: SelectionDetectionWorker | None = None
+        self.selection_detection_request_id = 0
+        self.selection_detection_edit_mode = ''
+        self.selection_detection_detector_label = 'RF-DETR'
         self.pdf_worker_thread: QThread | None = None
         self.pdf_worker: PdfWorker | None = None
         self.pending_render_img_path = ''
@@ -4448,9 +4256,6 @@ class MainWindow(QMainWindow):
         self.selection_transfer_btn = QPushButton('F12 從其他轉入')
         self.selection_transfer_btn.setCheckable(True)
         self.selection_transfer_btn.setToolTip('把本次選區內其他 mask 的重疊部分移到目前 mask，並從原 mask 移除')
-        self.selection_ctd_btn = QPushButton('添加CTD檢測選區')
-        self.selection_ctd_btn.setCheckable(True)
-        self.selection_ctd_btn.setToolTip('只對本次矩形選區跑 CTD，並把檢測結果添加到目前 mask')
         self.selection_rfdetr_btn = QPushButton('添加RF-DETR選區')
         self.selection_rfdetr_btn.setCheckable(True)
         self.selection_rfdetr_btn.setToolTip('使用上次保存的 RF-DETR 設定檢測本次選區，並添加到目前 mask')
@@ -4463,7 +4268,6 @@ class MainWindow(QMainWindow):
         self.selection_combine_group.addButton(self.selection_inner_btn)
         self.selection_combine_group.addButton(self.selection_add_inner_btn)
         self.selection_combine_group.addButton(self.selection_transfer_btn)
-        self.selection_combine_group.addButton(self.selection_ctd_btn)
         self.selection_combine_group.addButton(self.selection_rfdetr_btn)
         self.selection_combine_group.addButton(self.selection_local_edit_btn)
         self.selection_add_btn.clicked.connect(lambda: self.set_selection_combine_mode('add'))
@@ -4473,7 +4277,6 @@ class MainWindow(QMainWindow):
         self.selection_inner_btn.clicked.connect(lambda: self.set_selection_combine_mode('selection_inner'))
         self.selection_add_inner_btn.clicked.connect(lambda: self.set_selection_combine_mode('add_selection_inner'))
         self.selection_transfer_btn.clicked.connect(lambda: self.set_selection_combine_mode('transfer_from_other'))
-        self.selection_ctd_btn.clicked.connect(lambda: self.set_selection_combine_mode('ctd_detect_selection'))
         self.selection_rfdetr_btn.clicked.connect(lambda: self.set_selection_combine_mode('rfdetr_detect_selection'))
         self.selection_local_edit_btn.clicked.connect(lambda: self.set_selection_combine_mode('local_edit_selection'))
         self.undo_btn = QPushButton('撤銷')
@@ -4615,7 +4418,6 @@ class MainWindow(QMainWindow):
         selection_combine_layout.addWidget(self.selection_inner_btn)
         selection_combine_layout.addWidget(self.selection_add_inner_btn)
         selection_combine_layout.addWidget(self.selection_transfer_btn)
-        selection_combine_layout.addWidget(self.selection_ctd_btn)
         selection_combine_layout.addWidget(self.selection_rfdetr_btn)
         edit_toolbar.addWidget(self.selection_combine_controls)
         edit_toolbar.addSpacing(10)
@@ -4804,7 +4606,6 @@ class MainWindow(QMainWindow):
             self.selection_inner_btn,
             self.selection_add_inner_btn,
             self.selection_transfer_btn,
-            self.selection_ctd_btn,
             self.selection_rfdetr_btn,
             self.selection_local_edit_btn,
             self.undo_btn,
@@ -6257,7 +6058,6 @@ class MainWindow(QMainWindow):
         self.selection_inner_btn.setChecked(mode == 'selection_inner')
         self.selection_add_inner_btn.setChecked(mode == 'add_selection_inner')
         self.selection_transfer_btn.setChecked(mode == 'transfer_from_other')
-        self.selection_ctd_btn.setChecked(mode == 'ctd_detect_selection')
         self.selection_rfdetr_btn.setChecked(mode == 'rfdetr_detect_selection')
         self.selection_local_edit_btn.setChecked(mode == 'local_edit_selection')
         self.update_selection_combine_controls_visibility()
@@ -6293,7 +6093,6 @@ class MainWindow(QMainWindow):
         self.selection_inner_btn.setVisible(tool == 'magic')
         self.selection_add_inner_btn.setVisible(tool == 'magic')
         self.selection_transfer_btn.setVisible(selection_tool)
-        self.selection_ctd_btn.setVisible(selection_tool)
         self.selection_rfdetr_btn.setVisible(selection_tool)
         self.selection_local_edit_btn.setVisible(True)
 
@@ -6587,9 +6386,6 @@ class MainWindow(QMainWindow):
             queued_selection = selection_mask.copy()
             QTimer.singleShot(0, lambda: self.open_local_edit_dialog(queued_selection))
             return
-        if self.selection_combine_mode == 'ctd_detect_selection':
-            self.start_ctd_selection_detection(selection_mask)
-            return
         if self.selection_combine_mode == 'rfdetr_detect_selection':
             self.start_rfdetr_selection_detection(selection_mask)
             return
@@ -6726,9 +6522,6 @@ class MainWindow(QMainWindow):
         self.update_edit_buttons()
         self.status.showMessage('已互換矩形內現有的純色填充與圖像修補。')
 
-    def start_ctd_selection_detection(self, selection: np.ndarray) -> None:
-        self.start_selection_detection(selection, DEFAULT_DETECTOR)
-
     def start_rfdetr_selection_detection(self, selection: np.ndarray) -> None:
         self.start_selection_detection(selection, DETECTOR_RFDETR)
 
@@ -6737,56 +6530,56 @@ class MainWindow(QMainWindow):
         if self.current_base is None or not self.current_img_path or self.current_edit_mask() is None:
             self.status.showMessage('沒有可檢測的當前圖片。')
             return
-        if self.ctd_selection_worker_thread is not None:
-            QMessageBox.information(self, '正在檢測', f'{self.ctd_selection_detector_label} 正在檢測上一個選區。')
+        if self.selection_detection_worker_thread is not None:
+            QMessageBox.information(self, '正在檢測', f'{self.selection_detection_detector_label} 正在檢測上一個選區。')
             return
         if self.worker_thread is not None:
             QMessageBox.information(self, '正在執行', '已有批量任務在執行中。')
             return
-        self.ctd_selection_request_id += 1
-        request_id = self.ctd_selection_request_id
+        self.selection_detection_request_id += 1
+        request_id = self.selection_detection_request_id
         img_path = self.current_img_path
-        self.ctd_selection_edit_mode = self.edit_mode
-        self.ctd_selection_detector_label = detector_label
+        self.selection_detection_edit_mode = self.edit_mode
+        self.selection_detection_detector_label = detector_label
         self.status.showMessage(f'{detector_label} 正在檢測選區...')
-        self.ctd_selection_worker_thread = QThread()
+        self.selection_detection_worker_thread = QThread()
         detector_params = (
             _saved_rfdetr_detector_params(self.settings)
             if detector_name == DETECTOR_RFDETR else None
         )
-        self.ctd_selection_worker = CtdSelectionWorker(
+        self.selection_detection_worker = SelectionDetectionWorker(
             request_id, img_path, self.current_base, selection,
             detector_name=detector_name, detector_params=detector_params,
         )
-        self.ctd_selection_worker.moveToThread(self.ctd_selection_worker_thread)
-        self.ctd_selection_worker_thread.started.connect(self.ctd_selection_worker.run)
-        self.ctd_selection_worker.finished.connect(self.on_ctd_selection_finished)
-        self.ctd_selection_worker.failed.connect(self.on_ctd_selection_failed)
-        self.ctd_selection_worker.finished.connect(self.ctd_selection_worker_thread.quit)
-        self.ctd_selection_worker.failed.connect(self.ctd_selection_worker_thread.quit)
-        self.ctd_selection_worker_thread.finished.connect(self.cleanup_ctd_selection_worker)
-        self.ctd_selection_worker_thread.start()
+        self.selection_detection_worker.moveToThread(self.selection_detection_worker_thread)
+        self.selection_detection_worker_thread.started.connect(self.selection_detection_worker.run)
+        self.selection_detection_worker.finished.connect(self.on_selection_detection_finished)
+        self.selection_detection_worker.failed.connect(self.on_selection_detection_failed)
+        self.selection_detection_worker.finished.connect(self.selection_detection_worker_thread.quit)
+        self.selection_detection_worker.failed.connect(self.selection_detection_worker_thread.quit)
+        self.selection_detection_worker_thread.finished.connect(self.cleanup_selection_detection_worker)
+        self.selection_detection_worker_thread.start()
 
-    def on_ctd_selection_finished(self, request_id: int, img_path: str, detected: object, detected_pixels: int) -> None:
-        if request_id != self.ctd_selection_request_id or img_path != self.current_img_path:
+    def on_selection_detection_finished(self, request_id: int, img_path: str, detected: object, detected_pixels: int) -> None:
+        if request_id != self.selection_detection_request_id or img_path != self.current_img_path:
             return
-        if self.edit_mode != self.ctd_selection_edit_mode:
-            self.status.showMessage(f'已切換編輯類型，{self.ctd_selection_detector_label} 選區結果已忽略。')
+        if self.edit_mode != self.selection_detection_edit_mode:
+            self.status.showMessage(f'已切換編輯類型，{self.selection_detection_detector_label} 選區結果已忽略。')
             return
         current = self.current_edit_mask()
         if current is None:
             return
         detected_mask = np.asarray(detected, dtype=np.uint8)
         if detected_mask.shape[:2] != current.shape[:2]:
-            self.status.showMessage(f'{self.ctd_selection_detector_label} 選區結果尺寸不一致。')
+            self.status.showMessage(f'{self.selection_detection_detector_label} 選區結果尺寸不一致。')
             return
         detected_bool = detected_mask > 0
         if detected_pixels <= 0 or not np.any(detected_bool):
-            self.status.showMessage(f'{self.ctd_selection_detector_label} 選區內沒有檢測到文字。')
+            self.status.showMessage(f'{self.selection_detection_detector_label} 選區內沒有檢測到文字。')
             return
         add_pixels = detected_bool & (current == 0)
         if not np.any(add_pixels):
-            self.status.showMessage(f'{self.ctd_selection_detector_label} 檢測結果已在目前 mask 中。')
+            self.status.showMessage(f'{self.selection_detection_detector_label} 檢測結果已在目前 mask 中。')
             return
         self.push_undo_snapshot()
         current[detected_bool] = 255
@@ -6799,16 +6592,16 @@ class MainWindow(QMainWindow):
         self.queue_auto_render()
         self.update_edit_buttons()
         self.status.showMessage(
-            f'{self.ctd_selection_detector_label} 已添加選區檢測結果：{int(np.count_nonzero(add_pixels))} px。'
+            f'{self.selection_detection_detector_label} 已添加選區檢測結果：{int(np.count_nonzero(add_pixels))} px。'
         )
 
-    def on_ctd_selection_failed(self, request_id: int, img_path: str, message: str) -> None:
-        if request_id == self.ctd_selection_request_id and img_path == self.current_img_path:
-            self.status.showMessage(f'{self.ctd_selection_detector_label} 選區檢測失敗：{message}')
+    def on_selection_detection_failed(self, request_id: int, img_path: str, message: str) -> None:
+        if request_id == self.selection_detection_request_id and img_path == self.current_img_path:
+            self.status.showMessage(f'{self.selection_detection_detector_label} 選區檢測失敗：{message}')
 
-    def cleanup_ctd_selection_worker(self) -> None:
-        self.ctd_selection_worker = None
-        self.ctd_selection_worker_thread = None
+    def cleanup_selection_detection_worker(self) -> None:
+        self.selection_detection_worker = None
+        self.selection_detection_worker_thread = None
 
     def transfer_selection_from_other_masks(self, selection: np.ndarray) -> bool:
         current = self.mask_for_mode(self.edit_mode)
@@ -7129,7 +6922,7 @@ class MainWindow(QMainWindow):
             'F3 恢復原圖：矩形或套索左鍵清除兩類選區，可撤銷\n'
             'Cmd（macOS）或 Ctrl（Windows/Linux）＋右鍵拖拽：矩形內現有的兩類 mask 逐像素互換；空白不變\n'
             '筆刷 Shift + 按下拖到鬆開：連接按下和鬆開位置\n'
-            '矩形 / 魔法棒 / 套索：支援添加、減去、局部交集、從其他轉入和添加CTD檢測選區\n'
+            '矩形 / 魔法棒 / 套索：支援添加、減去、局部交集、從其他轉入和添加RF-DETR選區\n'
             '套索左鍵：逐點建立多邊形，雙擊或 Enter 閉合並套用\n'
             '套索 Backspace：退回上一點；Esc：取消目前套索\n'
             '局部視窗：矩形框選區域後，在獨立放大視窗編輯副本；選「調整邊框」才可拖動藍色 ROI 邊界，套用後才回寫主頁\n'
@@ -7140,7 +6933,7 @@ class MainWindow(QMainWindow):
             '選區內部：魔法棒專用，提取本次選區包圍住的內部孔洞\n'
             '添加＋內部：魔法棒專用，同時添加本次選區和其內部孔洞\n'
             '從其他轉入：把選區內其他 mask 的重疊部分移到目前 mask\n'
-            '添加CTD檢測選區：只對本次選區跑 CTD，將檢測結果添加到目前 mask\n'
+            '添加RF-DETR選區：只對本次選區跑 HighRes，將檢測結果添加到目前 mask\n'
             '魔法棒：點擊相近的連續區域\n'
             'Command/Ctrl + 左鍵拖拽：平移畫布\n'
             '觸摸板雙指：移動畫布\n'

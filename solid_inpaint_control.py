@@ -233,7 +233,7 @@ class ControlServer(QObject):
         w = self.window
         if QApplication.activeModalWidget() is not None:
             raise ControlError('busy', '有尚未關閉的對話框，請先完成目前操作。')
-        if w.is_local_edit_active or w.is_mask_stroke_active or w.ctd_selection_worker_thread is not None:
+        if w.is_local_edit_active or w.is_mask_stroke_active or w.selection_detection_worker_thread is not None:
             raise ControlError('busy', '正在編輯選區，請完成目前操作後重試。')
         if w.worker_thread is not None:
             raise ControlError('busy', '批次任務正在執行。')
@@ -445,23 +445,13 @@ class ControlServer(QObject):
 
     @staticmethod
     def _validate_detector_params(detector, values):
-        from ysg_detector import YSG_LABEL_DESCRIPTIONS
-        schemas = {
-            'legacy_ctd': {},
-            'ctbd': {'inpaint_mask_dilate': ('int', 0, 64),
-                     'mask_unification_method': {'none', 'rectangle', 'hull'},
-                     'text_region_filter': {'all', 'text_bubble', 'text_free'}},
-            'rfdetr': {'device': {'auto', 'cuda', 'mps', 'cpu'},
-                       'inpaint_mask_dilate': ('int', 0, 64),
-                       'mask_mode': {'text_onomatopoeia', 'text', 'onomatopoeia', 'all'}},
-            'ysgyolo': {'device': {'auto', 'cuda', 'mps', 'cpu'},
-                        'labels': ('labels', set(YSG_LABEL_DESCRIPTIONS)),
-                        'merge_text_lines': ('bool',),
-                        'source_text_vertical': ('bool',),
-                        'mask_dilate_size': ('int', 0, 64),
-                        'mask_corner_radius': ('int', 0, 1000)},
+        if detector != 'rfdetr':
+            raise ControlError('bad_request', '不支援的文字偵測模型。')
+        schema = {
+            'device': {'auto', 'cuda', 'mps', 'cpu'},
+            'inpaint_mask_dilate': ('int', 0, 64),
+            'mask_mode': {'text_onomatopoeia', 'text', 'onomatopoeia', 'all'},
         }
-        schema = schemas[detector]
         for name, value in values.items():
             rule = schema.get(name)
             if rule is None:
@@ -470,12 +460,6 @@ class ControlServer(QObject):
                 valid = value in rule if isinstance(value, str) else False
             elif rule[0] == 'int':
                 valid = type(value) is int and rule[1] <= value <= rule[2]
-            elif rule[0] == 'bool':
-                valid = type(value) is bool
-            else:
-                valid = (isinstance(value, list)
-                         and all(isinstance(label, str) and label in rule[1] for label in value)
-                         and len(value) == len(set(value)))
             if not valid:
                 raise ControlError('bad_request', f'{detector} 參數 {name} 無效。')
 

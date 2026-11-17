@@ -1,5 +1,26 @@
 # RF-DETR 支援工作交接文檔
 
+## 現行模型設定（2026-11-17）
+
+本分支只保留 `rfdetr`，使用 [mayocream/koharu-layout-highres](https://huggingface.co/mayocream/koharu-layout-highres)，設定統一放在 `rfdetr_config.py`：
+
+- 權重位置：`models/koharu-layout-highres/model.safetensors`
+- SHA-256：`03de2f77281974f5084cdd8652ace2b55dc15ac0378aed66654e62537cdda255`
+- 架構／版本：`RFDETRSeg2XLarge`／`rfdetr==1.7.0`
+- 建模及推論尺寸：1920 × 1920；`num_select=160`
+- 類別與門檻：`text=0.25`、`onomatopoeia=0.30`、`bubble=0.50`、`panel=0.40`
+- 裝置：自動依序選 CUDA、MPS、CPU，也可手動指定。
+
+氣泡填充使用同一 HighRes 權重的 `bubble` 實例遮罩（固定門檻 0.50）。一般頁面共用文字／氣泡推論，明確傳遞帶來源像素與模型簽章的當次結果；外部 Mask 需要氣泡填充時才懶載入氣泡偵測器，長圖裁窗優先沿用已載入的模型。舊模型快取因模型、門檻、解析度及裁窗版本鍵而失效；既有內縮、填色、接縫與人工保護邏輯保留。
+
+GUI、CLI 與 MCP 均只提供 HighRes；「添加CTD檢測選區」已移除，保留「添加RF-DETR選區」。bootstrap 只下載上述 HighRes 權重；CTD、CTBD、YSGYOLO、MangaLens 與 1152 版 RF-DETR 的本機權重已刪除，舊適配器和 detector vendor 程式亦移除。通用影像 I/O 與 Mask 幾何分別移至 `image_io.py`、`mask_utils.py`，衍生設計的授權正文保留在 `vendor/LICENSE-BallonsTranslator`。
+
+舊 v2 專案的結果及人工修改保留；其已移除模型名稱和專屬參數在執行新偵測或重新分類時回退至 HighRes 安全預設，不自動重跑既有結果。既有有效 RF-DETR 參數可沿用。CLI／MCP 明確指定舊模型會回報參數錯誤。
+
+下方為 **2026-08-16 舊版 1152 模型的歷史交接紀錄**，其中分支、Git 狀態、模型路徑、參數、依賴與效能數字不代表現況。
+
+---
+
 最後更新：2026-08-16（模型下載、依賴、最小推理、adapter 已全部完成）
 
 ## 目前 Git 狀態

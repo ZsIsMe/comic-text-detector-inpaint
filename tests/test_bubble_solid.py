@@ -372,29 +372,28 @@ class BubbleIntegrationTests(unittest.TestCase):
 
     def test_detection_prefers_cuda_then_mps_and_cache_skips_inference(self):
         for available, mps_available, expected_device in (
-                (True, True, 'cuda:0'), (True, False, 'cuda:0'),
+                (True, True, 'cuda'), (True, False, 'cuda'),
                 (False, True, 'mps'), (False, False, 'cpu')):
             with self.subTest(cuda=available, mps=mps_available), tempfile.TemporaryDirectory() as directory:
-                checkpoint = Path(directory)/'model.pt'
+                checkpoint = Path(directory)/'model.safetensors'
                 checkpoint.write_bytes(b'model')
                 cache = Path(directory)/'cache.npz'
                 image = np.full((64, 64, 3), 255, np.uint8)
                 polygon = np.array([[5, 5], [50, 5], [50, 50], [5, 50]], np.float32)
-                import torch
-                result = SimpleNamespace(masks=SimpleNamespace(xy=[polygon]),
-                    boxes=SimpleNamespace(cls=torch.tensor([0])), names={0:'balloon'})
+                instance = bubble._polygon_mask(polygon, image.shape[:2]) > 0
+                result = SimpleNamespace(mask=np.array([instance]),
+                    class_id=np.array([2]), confidence=np.array([.50]))
                 with patch.object(bubble, 'MODEL_PATH', checkpoint), patch.object(bubble, '_model', None), \
-                        patch.object(bubble, '_model_signature', None), patch('ultralytics.YOLO') as factory, \
+                        patch.object(bubble, '_model_signature', None), patch('load_model.load_rfdetr_model') as factory, \
                         patch('torch.cuda.is_available', return_value=available) as cuda_available, \
                         patch('torch.backends.mps.is_available', return_value=mps_available) as mps_probe:
                     predict = factory.return_value.predict
-                    predict.return_value = [result]
+                    predict.return_value = result
                     polygons, status = bubble.detect_bubbles(image, cache)
                     self.assertEqual(status, 'detected')
-                    np.testing.assert_array_equal(polygons[0], polygon)
-                    self.assertEqual(predict.call_args.kwargs['device'], expected_device)
-                    self.assertEqual(predict.call_args.kwargs['imgsz'], 1600)
-                    self.assertTrue(predict.call_args.kwargs['retina_masks'])
+                    np.testing.assert_array_equal(bubble._polygon_mask(polygons[0], image.shape[:2]) > 0, instance)
+                    self.assertEqual(predict.call_args.kwargs['shape'], (1920, 1920))
+                    factory.assert_called_once_with(checkpoint, device=expected_device)
                     if available:
                         mps_probe.assert_not_called()
                     else:
@@ -404,7 +403,7 @@ class BubbleIntegrationTests(unittest.TestCase):
                     cuda_available.return_value = not available
                     cached, status = bubble.detect_bubbles(image, cache)
                     self.assertEqual(status, 'cache')
-                    np.testing.assert_array_equal(cached[0], polygon)
+                    np.testing.assert_array_equal(cached[0], polygons[0])
                     cuda_available.assert_not_called()
                     mps_probe.assert_not_called()
                     predict.assert_called_once()
@@ -412,17 +411,17 @@ class BubbleIntegrationTests(unittest.TestCase):
 
     def test_polygon_cache_invalidates_on_image_and_model_change(self):
         with tempfile.TemporaryDirectory() as directory:
-            checkpoint = Path(directory)/'model.pt'
+            checkpoint = Path(directory)/'model.safetensors'
             checkpoint.write_bytes(b'model')
             cache = Path(directory)/'cache.npz'
             image = np.full((64, 64, 3), 255, np.uint8)
             polygon = np.array([[5, 5], [50, 5], [50, 50], [5, 50]], np.float32)
-            import torch
-            result = SimpleNamespace(masks=SimpleNamespace(xy=[polygon]),
-                boxes=SimpleNamespace(cls=torch.tensor([0])), names={0:'balloon'})
+            instance = bubble._polygon_mask(polygon, image.shape[:2]) > 0
+            result = SimpleNamespace(mask=np.array([instance]),
+                class_id=np.array([2]), confidence=np.array([.50]))
             with patch.object(bubble, 'MODEL_PATH', checkpoint), patch.object(bubble, '_model', None), \
-                    patch.object(bubble, '_model_signature', None), patch('ultralytics.YOLO') as factory:
-                factory.return_value.predict.return_value = [result]
+                    patch.object(bubble, '_model_signature', None), patch('load_model.load_rfdetr_model') as factory:
+                factory.return_value.predict.return_value = result
                 self.assertEqual(bubble.detect_bubbles(image, cache)[1], 'detected')
                 self.assertEqual(bubble.detect_bubbles(image, cache)[1], 'cache')
                 image[0, 0] = 0
@@ -430,7 +429,7 @@ class BubbleIntegrationTests(unittest.TestCase):
                 checkpoint.write_bytes(b'different model')
                 self.assertEqual(bubble.detect_bubbles(image, cache)[1], 'detected')
                 self.assertEqual(factory.call_count, 2)
-                result.masks = None
+                result.mask = None
                 image[0, 1] = 0
                 self.assertEqual(bubble.detect_bubbles(image, cache)[0], [])
 
