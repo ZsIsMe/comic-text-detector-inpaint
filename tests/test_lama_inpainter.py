@@ -42,12 +42,17 @@ class LamaInpainterTests(unittest.TestCase):
             load.assert_called_once_with(checkpoint, map_location='cpu', weights_only=True)
             model.load_state_dict.assert_called_once_with(state, strict=True)
             model.requires_grad_.assert_called_once_with(False)
+            model.to.assert_called_once_with(device='cpu', dtype=torch.float32)
             with patch('torch.load') as load:
                 with self.assertRaisesRegex(ValueError, 'SHA-256'):
                     lama.load_generator(checkpoint)
                 load.assert_not_called()
 
-    def test_preprocessing_preserves_thin_masks_and_output_has_exact_original_mask_alpha(self):
+    def test_defaults_and_single_pixel_alpha_are_preserved_without_lowlevel_grow(self):
+        from lama_config import MERGE_DISTANCE, CONTEXT_RATIO, MASK_EXPAND, REPAIR_POLICY
+        self.assertEqual((lama.MAX_INPAINT_SIZE, MERGE_DISTANCE, CONTEXT_RATIO, MASK_EXPAND),
+                         (768, 24, 1.7, 8))
+        self.assertEqual(REPAIR_POLICY, 'manga-local-crop768-grow8-v3')
         image = np.full((101, 2051, 3), (20, 40, 80), np.uint8)
         before = image.copy()
         mask = np.zeros(image.shape[:2], np.uint8)
@@ -59,103 +64,166 @@ class LamaInpainterTests(unittest.TestCase):
             second = inpainter(image, mask)
         self.assertEqual(load.call_count, 1)
         np.testing.assert_array_equal(repaired, second)
-        self.assertTrue(np.all(repaired[mask == 0] == 0))
+        self.assertFalse(np.any(repaired[mask == 0]))
         np.testing.assert_array_equal(repaired[mask > 0], [[26, 128, 230, 255]])
         rgb, small_mask = model.inputs[0]
-        self.assertEqual(rgb.shape[1], 3)
-        self.assertEqual(rgb.shape[-2] % 64, 0)
-        self.assertEqual(tuple(rgb.shape[-2:]), (64, 64))
-        self.assertGreater(int(small_mask.sum()), 0)
-        self.assertEqual(set(small_mask.unique().tolist()), {0, 1})
-        np.testing.assert_allclose(rgb[0, :, 0, 0], np.array([20, 40, 80]) / 255, atol=1e-7)
+        self.assertEqual(tuple(rgb.shape), (1, 3, 64, 64))
+        self.assertEqual(rgb.dtype, torch.float32)
+        self.assertEqual(small_mask.dtype, torch.float32)
+        self.assertEqual(set(small_mask.unique().tolist()), {1})
+        np.testing.assert_array_equal(rgb[0, :, 0, 0],
+                                      (torch.tensor([20, 40, 80], dtype=torch.float32) / 255).numpy())
         np.testing.assert_array_equal(image, before)
 
-    def test_context_window_uses_upstream_area_ratio_and_clipped_minimum(self):
-        self.assertEqual(lama._context_window((100, 80, 200, 130), 400, 300),
-                         (90, 70, 210, 140))
-        self.assertEqual(lama._context_window((0, 0, 1, 1), 500, 400), (0, 0, 32, 32))
-        self.assertEqual(lama._context_window((499, 399, 500, 400), 500, 400),
-                         (468, 368, 500, 400))
-        self.assertEqual(lama._context_window((3, 2, 4, 3), 9, 7), (0, 0, 9, 7))
+    def test_region_geometry_dilates_25_square_then_uses_original_mask_bounds(self):
+        mask = np.zeros((300, 400), bool)
+        mask[80:130, 100:200] = True
+        labels, regions = lama.region_crops(mask)
+        self.assertEqual(regions, [(90, 70, 210, 140, 1)])
+        self.assertEqual(int((labels > 0).sum()), (100 + 24) * (50 + 24))
+        # A one-pixel crop stays one pixel: no minimum context is injected.
+        tiny = np.zeros((10, 12), bool)
+        tiny[0, 0] = True
+        self.assertEqual(lama.region_crops(tiny)[1], [(0, 0, 1, 1, 1)])
+        # The square dilation joins a 24-pixel gap, but not a 25-pixel gap.
+        close = np.zeros((100, 120), bool)
+        close[30, 30] = close[30, 55] = True
+        self.assertEqual(lama.region_crops(close)[1], [(30, 30, 56, 31, 1)])
+        far = np.zeros_like(close)
+        far[30, 30] = far[30, 56] = True
+        self.assertEqual(lama.region_crops(far)[1],
+                         [(30, 30, 31, 31, 1), (56, 30, 57, 31, 2)])
 
-    def test_grouping_merges_16px_gaps_and_bridges_without_dropping_tiny_regions(self):
-        boxes = [(10, 10, 11, 11), (27, 10, 28, 11), (44, 10, 45, 11),
-                 (100, 100, 101, 101)]
-        self.assertEqual(lama._merge_boxes(boxes, gap=16),
-                         [(10, 10, 45, 11), (100, 100, 101, 101)])
-        self.assertEqual(lama._merge_boxes([(0, 0, 1, 1), (18, 0, 19, 1)], gap=16),
-                         [(0, 0, 1, 1), (18, 0, 19, 1)])
-        mask = np.zeros((160, 200), np.uint8)
-        mask[30, 30] = mask[30, 60] = mask[120, 120] = 255
-        self.assertEqual(lama._repair_windows(mask),
-                         [(15, 15, 77, 47), (105, 105, 137, 137)])
-
-    def test_square_reflect_padding_preserves_unscaled_small_crop(self):
-        image = np.arange(3 * 5 * 3, dtype=np.uint8).reshape(3, 5, 3)
-        mask = np.zeros((3, 5), np.uint8)
-        mask[1, 2] = 255
-        rgb, binary, small = lama._prepare(image, mask, 1536)
-        self.assertEqual(small, (3, 5))
-        self.assertEqual(rgb.shape, (64, 64, 3))
-        np.testing.assert_array_equal(rgb[:3, :5], image.astype(np.float32) / 255)
-        np.testing.assert_array_equal(rgb, cv2.copyMakeBorder(
-            image.astype(np.float32) / 255, 0, 61, 0, 59, cv2.BORDER_REFLECT))
-        np.testing.assert_array_equal(binary, cv2.copyMakeBorder(
-            (mask > 0).astype(np.float32), 0, 61, 0, 59, cv2.BORDER_REFLECT))
-
-    def test_large_crop_is_linear_downscaled_to_1536_and_keeps_one_pixel_masks(self):
-        self.assertEqual(lama.MAX_INPAINT_SIZE, 1536)
-        image = np.zeros((1800, 2000, 3), np.uint8)
-        image[:, ::2] = 255
+    def test_overlapping_contexts_stay_separate_and_only_their_label_mask_is_written(self):
+        image = np.full((700, 1100, 3), 100, np.uint8)
         mask = np.zeros(image.shape[:2], np.uint8)
-        mask[1, 1] = mask[1799, 1999] = 255
-        rgb, binary, small = lama._prepare(image, mask, lama.MAX_INPAINT_SIZE)
-        self.assertEqual(small, (1382, 1536))
-        self.assertEqual(rgb.shape, (1536, 1536, 3))
-        expected = cv2.resize(image.astype(np.float32) / 255, (1536, 1382),
-                              interpolation=cv2.INTER_LINEAR)
-        np.testing.assert_array_equal(rgb[:1382], expected)
-        self.assertGreater(float(binary[0:3, 0:3].sum()), 0)
-        self.assertGreater(float(binary[1379:1382, 1533:1536].sum()), 0)
+        mask[100:500, 100:500] = mask[100:500, 530:930] = 255
+        before, mask_before = image.copy(), mask.copy()
+        labels, regions = lama.region_crops(mask > 0)
+        self.assertEqual(regions, [(39, 39, 561, 561, 1), (469, 39, 991, 561, 2)])
+        calls = []
 
-    def test_multiple_local_predictions_map_back_to_original_coordinates(self):
-        rows, columns = np.indices((160, 260))
-        image = np.stack((rows, columns % 256, (rows + columns) % 256), axis=-1).astype(np.uint8)
-        before = image.copy()
-        mask = np.zeros(image.shape[:2], np.uint8)
-        mask[2, 5] = 255
-        mask[100:105, 230:236] = 255
-        mask_before = mask.copy()
+        def predict(context, local_mask):
+            calls.append((context.copy(), local_mask.copy()))
+            return np.full_like(context, 10 * len(calls))
 
-        class EchoModel(FlatModel):
-            def forward(self, image, mask):
-                self.inputs.append((image.clone(), mask.clone()))
-                return image
-
-        model = EchoModel()
-        with patch.object(lama, 'load_generator', return_value=model) as load:
-            inpainter = lama.LamaLargeInpainter(device='cpu')
-            output = inpainter(image, mask)
-        self.assertEqual(load.call_count, 1)
-        self.assertEqual(len(model.inputs), 2)
-        np.testing.assert_array_equal(output[mask > 0, :3], image[mask > 0])
-        self.assertTrue(np.all(output[mask > 0, 3] == 255))
+        instance = lama.LamaLargeInpainter(device='cpu')
+        with patch.object(instance, '_predict_crop', side_effect=predict):
+            output = instance(image, mask)
+        self.assertEqual(len(calls), 2)
+        for (_, local_mask), (x1, y1, x2, y2, label) in zip(calls, regions):
+            np.testing.assert_array_equal(local_mask,
+                (mask[y1:y2, x1:x2] > 0) & (labels[y1:y2, x1:x2] == label))
+            self.assertEqual(int(local_mask.sum()), 400 * 400)
+        self.assertTrue(np.all(output[100:500, 100:500, :3] == 10))
+        self.assertTrue(np.all(output[100:500, 530:930, :3] == 20))
+        # The second overlapping context sees the first group's completed repair.
+        np.testing.assert_array_equal(calls[1][0][150 - 39, 480 - 469], [10, 10, 10])
+        np.testing.assert_array_equal(output[:, :, 3], mask)
         self.assertFalse(np.any(output[mask == 0]))
-        for (x1, y1, x2, y2), (tensor, _) in zip(lama._repair_windows(mask), model.inputs):
-            np.testing.assert_allclose(tensor[0, :, :y2-y1, :x2-x1].numpy().transpose(1, 2, 0),
-                                       image[y1:y2, x1:x2].astype(np.float32) / 255)
         np.testing.assert_array_equal(image, before)
         np.testing.assert_array_equal(mask, mask_before)
 
-    def test_overlapping_context_windows_are_inferred_once_and_cover_every_mask_pixel(self):
-        image = np.zeros((160, 200, 3), np.uint8)
-        mask = np.zeros(image.shape[:2], np.uint8)
-        mask[30, 30] = mask[30, 60] = 255
+    def test_prepare_matches_uint8_linear_ceil64_then_square_reflect_reference(self):
+        image = np.arange(65 * 139 * 3, dtype=np.uint8).reshape(65, 139, 3)
+        mask = np.zeros((65, 139), bool)
+        mask[10:14, 17:23] = True
+        rgb, binary, small = lama._prepare(image, mask, 768)
+        self.assertEqual(small, (128, 192))
+        resized = cv2.resize(image, (192, 128), interpolation=cv2.INTER_LINEAR)
+        resized_mask = cv2.resize(mask.astype(np.uint8) * 255, (192, 128),
+                                  interpolation=cv2.INTER_LINEAR)
+        np.testing.assert_array_equal(rgb, cv2.copyMakeBorder(resized, 0, 64, 0, 0, cv2.BORDER_REFLECT))
+        np.testing.assert_array_equal(binary, cv2.copyMakeBorder(resized_mask, 0, 64, 0, 0,
+                                                               cv2.BORDER_REFLECT) >= 128)
+        self.assertEqual(rgb.dtype, np.uint8)
+        self.assertEqual(binary.dtype, np.bool_)
+
+    def test_prepare_768_limit_and_reference_mask_threshold_without_area_coverage(self):
+        image = np.zeros((1800, 2000, 3), np.uint8)
+        image[:, ::2] = 255
+        mask = np.zeros(image.shape[:2], bool)
+        mask[0, 0] = True
+        rgb, binary, small = lama._prepare(image, mask, 768)
+        self.assertEqual(small, (704, 768))
+        self.assertEqual(rgb.shape, (768, 768, 3))
+        np.testing.assert_array_equal(rgb[:704], cv2.resize(image, (768, 704), interpolation=cv2.INTER_LINEAR))
+        resized_mask = cv2.resize(mask.astype(np.uint8) * 255, (768, 704), interpolation=cv2.INTER_LINEAR)
+        np.testing.assert_array_equal(binary[:704], resized_mask >= 128)
+        self.assertFalse(np.any(binary))  # Deliberately follows reference threshold, not old thin-mask coverage.
+        skinny = np.zeros((1, 3000, 3), np.uint8)
+        rgb, _, small = lama._prepare(skinny, np.ones((1, 3000), bool), 768)
+        self.assertEqual(small, (64, 768))  # max(1, round(...)) avoids a zero-sized axis.
+        self.assertEqual(rgb.shape, (768, 768, 3))
+
+    def test_prediction_rounds_uint8_before_unpadding_and_restoring_crop_size(self):
+        class PatternModel(torch.nn.Module):
+            def forward(self, image, mask):
+                self.inputs = image.clone(), mask.clone()
+                h, w = image.shape[-2:]
+                grid = torch.arange(h * w, dtype=torch.float32).reshape(h, w) / (h * w - 1)
+                self.prediction = torch.stack((grid, grid * .731 + .001, grid * .333)).unsqueeze(0)
+                return self.prediction
+
+        image = np.arange(73 * 139 * 3, dtype=np.uint8).reshape(73, 139, 3)
+        mask = np.zeros((73, 139), bool)
+        mask[12:50, 20:110] = True
+        instance = lama.LamaLargeInpainter(device='cpu')
+        instance.model, instance.device = PatternModel(), 'cpu'
+        actual = instance._predict_crop(image, mask)
+        input_rgb, input_mask = instance.model.inputs
+        reference_wrapped = input_mask * instance.model.prediction + (1 - input_mask) * input_rgb
+        predicted = reference_wrapped[0].permute(1, 2, 0).numpy()
+        expected = np.clip(np.round(predicted * 255), 0, 255).astype(np.uint8)[:128, :192]
+        expected = cv2.resize(expected, (139, 73), interpolation=cv2.INTER_LINEAR)
+        np.testing.assert_array_equal(actual, expected)
+        old_order = cv2.resize(predicted[:128, :192], (139, 73), interpolation=cv2.INTER_LINEAR)
+        old_order = np.clip(np.round(old_order * 255), 0, 255).astype(np.uint8)
+        self.assertTrue(np.any(actual != old_order))
+        prepared = lama._prepare(image, mask, 768)[0]
+        reference_tensor = torch.from_numpy(prepared).permute(2, 0, 1).unsqueeze(0).to(dtype=torch.float32) / 255
+        torch.testing.assert_close(instance.model.inputs[0], reference_tensor, rtol=0, atol=0)
+        self.assertEqual(instance.model.inputs[0].stride(), reference_tensor.stride())
+
+    def test_network_resolution_masked_compositing_precedes_boundary_resampling(self):
+        image = np.full((73, 139, 3), 100, np.uint8)
+        mask = np.zeros((73, 139), bool)
+        mask[20:50, 40:90] = True
         model = FlatModel()
-        with patch.object(lama, 'load_generator', return_value=model):
-            output = lama.LamaLargeInpainter(device='cpu')(image, mask)
-        self.assertEqual(len(model.inputs), 1)
-        np.testing.assert_array_equal(output[:, :, 3], mask)
+        instance = lama.LamaLargeInpainter(device='cpu')
+        instance.model, instance.device = model, 'cpu'
+        actual = instance._predict_crop(image, mask)
+        # Independent reference-node preparation and Spandrel wrapper formula.
+        resized_image = cv2.resize(image, (192, 128), interpolation=cv2.INTER_LINEAR)
+        resized_mask = cv2.resize(mask.astype(np.uint8) * 255, (192, 128),
+                                  interpolation=cv2.INTER_LINEAR)
+        padded_image = cv2.copyMakeBorder(resized_image, 0, 64, 0, 0, cv2.BORDER_REFLECT)
+        padded_mask = cv2.copyMakeBorder(resized_mask, 0, 64, 0, 0, cv2.BORDER_REFLECT)
+        rgb = torch.from_numpy(padded_image).permute(2, 0, 1).unsqueeze(0).float() / 255
+        selected = torch.from_numpy(padded_mask >= 128).unsqueeze(0).unsqueeze(0).float()
+        raw = torch.tensor([.1, .5, .9]).view(1, 3, 1, 1).expand_as(rgb)
+        wrapped = selected * raw + (1 - selected) * rgb
+        pixels = wrapped[0].permute(1, 2, 0).numpy()
+        pixels = np.clip(np.round(pixels * 255), 0, 255).astype(np.uint8)[:128, :192]
+        expected = cv2.resize(pixels, (139, 73), interpolation=cv2.INTER_LINEAR)
+        np.testing.assert_array_equal(actual, expected)
+        # Missing the wrapper incorrectly leaves the generator's mask-exterior
+        # colors available to interpolation back into selected boundary pixels.
+        self.assertTrue(np.any(actual[mask] != np.array([26, 128, 230], np.uint8)))
+        np.testing.assert_array_equal(actual[0, 0], [100, 100, 100])
+
+    def test_masks_and_images_are_validated_even_when_empty_without_constructing_model(self):
+        image = np.zeros((9, 7, 3), np.uint8)
+        cases = [np.zeros((8, 7)), np.full((9, 7), np.nan),
+                 np.full((9, 7), -1), np.full((9, 7), np.inf),
+                 np.zeros((9, 7), np.complex64), np.full((9, 7), 'bad')]
+        with patch.object(lama, 'LamaLargeInpainter', side_effect=AssertionError('must stay lazy')):
+            for mask in cases:
+                with self.subTest(dtype=mask.dtype, shape=mask.shape):
+                    with self.assertRaises(ValueError):
+                        lama.inpaint_other(image, mask)
+            with self.assertRaises(ValueError):
+                lama.inpaint_other(image.astype(np.float32), np.zeros((9, 7)))
 
     def test_empty_mask_never_loads_or_constructs_a_model(self):
         image = np.zeros((9, 7, 3), np.uint8)
@@ -211,7 +279,9 @@ class LamaInpainterTests(unittest.TestCase):
         original_to = torch.Tensor.to
 
         def to(tensor, *args, **kwargs):
-            return tensor if args and args[0] == 'mps' else original_to(tensor, *args, **kwargs)
+            if kwargs.get('device') == 'mps':
+                kwargs = dict(kwargs, device='cpu')
+            return original_to(tensor, *args, **kwargs)
 
         model = FailOnceModel()
         inpainter = lama.LamaLargeInpainter(device='cpu')

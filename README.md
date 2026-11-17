@@ -244,7 +244,7 @@ macOS 將 Python 路徑改為 `.venv/bin/python`，並使用對應的資料夾�
 | 腳本 | 各工程內的輸出 | 驗證及續跑 |
 | --- | --- | --- |
 | `batch_export_refinement.py` | `ctd_inpainted/export_pair/` 的合成圖、`other_mask/`、`colored/` | 三組 PNG 逐張讀回比對像素，整工程驗收後發布；既有導出只在相同報告能驗證時跳過，其餘情況保留並回報失敗 |
-| `batch_export_psd.py` | `ctd_inpainted/psd_assets/` 的 `solid/`、`other_mask/`、`lama_large_512px/`、`psds/` | 沿用程式的兩階段流程，先完成本工程全部 LaMa PNG，再組裝 PSD；檢查素材像素、PSD 可讀性及新 PSD 圖層，已有 PSD 保留 |
+| `batch_export_psd.py` | `ctd_inpainted/psd_assets/` 的 `solid/`、`other_mask/`、`repair_mask/`、`lama_large_512px/`、`psds/` | 沿用程式的兩階段流程，先完成本工程全部 LaMa PNG，再組裝 PSD；檢查素材、實際修補遮罩、PSD 可讀性及新 PSD 圖層，已有 PSD 保留 |
 
 只有 PSD 導出會在 OTHER 非空時執行 LaMa，需已安裝 `requirements.txt` 並備妥已校驗的 LaMa 權重；不需要啟動 Photoshop。待精修標記圖沿用本機 GUI 的顏色及透明度設定。
 
@@ -286,17 +286,20 @@ PDF、PNG 和 PSD 按需導出到 `raw` 之外，日常保存不產生多組重�
 1. **LaMa 修補**：先完成本批全部頁面的 PNG 素材；只有 OTHER 非空的頁面才生成透明修補 PNG。
 2. **PSD 組裝**：全部修補 PNG 完成後，讀取原圖、`solid` 和修補 PNG 組成分層 PSD，不再執行模型推論。
 
-LaMa 沿用 [BallonsTranslator 的尺寸與補邊處理](https://github.com/dmMaze/BallonsTranslator/blob/dev/ballontranslator/modules/inpaint/inpaint_default.py)：每個修補區域最長邊上限預設為 **1536**，僅超過上限時縮小；較小區域不放大，反射補邊至邊長為 64 倍數的正方形後推論，再移除補邊並恢復區域尺寸。`lama_large_512px` 是權重名稱，不是固定 512 像素輸入限制。
+本分支試用已驗證的 **LaMa-Manga-Local-Crop** 方法，與 ComfyUI 共用相同權重內容，直接以本機 PyTorch FP32 執行，無須安裝或啟動 ComfyUI。前一版 1536 方法保留在 `codex/koharu-layout-highres` 的 `509b2c9`。
 
-本專案沒有正式保存上游的文字框，因此從當前 OTHER 遮罩的全部連通區建立框，合併相距 16 像素內的相鄰框，按上游 `enlarge_window(ratio=1.7)` 擴展背景範圍；極小區域補足最小 32 像素上下文，並合併重疊裁窗。這是本專案對分塊來源的適配，不讀取可能過期的偵測快取，不丟棄單像素人工選區。逐塊修補後只貼回原 OTHER 範圍，沒有額外擴張正式遮罩。程式與批量 PSD 腳本共用此流程。
+沿用工作流參數：OTHER 按 0.5 門檻二值化後用十字形核外擴 **8px**，再用 **25×25 方核**分組（`merge_distance=24`），按原選區與分組標籤求框，採 **1.7** 的目標面積比外擴背景。裁窗最長邊上限 **768**，寬高各自向上取到 64 倍數後用線性插值調整，再反射補成正方形；模型先在推論尺寸還原 Mask 外底圖，再將輸出量化為 8-bit，去補邊後線性恢復局部尺寸。重疊上下文不合併，每次只處理自己分組的 Mask。沒有沿用舊版的 16px 合併、32px 最小窗或細 Mask 面積覆蓋縮放。
 
-舊版整頁 512 推論的批量報告不會直接續用；再次執行時更新修補 PNG，既有 PSD 保留，含修補內容的舊 PSD 在報告中標為 `stale`。本次方法更新不會自動重跑漫畫工程。
+對本專案的適配：使用「原圖＋已保存填色」合成圖作為模型底圖；外擴範圍扣除已有填色及人工擦除保護，原圖和正式 OTHER 不改。實際範圍保存為 `repair_mask/<name>.png`，修補 PNG 與 PSD 的 Alpha 均按此範圍驗證。`export_psds_from_assets` 在對應工程 raw 存在時讀取正式人工保護；只有獨立 PNG 素材且無 raw／`edited_loader` 時，僅能保護可知的填色，無法推回已遺失的人工擦除資料。
+
+舊版 512／1536 推論的批量報告不會直接續用；再次執行時更新修補素材，既有 PSD 保留，含修補內容的舊 PSD 在報告中標為 `stale`。本次方法更新不會自動重跑漫畫工程。
 
 視窗顯示整批進度條，以及目前階段、該階段頁碼與檔名；進度按頁更新，完成後顯示 PSD 所在路徑：
 
 ```text
 <image folder>/ctd_inpainted/psd_assets/solid/<name>.png
 <image folder>/ctd_inpainted/psd_assets/other_mask/<name>.png
+<image folder>/ctd_inpainted/psd_assets/repair_mask/<name>.png
 <image folder>/ctd_inpainted/psd_assets/lama_large_512px/<name>.png
 <image folder>/ctd_inpainted/psd_assets/psds/<name>.psd
 ```
@@ -305,11 +308,11 @@ LaMa 沿用 [BallonsTranslator 的尺寸與補邊處理](https://github.com/dmMa
 
 | 圖層 | 內容 | 初始狀態 |
 | --- | --- | --- |
-| `lama_large_512px` | 從同名透明修補 PNG 讀入，內容為 LaMa 對原圖 `other_mask > 0` 區域的修補結果 | 顯示 |
+| `lama_large_512px` | 從同名透明修補 PNG 讀入，內容為 LaMa 對 `repair_mask > 0` 區域的修補結果 | 顯示 |
 | `overlay-manual` | 保存的純色填充 overlay；Alpha 非零時才建立 | 顯示 |
 | `bg` | 原圖背景 | 顯示 |
 
-`lama_large_512px` 是普通 RGBA 圖層，與落盤的修補 PNG 使用同一份內容。LaMa 的 8-bit 修補輸出在修補區內 Alpha 為 255，區外的 RGBA 全為 0；它不是黑白 Mask 圖層。寫入 16-bit PSD 時，修補內容按 PSD 位深轉存，區內仍為完全不透明。OTHER 為空時不執行 LaMa、不生成修補 PNG，PSD 也不建立 LaMa 圖層。重新導出該頁時會清理同名、尺寸相符且 RGBA 全零的舊修補 PNG；非空或損壞的舊檔保留但不採用。已有 PSD 仍保留，批量報告會把不符合新規則的舊空修補層標為 `stale`，不自動覆寫。新 PSD 不建立黑白 `other_mask` 圖層或 `OTHER_CHANNEL`，需要黑白選區時可使用旁邊的 `other_mask` PNG。
+`lama_large_512px` 是普通 RGBA 圖層，與落盤的修補 PNG 使用同一份內容。LaMa 的 8-bit 修補輸出在實際修補區內 Alpha 為 255，區外 RGBA 全為 0；它不是黑白 Mask 圖層。寫入 16-bit PSD 時，修補內容按 PSD 位深轉存。OTHER 或實際修補範圍為空時不執行 LaMa、不生成修補 PNG，PSD 也不建立 LaMa 圖層；`repair_mask` 仍保存全黑圖以記錄本次範圍。重新導出時只清理同名、尺寸相符且 RGBA 全零的舊修補 PNG；非空或損壞舊檔保留但不採用。已有 PSD 不自動覆寫。黑白 `other_mask` 與 `repair_mask` 都不建立 PSD 圖層或 `OTHER_CHANNEL`，可在旁邊使用對應 PNG。
 
 PSD 保留來源尺寸與位深，RGB 來源已有的 ICC 描述檔會直接寫入。8-bit CMYK 或帶灰階 ICC 的來源會先轉為 sRGB，並使用轉換後的 ICC；16-bit 灰階 ICC 或其他不能套用到 RGB PSD 的描述檔會明確回報錯誤。16-bit 原圖的背景仍保留 16-bit；LaMa 使用 8-bit 輸入與修補內容，不會因此把整張背景降為 8-bit。修補層預設顯示，開啟 PSD 後可直接檢查修補品質，也可自行隱藏以比較原圖。
 

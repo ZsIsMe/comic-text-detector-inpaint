@@ -10,59 +10,48 @@ import threading
 import cv2
 import numpy as np
 
-from lama_config import MODEL_PATH, MODEL_SHA256, MAX_INPAINT_SIZE, PAD_MODULO
+from lama_config import (
+    MODEL_PATH, MODEL_SHA256, MAX_INPAINT_SIZE, PAD_MODULO, MERGE_DISTANCE, CONTEXT_RATIO,
+)
 
 
-def _merge_boxes(boxes, gap=0):
-    """Coalesce touching/near exclusive xyxy rectangles, including bridges."""
-    merged = []
-    for box in sorted(boxes):
-        box = tuple(int(value) for value in box)
-        pending = list(merged)
-        merged = []
-        while pending:
-            other = pending.pop()
-            if (box[0] <= other[2] + gap and other[0] <= box[2] + gap
-                    and box[1] <= other[3] + gap and other[1] <= box[3] + gap):
-                box = (min(box[0], other[0]), min(box[1], other[1]),
-                       max(box[2], other[2]), max(box[3], other[3]))
-                # The enlarged union may now bridge a rectangle already visited.
-                pending.extend(merged)
-                merged = []
-            else:
-                merged.append(other)
-        merged.append(box)
-    return sorted(merged, key=lambda box: (box[1], box[0], box[3], box[2]))
+def region_crops(mask, merge_distance=MERGE_DISTANCE, context_ratio=CONTEXT_RATIO):
+    """LaMa-Manga-Local-Crop grouping: dilated labels, original-mask bounds.
 
-
-def _context_window(box, width, height, ratio=1.7, minimum=32):
-    """BallonsTranslator enlarge_window (aspect_ratio=1), with tiny-mask context.
-
-    Upstream utils/imgproc_utils.py solves a quadratic for added *area*, rather
-    than multiplying each side by ratio. Our minimum 32px per axis adapts this
-    to authoritative masks, which can contain individual pixels instead of text
-    block rectangles. The minimum window shifts at image edges without padding.
+    Mirrors ComfyUI-MangaLaMa region_crops. Contexts may overlap; their selected
+    label masks stay separate. No bbox-distance merge or minimum window is used.
     """
-    x1, y1, x2, y2 = box
-    w, h = x2 - x1, y2 - y1
-    delta = int(round((math.sqrt((w + h) ** 2 + 4 * (ratio - 1) * w * h)
-                       - (w + h)) / 4))
-    dx, dy = min(x1, width - x2, delta), min(y1, height - y2, delta)
-    x1, y1, x2, y2 = x1 - dx, y1 - dy, x2 + dx, y2 + dy
-    target_w, target_h = min(width, max(minimum, x2 - x1)), min(height, max(minimum, y2 - y1))
-    x1 = min(max(0, x1 - (target_w - (x2 - x1)) // 2), width - target_w)
-    y1 = min(max(0, y1 - (target_h - (y2 - y1)) // 2), height - target_h)
-    return x1, y1, x1 + target_w, y1 + target_h
-
-
-def _repair_windows(mask):
-    """Use only saved OTHER pixels, never disposable detection caches."""
-    active = np.ascontiguousarray(mask > 0, dtype=np.uint8)
-    count, _, stats, _ = cv2.connectedComponentsWithStats(active, connectivity=8)
-    boxes = [(x, y, x + w, y + h) for x, y, w, h, _ in stats[1:count]]
-    grouped = _merge_boxes(boxes, gap=16)
+    grouping = mask.astype(np.uint8)
+    if merge_distance > 0:
+        grouping = cv2.dilate(grouping, np.ones((merge_distance + 1, merge_distance + 1), np.uint8))
+    count, labels = cv2.connectedComponents(grouping, connectivity=8)
     height, width = mask.shape
-    return _merge_boxes([_context_window(box, width, height) for box in grouped])
+    regions = []
+    for label in range(1, count):
+        selected = mask & (labels == label)
+        ys, xs = np.nonzero(selected)
+        if not len(xs):
+            continue
+        x1, x2 = int(xs.min()), int(xs.max()) + 1
+        y1, y2 = int(ys.min()), int(ys.max()) + 1
+        w, h = x2 - x1, y2 - y1
+        margin = round((math.sqrt((w + h) ** 2 + 4 * (context_ratio - 1) * w * h) - w - h) / 4)
+        dx, dy = min(margin, x1, width - x2), min(margin, y1, height - y2)
+        regions.append((x1 - dx, y1 - dy, x2 + dx, y2 + dy, label))
+    regions.sort(key=lambda item: (item[1], item[0]))
+    return labels, regions
+
+
+def _validated_inputs(image_rgb, other_mask):
+    image, mask = np.asarray(image_rgb), np.asarray(other_mask)
+    if (image.ndim != 3 or image.shape[2] not in (3, 4)
+            or image.dtype not in (np.uint8, np.uint16) or not all(image.shape[:2])):
+        raise ValueError('LaMa 需要非空 RGB/RGBA uint8 或 uint16 圖像。')
+    if mask.shape != image.shape[:2]:
+        raise ValueError('LaMa Mask 尺寸與原圖不一致。')
+    if mask.dtype.kind not in 'buif' or not np.isfinite(mask).all() or np.any(mask < 0):
+        raise ValueError('LaMa Mask 必須為有限、非負的數值選區。')
+    return image, mask > 0
 
 
 def _device(requested='auto'):
@@ -100,25 +89,24 @@ def load_generator(path=MODEL_PATH, *, device='cpu'):
         raise ValueError('LaMa 模型缺少 gen_state_dict。')
     model = LamaLargeGenerator()
     model.load_state_dict(checkpoint['gen_state_dict'], strict=True)
-    return model.eval().requires_grad_(False).to(device)
+    return model.eval().requires_grad_(False).to(device=device, dtype=torch.float32)
 
 
 def _prepare(image, mask, max_size):
+    """Match the reference node's uint8 resize, ceil64 and square REFLECT order."""
     height, width = image.shape[:2]
     scale = min(1.0, max_size / max(height, width))
-    target = max(1, round(width * scale)), max(1, round(height * scale))
-    rgb = image.astype(np.float32) / 255.0
-    binary = (mask > 0).astype(np.float32)
-    if target != (width, height):
-        rgb = cv2.resize(rgb, target, interpolation=cv2.INTER_LINEAR)
-        # Resize float coverage, not uint8/nearest: even a one-pixel mask must survive.
-        binary = (cv2.resize(binary, target, interpolation=cv2.INTER_AREA) > 0).astype(np.float32)
-    small_h, small_w = binary.shape
-    side = math.ceil(max(small_h, small_w) / PAD_MODULO) * PAD_MODULO
-    bottom, right = side - small_h, side - small_w
-    rgb = cv2.copyMakeBorder(rgb, 0, bottom, 0, right, cv2.BORDER_REFLECT)
-    binary = cv2.copyMakeBorder(binary, 0, bottom, 0, right, cv2.BORDER_REFLECT)
-    return rgb, binary, (small_h, small_w)
+    # The reference rounds to zero for an extremely thin crop. Clamp to one
+    # before ceil64 solely to make that geometry valid; all other math matches.
+    resized_w = math.ceil(max(1, round(width * scale)) / PAD_MODULO) * PAD_MODULO
+    resized_h = math.ceil(max(1, round(height * scale)) / PAD_MODULO) * PAD_MODULO
+    rgb = cv2.resize(image, (resized_w, resized_h), interpolation=cv2.INTER_LINEAR)
+    binary = cv2.resize(mask.astype(np.uint8) * 255, (resized_w, resized_h),
+                        interpolation=cv2.INTER_LINEAR)
+    side = max(resized_w, resized_h)
+    rgb = cv2.copyMakeBorder(rgb, 0, side - resized_h, 0, side - resized_w, cv2.BORDER_REFLECT)
+    binary = cv2.copyMakeBorder(binary, 0, side - resized_h, 0, side - resized_w, cv2.BORDER_REFLECT)
+    return rgb, binary >= 128, (resized_h, resized_w)
 
 
 class LamaLargeInpainter:
@@ -133,33 +121,22 @@ class LamaLargeInpainter:
         self._lock = threading.Lock()
 
     def __call__(self, image_rgb, other_mask):
-        image = np.asarray(image_rgb)
-        mask = np.asarray(other_mask)
-        if image.ndim != 3 or image.shape[2] not in (3, 4) or image.dtype not in (np.uint8, np.uint16):
-            raise ValueError('LaMa 需要 RGB/RGBA uint8 或 uint16 圖像。')
-        if mask.shape != image.shape[:2]:
-            raise ValueError('LaMa Mask 尺寸與原圖不一致。')
-        output = np.zeros((*mask.shape, 4), np.uint8)
-        active = mask > 0
+        image, active = _validated_inputs(image_rgb, other_mask)
+        output = np.zeros((*active.shape, 4), np.uint8)
         if not np.any(active):
             return output
         context = image[:, :, :3].copy()
         if context.dtype == np.uint16:
             context = (context >> 8).astype(np.uint8)
         with self._lock:
-            remaining = active.copy()
-            for x1, y1, x2, y2 in _repair_windows(mask):
-                local_mask = remaining[y1:y2, x1:x2]
-                if not np.any(local_mask):
-                    continue
+            labels, regions = region_crops(active)
+            for x1, y1, x2, y2, label in regions:
+                local_mask = active[y1:y2, x1:x2] & (labels[y1:y2, x1:x2] == label)
                 repaired = self._predict_crop(context[y1:y2, x1:x2], local_mask)
                 context[y1:y2, x1:x2][local_mask] = repaired[local_mask]
                 local_output = output[y1:y2, x1:x2]
                 local_output[local_mask, :3] = repaired[local_mask]
                 local_output[local_mask, 3] = 255
-                local_mask[:] = False
-        if np.any(remaining):
-            raise ValueError('LaMa 局部修補未覆蓋全部 OTHER 選區。')
         return output
 
     def _predict_crop(self, context, mask):
@@ -176,25 +153,36 @@ class LamaLargeInpainter:
                     raise
                 self.device = 'cpu'
                 self.model = load_generator(self.model_path, device='cpu')
-        image_tensor = torch.from_numpy(np.ascontiguousarray(rgb.transpose(2, 0, 1))).unsqueeze(0)
+        image_tensor = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0)
         mask_tensor = torch.from_numpy(binary).unsqueeze(0).unsqueeze(0)
+
+        def predict(device):
+            image_float = image_tensor.to(device=device, dtype=torch.float32) / 255.0
+            mask_float = mask_tensor.to(device=device, dtype=torch.float32)
+            prediction = self.model(image_float, mask_float)
+            # Spandrel's LaMa wrapper composites at network resolution before
+            # quantization/resizing. The generator already masks its own input.
+            return mask_float * prediction + (1 - mask_float) * image_float
+
         with torch.inference_mode():
             try:
-                predicted = self.model(image_tensor.to(self.device), mask_tensor.to(self.device))
+                predicted = predict(self.device)
             except (RuntimeError, NotImplementedError):
                 if self.device != 'mps':
                     raise
                 # Retry the entire model on CPU; never discard FFT imaginary components.
                 self.model = self.model.to('cpu')
                 self.device = 'cpu'
-                predicted = self.model(image_tensor, mask_tensor)
+                predicted = predict('cpu')
         prediction = predicted.detach().float().cpu().numpy()
         if prediction.shape != (1, 3, *binary.shape) or not np.isfinite(prediction).all():
             raise ValueError('LaMa 回傳無效的修補圖像。')
         small_h, small_w = small_shape
-        repaired = prediction[0, :, :small_h, :small_w].transpose(1, 2, 0)
-        repaired = cv2.resize(repaired, (mask.shape[1], mask.shape[0]), interpolation=cv2.INTER_LINEAR)
-        repaired = np.rint(np.clip(repaired, 0, 1) * 255).astype(np.uint8)
+        repaired = prediction[0].transpose(1, 2, 0)
+        repaired = np.clip(np.round(repaired * 255), 0, 255).astype(np.uint8)
+        repaired = repaired[:small_h, :small_w]
+        if (small_w, small_h) != (mask.shape[1], mask.shape[0]):
+            repaired = cv2.resize(repaired, (mask.shape[1], mask.shape[0]), interpolation=cv2.INTER_LINEAR)
         return repaired
 
 
@@ -204,10 +192,11 @@ _model_lock = threading.Lock()
 
 def inpaint_other(image_rgb, other_mask):
     """Return an RGBA repair layer; an empty mask does not initialize the model."""
-    if not np.any(other_mask):
-        return np.zeros((*np.asarray(other_mask).shape, 4), np.uint8)
+    image, active = _validated_inputs(image_rgb, other_mask)
+    if not np.any(active):
+        return np.zeros((*active.shape, 4), np.uint8)
     global _model
     with _model_lock:
         if _model is None:
             _model = LamaLargeInpainter()
-        return _model(image_rgb, other_mask)
+        return _model(image, active)

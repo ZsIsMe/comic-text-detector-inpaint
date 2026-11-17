@@ -21,13 +21,10 @@ import numpy as np
 
 import project_store as store
 import psd_export
-from lama_config import MODEL_NAME
+from lama_config import MODEL_NAME, REPAIR_POLICY
 from scripts.batch_export_common import (
     discover_projects, paths_for, preflight_project, raw_hashes, read_image, save_json, sha256,
 )
-
-REPAIR_POLICY = 'nonempty-other-blocks1536-v2'
-
 
 def verify_outputs(folder, images, created):
     """Validate current PNGs and read PSDs without imposing layers on hand edits."""
@@ -46,7 +43,12 @@ def verify_outputs(folder, images, created):
         solid, other = (read_image(pngs[name]) for name in pngs)
         if not np.array_equal(solid, page['overlay']) or not np.array_equal(other, page['other']):
             raise ValueError(f'Saved page and exported PNGs differ: {source.name}')
-        needs_repair = bool(np.any(other))
+        background, _ = psd_export._source(source)
+        _, effective = psd_export.prepare_repair_inputs(background, solid, other, page['edited'])
+        pngs['repair_mask'] = root / 'repair_mask' / f'{source.stem}.png'
+        if not np.array_equal(read_image(pngs['repair_mask']), effective):
+            raise ValueError(f'Effective repair mask differs from saved page protection: {source.name}')
+        needs_repair = bool(np.any(effective))
         repair_path = root / MODEL_NAME / f'{source.stem}.png'
         if needs_repair:
             pngs[MODEL_NAME] = repair_path
@@ -54,7 +56,7 @@ def verify_outputs(folder, images, created):
             if repair.ndim != 3 or repair.shape[2] != 4:
                 raise ValueError(f'Repair PNG is not BGRA: {source.name}')
             repair_rgba = cv2.cvtColor(repair, cv2.COLOR_BGRA2RGBA)
-            psd_export._validate_repair(repair_rgba, other)
+            psd_export._validate_repair(repair_rgba, effective)
         destination = psd_export._existing(root / 'psds' / f'{source.stem}.psd')
         if destination is None or not destination.is_file():
             raise ValueError(f'PSD output is missing: {source.name}')
@@ -93,13 +95,15 @@ def verify_outputs(folder, images, created):
             'layers': [layer.name for layer in psd],
             'materials': [str(p.relative_to(root)) for p in pngs.values()],
             'repair_required': needs_repair,
+            'original_other_pixels': int(np.count_nonzero(other)),
+            'repair_mask_pixels': int(np.count_nonzero(effective)),
             'repair_policy_matches': needs_repair or not any(layer.name == MODEL_NAME for layer in psd),
             'omitted_repair_png': None if needs_repair else str(repair_path.relative_to(root)),
             'unused_repair_png': (str(unused_repair.relative_to(root))
                                   if unused_repair is not None and unused_repair.is_file() else None),
         }
         print(f'  VERIFY {index}/{len(images)} {source.name}', flush=True)
-    if len(hashes) != len(images) * 3 + sum(d['repair_required'] for d in details.values()):
+    if len(hashes) != len(images) * 4 + sum(d['repair_required'] for d in details.values()):
         raise ValueError('Unexpected number of current PNG/PSD outputs')
     return hashes, details
 
@@ -115,7 +119,7 @@ def verified_resume(folder, previous):
     expected = previous.get('export_hashes', {})
     repair_pages = previous.get('repair_pages')
     if (not isinstance(repair_pages, int) or not 0 <= repair_pages <= previous.get('pages', 0)
-            or not expected or len(expected) != previous.get('pages', 0) * 3 + repair_pages):
+            or not expected or len(expected) != previous.get('pages', 0) * 4 + repair_pages):
         return False
     root = Path(paths_for(folder)['output']) / 'psd_assets'
     try:
@@ -178,7 +182,7 @@ def export_project(folder, images, previous=None):
                                if d['omitted_repair_png'] is not None and d['unused_repair_png'] is None],
         'unused_repair_hashes': {d['unused_repair_png']: sha256(output / d['unused_repair_png'])
                                 for d in details.values() if d['unused_repair_png'] is not None},
-        'png_files': len(images) * 2 + repair_pages,
+        'png_files': len(images) * 3 + repair_pages,
         'created': result['created'], 'skipped': result['skipped'],
         'raw_hashes': before, 'export_hashes': hashes, 'psd_details': details,
         'psd_freshness': freshness, 'materials_current': True, 'psds_current': current,

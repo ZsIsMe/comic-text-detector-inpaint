@@ -11,7 +11,7 @@ from psd_tools import PSDImage
 
 import project_store as store
 import psd_export
-from image_io import imwrite
+from image_io import imread, imwrite
 from scripts import batch_export_psd as batch
 from scripts.batch_export_common import paths_for, preflight_project, raw_hashes, sha256
 
@@ -57,7 +57,7 @@ class BatchExportPsdTests(unittest.TestCase):
             record = batch.export_project(self.folder, preflight_project(self.folder))
         infer.assert_called_once()
         self.assertEqual(record['status'], 'success')
-        self.assertEqual(record['png_files'], 3)
+        self.assertEqual(record['png_files'], 4)
         self.assertEqual(len(record['created']), 1)
         self.assertEqual(raw_hashes(self.folder), before)
         self.assertTrue(batch.verified_resume(self.folder, record))
@@ -74,9 +74,9 @@ class BatchExportPsdTests(unittest.TestCase):
         self.assertEqual(detail['depth'], 16)
         self.assertEqual(detail['layers'], ['bg'])
         self.assertEqual(record['status'], 'success')
-        self.assertEqual(record['png_files'], 2)
+        self.assertEqual(record['png_files'], 3)
         self.assertEqual(record['repair_pages'], 0)
-        self.assertEqual(len(record['export_hashes']), 3)
+        self.assertEqual(len(record['export_hashes']), 4)
         self.assertFalse((Path(record['output']) / 'lama_large_512px').exists())
         self.assertTrue(batch.verified_resume(folder, record))
 
@@ -91,8 +91,8 @@ class BatchExportPsdTests(unittest.TestCase):
             record = batch.export_project(self.folder, preflight_project(self.folder))
         infer.assert_called_once()
         self.assertEqual(record['repair_pages'], 1)
-        self.assertEqual(record['png_files'], 5)
-        self.assertEqual(len(record['export_hashes']), 7)
+        self.assertEqual(record['png_files'], 7)
+        self.assertEqual(len(record['export_hashes']), 9)
         self.assertFalse((Path(record['output']) / 'lama_large_512px' / '02.png').exists())
         self.assertEqual(raw_hashes(self.folder), before)
         self.assertTrue(batch.verified_resume(self.folder, record))
@@ -142,7 +142,7 @@ class BatchExportPsdTests(unittest.TestCase):
             record = self.export(folder, previous=record)
             self.assertEqual(png.read_bytes(), content)
             self.assertEqual(record['status'], 'success')
-            self.assertEqual(record['png_files'], 2)
+            self.assertEqual(record['png_files'], 3)
             self.assertEqual(len(record['unused_repair_hashes']), 1)
             self.assertTrue(batch.verified_resume(folder, record))
 
@@ -216,7 +216,7 @@ class BatchExportPsdTests(unittest.TestCase):
         record = self.export()
         psd = Path(record['created'][0])
         before = psd.read_bytes()
-        record['repair_policy'] = 'nonempty-other-v1'
+        record['repair_policy'] = 'nonempty-other-blocks1536-v2'
         self.assertFalse(batch.verified_resume(self.folder, record))
         with patch.object(psd_export, 'inpaint_other', side_effect=repair) as infer:
             updated = batch.export_project(self.folder, preflight_project(self.folder), record)
@@ -225,6 +225,28 @@ class BatchExportPsdTests(unittest.TestCase):
         self.assertEqual(updated['status'], 'preserved')
         self.assertEqual(set(updated['psd_freshness'].values()), {'stale'})
         self.assertTrue(batch.verified_resume(self.folder, updated))
+
+    def test_expanded_mask_respects_manual_fill_and_erasures_and_is_verified(self):
+        paths = paths_for(self.folder)
+        page = store.load_page(paths, self.image, (8, 10))
+        page['edited'][3, 4] = 255  # A manually restored pixel next to OTHER.
+        store.save_page(paths, self.image, page)
+        before = raw_hashes(self.folder)
+        record = self.export()
+        output = Path(record['output'])
+        actual_mask = imread(output / 'repair_mask' / '01.png', 0)
+        actual_repair = imread(output / 'lama_large_512px' / '01.png', -1)
+        self.assertEqual(actual_mask[3, 4], 0)
+        self.assertFalse(np.any(actual_mask[page['overlay'][:, :, 3] > 0]))
+        self.assertTrue(np.all(actual_mask[page['other'] > 0] == 255))
+        self.assertGreater(np.count_nonzero(actual_mask), np.count_nonzero(page['other']))
+        np.testing.assert_array_equal(actual_repair[:, :, 3], actual_mask)
+        self.assertEqual(raw_hashes(self.folder), before)
+        actual_mask[3, 4] = 255
+        imwrite(output / 'repair_mask' / '01.png', actual_mask)
+        self.assertFalse(batch.verified_resume(self.folder, record))
+        with self.assertRaisesRegex(ValueError, 'Effective repair mask'):
+            batch.verify_outputs(self.folder, [self.image], [])
 
     def test_concurrent_raw_change_is_never_reported_as_success(self):
         def concurrent_edit(image, mask):
