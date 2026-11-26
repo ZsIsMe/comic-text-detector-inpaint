@@ -330,6 +330,18 @@ LaMa 只在明確執行 PSD 導出時處理 OTHER 選區，不重新偵測、不
 
 此腳本維持原本的 `bg`、`overlay-manual` 與 `OTHER_CHANNEL` 流程。`OTHER_CHANNEL` 保存非純色背景文字的選區，可勾選「有 OTHER_CHANNEL 時執行動作」，選擇已錄好的 Photoshop 動作組和動作。它與程式直接產生的 `psd_assets/psds/` 是兩條分開的導出流程，不會替新 PSD 加入 LaMa 圖層。
 
+### 用 LabelPlus 在分層 PSD 上排字
+
+在 Photoshop 選擇「檔案 → 指令碼 → 瀏覽」，開啟倉庫內的 [LabelPlus_Ps_Script_ZS.jsx](LabelPlus_Ps_Script_ZS.jsx)。它支援 LabelPlus 文本與 Meo JSON，會在修補 PSD 的副本上新增可編輯的譯文圖層，並保留原有圖層、分組與蒙版。
+
+1. 選擇翻譯文件，並將「PSD導入路徑」設為直接包含 `.psd` 的資料夾。一般導出使用 `ctd_inpainted/psd_assets/psds/`，多方法導出使用 `ctd_inpainted/psd_assets/ai_exports/<export_name>/psds/`。
+2. 點擊「檢查匹配結果」。腳本按主檔名配對，例如 `page1.png` 配 `page1.psd`。選擇要導入的頁面與分組。
+3. 選擇另一個輸出資料夾，將輸出格式設為 PSD，再執行導入。要沿用 Meo 文件的排版設定，可勾選「Meo 文字樣式（字體、大小、方向、顏色、描邊）」。
+
+上述 PSD 導入模式可直接使用倉庫內的 JSX。若改用原圖模式並選擇「自動」模板，請將 LabelPlus 完整構建中的 `ps_script_res/` 放在 JSX 旁。
+
+本腳本是 LabelPlus PS-Script 的構建產物，保留原 GPL-2.0 授權標頭。[對應原始碼（1293fe0）](https://github.com/ZsIsMe/PS-Script/tree/1293fe0666507e1d563d5d3b2331c9896829ebdc) · [授權全文](https://github.com/ZsIsMe/PS-Script/blob/1293fe0666507e1d563d5d3b2331c9896829ebdc/LICENSE.txt)
+
 ## 模型文件
 
 唯一的文字與氣泡偵測器是 RF-DETR（Koharu Layout HighRes）；PSD 導出另使用 LaMa 修補模型。**模型不隨 Git 分發，也不需要透過 Git LFS 下載當前版本的模型。** 首次執行 `python bootstrap.py` 時，程式會從下列原始發布來源下載缺少的模型，校驗 SHA-256 後才啟用；已有且校驗相符的模型直接複用。
@@ -400,6 +412,7 @@ launch.bat
 detect_solid_inpaint_folder.py
 solid_inpaint_ui.py
 create_psds_from_outputs.jsx
+LabelPlus_Ps_Script_ZS.jsx
 models/.gitkeep
 rfdetr_config.py
 load_model.py
