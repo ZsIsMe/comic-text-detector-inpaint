@@ -16,6 +16,9 @@ description: 導出 Solid Inpaint 的修復 PNG 素材並同步合成分層 PSD�
 
 ## 執行
 
+- 多頁、多方法的匯出按工作流分批執行：先完成整批頁面的 LaMa，再跑完一個 ComfyUI 方法的所有待修頁，才切換下一個方法，最後統一組裝 PSD。續跑時先接回已提交的任務，複用通過校驗的素材。
+- 開始前確認入口的實際執行順序。若既有入口會逐頁交替模型，先按整批用 `export_repair_png` 完成 LaMa，並用 `ComfyRepairClient.run` 按方法分批生成到同一版本，沿用正式頁面選區與人工保護，再以該版本的素材組裝 PSD。
+
 優先用現有 Solid Inpaint MCP。先 `list_app_instances`，按工程識別目標視窗，後續同一視窗工具傳相同 `instance_id`。`open_project`／保存沿用程序，正在編輯、模態視窗或其他任務時等待狀態釋放。保存失敗不繼續讀舊資料導出。
 
 呼叫 `start_psd_export(extra_methods=[...], start_page=..., end_page=..., comfy_url=..., instance_id=...)`。返回 `job_id` 和 `export_name` 後，用 `get_job_status` 跟進至 completed、incomplete 或 failed。它一次完成所選方法素材及 PSD；不把「素材已生成」說成「PSD 已完成」。保留失敗任務的 export_name 以便同一版本續跑。
