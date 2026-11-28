@@ -46,7 +46,7 @@ psd_export.py / lama_inpainter.py / lama_config.py
 
 ## 運行方式
 
-推薦使用 Python 3.10-3.12。
+需要 Python 3.11 以上，推薦使用 Python 3.12。啟動器會保留舊版或損壞的 `.venv` 為 `.venv.backup-<時間戳>`，再建立新環境。
 
 macOS：
 

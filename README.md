@@ -32,7 +32,9 @@ AI 可用隨倉庫提供的 [PSD 導出 Skill](.agents/skills/comic-psd-export/S
 
 ## 快速開始
 
-建議使用 Python 3.10-3.12。Python 3.13+ 可能可用，但不建議普通用戶首次安裝時使用。
+需要 Python 3.11 以上，建議使用 Python 3.12。Python 3.13+ 可能可用，但不建議普通用戶首次安裝時使用。
+
+macOS 啟動腳本會優先使用相容的既有 `.venv`，建立新環境時優先選擇 Python 3.12，再選擇 3.11。舊版或損壞的 `.venv` 會保留為 `.venv.backup-<時間戳>`，再建立新環境及安裝依賴。
 
 macOS：
 
@@ -367,7 +369,7 @@ HighRes 使用 `RFDETRSeg2XLarge`、1920 × 1920 輸入及最多 160 個偵測�
 
 PSD 匯出修補使用 [dreMaz/AnimeMangaInpainting 的 lama_large_512px.ckpt](https://huggingface.co/dreMaz/AnimeMangaInpainting/resolve/main/lama_large_512px.ckpt)，SHA-256 為 `11d30fbb3000fb2eceae318b75d9ced9229d99ae990a7f8b3ac35c8d31f2c935`。下載設定集中於 `lama_config.py`，推論由 `lama_inpainter.py` 按需執行；模型架構的 GPL 衍生來源與授權說明保留在 `vendor/lama_large.py` 及相關授權檔。LaMa 的修補效果需要人工確認，不代表 OTHER 分類或頁面校對已完成。
 
-偵測器依賴包含 `rfdetr==1.7.0`、`transformers==5.15.0`、`supervision==0.28.0`；分層 PSD 導出使用 `psd-tools==1.26.1`。Python 3.10 的 Apple Silicon macOS 固定使用 `scipy==1.14.1`，避開在該環境無法載入的 1.15.3 wheel；其他環境由 pip 選擇相容版本。Python 3.13 以上使用 NumPy 2，較舊 Python 沿用 NumPy 1 的限制。舊模型專用套件不再列為直接依賴；PyTorch 等套件仍會安裝自身所需的間接依賴。
+偵測器依賴包含 `rfdetr==1.7.0`、`transformers==5.15.0`、`supervision==0.28.0`；分層 PSD 導出使用 `psd-tools==1.26.1`，需要 Python 3.11 以上。SciPy 由 pip 選擇相容版本。Python 3.13 以上使用 NumPy 2，較舊 Python 沿用 NumPy 1 的限制。舊模型專用套件不再列為直接依賴；PyTorch 等套件仍會安裝自身所需的間接依賴。
 
 如果缺少 HighRes 權重，命令行和圖形界面都會提示找不到模型文件；PSD 導出遇到非空 OTHER 時也需要已校驗的 LaMa 權重。
 
@@ -442,7 +444,7 @@ models/lama_large_512px.ckpt
 ## 開發注意
 
 - 氣泡填充與 LaMa 架構的衍生設計保留來源標註，相關授權正文見 `vendor/LICENSE-BallonsTranslator`；其他上游來源註記見對應模組。
-- 建議用 Python 3.10-3.12 測試發佈流程。
+- 建議用 Python 3.11-3.12 測試發佈流程。
 - `requirements.txt` 依 Python 版本限制 NumPy：Python 3.13 之前使用 NumPy 1，Python 3.13 以上使用 NumPy 2。
 - `inpainted` 是完整畫布尺寸的透明 PNG，不需要 Photoshop 圖層用的四角 anchor pixel。
 - `other_mask` 表示不能自動純色填補、需要後續處理的 repair area。

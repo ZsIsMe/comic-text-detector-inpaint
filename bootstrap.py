@@ -5,9 +5,9 @@ from __future__ import annotations
 
 import hashlib
 import os
-import shutil
 import subprocess
 import sys
+import time
 import urllib.request
 import venv
 from pathlib import Path
@@ -35,8 +35,8 @@ def fail(message: str, code: int = 1) -> None:
 
 
 def ensure_python_version() -> None:
-    if sys.version_info < (3, 10):
-        fail('Python 3.10 or newer is required.')
+    if sys.version_info < (3, 11):
+        fail('Python 3.11 or newer is required. Python 3.12 is recommended.')
 
 
 def venv_python() -> Path:
@@ -56,7 +56,7 @@ def run(cmd: list[str], *, cwd: Path | None = None) -> None:
 def is_venv_healthy(python: Path) -> bool:
     try:
         subprocess.check_call(
-            [str(python), '--version'],
+            [str(python), '-c', 'import sys; sys.exit(sys.version_info < (3, 11))'],
             cwd=str(ROOT),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -68,14 +68,15 @@ def is_venv_healthy(python: Path) -> bool:
 
 def ensure_venv() -> Path:
     python = venv_python()
-    if python.exists():
+    if VENV_DIR.exists() or VENV_DIR.is_symlink():
         if is_venv_healthy(python):
             return python
-        info('Virtual environment is broken. Recreating it...')
+        backup = VENV_DIR.with_name(f'.venv.backup-{time.time_ns()}')
         try:
-            shutil.rmtree(VENV_DIR)
+            VENV_DIR.rename(backup)
         except Exception as exc:
-            fail(f'Could not remove broken virtual environment: {exc}')
+            fail(f'Could not back up incompatible virtual environment: {exc}')
+        info(f'Previous virtual environment was incompatible or broken. Preserved at {backup}')
 
     info('Creating virtual environment...')
     try:

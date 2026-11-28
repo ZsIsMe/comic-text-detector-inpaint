@@ -26,7 +26,7 @@ close_current_terminal_window() {
 }
 
 python_is_usable() {
-  [ -n "$1" ] && [ -x "$1" ] && "$1" -c 'import sys; sys.exit(sys.version_info < (3, 10))' >/dev/null 2>&1
+  [ -n "$1" ] && [ -x "$1" ] && "$1" -c 'import sys; sys.exit(sys.version_info < (3, 11))' >/dev/null 2>&1
 }
 
 select_python() {
@@ -39,7 +39,7 @@ select_python() {
   fi
 
   # Finder may not include Homebrew in PATH. Prefer the tested Python versions.
-  for version in 3.10 3.11 3.12; do
+  for version in 3.12 3.11; do
     for candidate in "$(command -v "python$version" 2>/dev/null || true)" \
                      "/opt/homebrew/bin/python$version" "/usr/local/bin/python$version"; do
       if python_is_usable "$candidate"; then
@@ -62,7 +62,7 @@ select_python() {
 }
 
 if ! PYTHON="$(select_python)"; then
-  echo "Python 3.10 or newer is required."
+  echo "Python 3.11 or newer is required. Python 3.12 is recommended."
   echo "Install Python from https://www.python.org/downloads/"
   wait_for_error
   exit 1

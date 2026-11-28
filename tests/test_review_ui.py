@@ -65,6 +65,21 @@ class ReviewUiTests(unittest.TestCase):
         self.assertTrue(w.review_next_btn.isVisible())
         self.assertEqual(w.current_img_path, self.path)
 
+    def test_manual_list_color_tracks_saved_other_mask(self):
+        w = self.window
+        w.review_tools_action.setChecked(False)
+        w.set_edit_mode('manual_other')
+        mask = w.current_manual_other.copy()
+        mask[10:15, 10:15] = 255
+        w.on_mask_edited(mask)
+        self.assertTrue(w.flush_pending_edits())
+        item = w.list_widget.currentItem()
+        self.assertEqual(item.foreground().color().name(), '#d59a45')
+        self.assertEqual(item.text().split(), ['1', '01.png'])
+        w.on_erase_all_masks_requested(mask > 0)
+        self.assertTrue(w.flush_pending_edits())
+        self.assertEqual(item.foreground().color().name(), '#dfe5ea')
+
     def test_review_invalidates_on_edit_and_complete_moves_next(self):
         w = self.window
         second = str(self.root / '02.png')

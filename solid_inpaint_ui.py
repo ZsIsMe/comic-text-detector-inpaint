@@ -5976,7 +5976,7 @@ class MainWindow(QMainWindow):
         item.setToolTip(name)
         if 'error' in info:
             color = '#e06767'
-        elif self.review_tools_action.isChecked() and int(info.get('other_pixels', 0)) > 0:
+        elif int(info.get('other_pixels', 0)) > 0:
             color = '#d59a45'
         elif self.review_tools_action.isChecked() and store.is_page_reviewed(info):
             color = '#57b66f'
