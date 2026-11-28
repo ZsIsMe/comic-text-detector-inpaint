@@ -801,7 +801,7 @@ class ControlServer(QObject):
             raise ControlError('save_failed', w._last_control_error or '頁面尚未成功偵測或校對標記保存失敗。')
         old_path = w.current_img_path
         if advance:
-            w.next_image()
+            w.next_edit_page()
             if w.current_img_path == old_path and w.list_widget.currentRow() < len(w.imglist) - 1:
                 raise ControlError('navigation_failed', '校對標記已保存，但切頁失敗。')
         if w.current_base is None or w.current_page is None:

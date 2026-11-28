@@ -16,8 +16,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QLocale, QObject, QPoint, QPointF, QRect, QRectF, QSettings, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QPolygonF, QShortcut
+from PySide6.QtCore import QItemSelectionModel, QLocale, QObject, QPoint, QPointF, QRect, QRectF, QSettings, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QPolygonF, QShortcut, QTransform
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -90,6 +90,8 @@ from detect_solid_inpaint_folder import (
     export_psd_assets,
 )
 from image_io import imread, imwrite
+from page_strip import PageStrip
+from strip_previews import StripPreviews
 import project_store as store
 from bubble_solid import save_settings as save_solid_settings
 
@@ -490,12 +492,93 @@ class ImageView(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._zoom = 1.0
         self._suppress_view_changed = False
+        self.page_strip: PageStrip | None = None
+        self.strip_row = -1
+        self.activate_strip_row = None
+        self._strip_items: dict[int, QGraphicsPixmapItem] = {}
+        self._strip_image_keys: dict[int, int] = {}
         self.horizontalScrollBar().valueChanged.connect(self._emit_view_changed)
         self.verticalScrollBar().valueChanged.connect(self._emit_view_changed)
 
     def _emit_view_changed(self) -> None:
         if not self._suppress_view_changed:
             self.viewChanged.emit()
+
+    def set_page_strip(self, strip: PageStrip | None) -> None:
+        self.set_strip_neighbors({})
+        self.page_strip = strip
+        self.strip_row = -1
+        self.scene().setSceneRect(0, 0, 1, 1)
+
+    def set_strip_row(self, row: int, keep_view: bool = False) -> None:
+        strip = self.page_strip
+        if strip is None or row == self.strip_row:
+            return
+        old_row = self.strip_row
+        self.strip_row = row
+        old_transform = self.transform()
+        old_x = self.horizontalScrollBar().value()
+        old_y = self.verticalScrollBar().value()
+        origin = strip.rect(row).topLeft()
+        # Keep the active page at scene (0, 0) so all existing tools operate
+        # on page pixels. Rebase the transform as well, including subpixels at
+        # fractional zoom, so a click can edit the same pixel after activation.
+        suppress = self._suppress_view_changed
+        self._suppress_view_changed = True
+        try:
+            if row in self._strip_items:
+                self.scene().removeItem(self._strip_items.pop(row))
+                self._strip_image_keys.pop(row)
+            for index, item in self._strip_items.items():
+                item.setPos(strip.rect(index).topLeft() - origin)
+            self.scene().setSceneRect(strip.scene_bounds(row))
+            if keep_view and old_row >= 0:
+                offset = origin - strip.rect(old_row).topLeft()
+                self.setTransform(old_transform.translate(offset.x(), offset.y()))
+                self.horizontalScrollBar().setValue(old_x)
+                self.verticalScrollBar().setValue(old_y)
+        finally:
+            self._suppress_view_changed = suppress
+
+    def set_strip_neighbors(self, images: dict) -> None:
+        for row in tuple(self._strip_items):
+            if row not in images or row == self.strip_row:
+                self.scene().removeItem(self._strip_items.pop(row))
+                self._strip_image_keys.pop(row)
+        if self.page_strip is None or self.strip_row < 0:
+            return
+        origin = self.page_strip.rect(self.strip_row).topLeft()
+        for row, image in images.items():
+            if row == self.strip_row or image.isNull():
+                continue
+            key = image.cacheKey()
+            if self._strip_image_keys.get(row) == key:
+                continue
+            pixmap = QPixmap.fromImage(image) if isinstance(image, QImage) else image
+            rect = self.page_strip.rect(row)
+            item = self._strip_items.get(row)
+            if item is None:
+                item = QGraphicsPixmapItem()
+                item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                item.setShapeMode(QGraphicsPixmapItem.ShapeMode.BoundingRectShape)
+                item.setZValue(-1)
+                self.scene().addItem(item)
+                self._strip_items[row] = item
+            item.setPixmap(pixmap)
+            item.setPos(rect.topLeft() - origin)
+            item.setTransform(QTransform.fromScale(rect.width() / item.boundingRect().width(),
+                                                   rect.height() / item.boundingRect().height()))
+            self._strip_image_keys[row] = key
+
+    def _activate_page_at(self, pos: QPoint) -> bool:
+        if self.page_strip is None or self.strip_row < 0:
+            return True
+        row = self.page_strip.row_at(self.strip_row, self.mapToScene(pos))
+        if row is None:
+            return False
+        if self.activate_strip_row is None:
+            return row == self.strip_row
+        return self.activate_strip_row(row)
 
     def keyPressEvent(self, event) -> None:
         if (event.key() in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown)
@@ -508,7 +591,8 @@ class ImageView(QGraphicsView):
     def set_qimage(self, image: QImage | None, keep_view: bool = False) -> None:
         if image is None:
             self.pixmap_item.setPixmap(QPixmap())
-            self.scene().setSceneRect(0, 0, 1, 1)
+            if self.strip_row < 0:
+                self.scene().setSceneRect(0, 0, 1, 1)
             self._emit_view_changed()
             return
         old_transform = self.transform()
@@ -517,7 +601,8 @@ class ImageView(QGraphicsView):
         old_vertical_scroll = self.verticalScrollBar().value()
         pixmap = QPixmap.fromImage(image)
         self.pixmap_item.setPixmap(pixmap)
-        self.scene().setSceneRect(pixmap.rect())
+        if self.strip_row < 0:
+            self.scene().setSceneRect(pixmap.rect())
         if keep_view:
             self.setTransform(old_transform)
             self._zoom = old_zoom
@@ -603,6 +688,9 @@ class ImageView(QGraphicsView):
         self._emit_view_changed()
 
     def wheelEvent(self, event) -> None:
+        self._navigate_wheel(event, event.position().toPoint())
+
+    def _navigate_wheel(self, event, anchor_pos: QPoint) -> None:
         if self.pixmap_item.pixmap().isNull():
             return
         pixel_delta = event.pixelDelta()
@@ -615,7 +703,7 @@ class ImageView(QGraphicsView):
             zoom_delta = pixel_delta.y() or angle_delta.y() or pixel_delta.x() or angle_delta.x()
             if zoom_delta != 0:
                 factor = VIEW_ZOOM_STEP if zoom_delta > 0 else 1 / VIEW_ZOOM_STEP
-                self.zoom_by(factor, anchor_pos=event.position().toPoint())
+                self.zoom_by(factor, anchor_pos=anchor_pos)
             event.accept()
             return
         if modifiers & Qt.KeyboardModifier.ControlModifier:
@@ -638,12 +726,15 @@ class ImageView(QGraphicsView):
 class PassivePreviewView(ImageView):
     def __init__(self) -> None:
         super().__init__()
+        self.scroll_target: ImageView | None = None
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.setInteractive(False)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
 
     def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._activate_page_at(event.position().toPoint())
         event.accept()
 
     def mouseMoveEvent(self, event) -> None:
@@ -653,9 +744,14 @@ class PassivePreviewView(ImageView):
         event.accept()
 
     def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._activate_page_at(event.position().toPoint())
         event.accept()
 
     def wheelEvent(self, event) -> None:
+        if self.page_strip is not None and self.scroll_target is not None and self.scroll_target.isEnabled():
+            anchor = self.mapToScene(event.position().toPoint())
+            self.scroll_target._navigate_wheel(event, self.scroll_target.mapFromScene(anchor))
         event.accept()
 
     def keyPressEvent(self, event) -> None:
@@ -841,6 +937,7 @@ class MaskEditorView(ImageView):
         self._active_button: Qt.MouseButton | None = None
         self._drag_start: tuple[int, int] | None = None
         self._last_brush_point: tuple[int, int] | None = None
+        self._strip_brush_end: tuple[int, int] | None = None
         self._brush_line_start: tuple[int, int] | None = None
         self._brush_line_preview: QGraphicsLineItem | None = None
         self._erase_all_drag = False
@@ -905,6 +1002,27 @@ class MaskEditorView(ImageView):
         self.setMouseTracking(True)
         self.viewport().setMouseTracking(True)
 
+    def set_page_strip(self, strip: PageStrip | None) -> None:
+        super().set_page_strip(strip)
+        # Clip the cursor, cosmetic pens and temporary selections too. Their
+        # painted extents can exceed the image even when their coordinates do not.
+        self.pixmap_item.setShapeMode(QGraphicsPixmapItem.ShapeMode.BoundingRectShape)
+        self.pixmap_item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemClipsChildrenToShape,
+                                 strip is not None)
+        if strip is None:
+            for item in self.pixmap_item.childItems():
+                item.setParentItem(None)
+        else:
+            for item in self.scene().items():
+                if item is not self.pixmap_item and item.parentItem() is None:
+                    item.setParentItem(self.pixmap_item)
+
+    def _add_page_overlay(self, item: QGraphicsItem) -> None:
+        if self.page_strip is None:
+            self.scene().addItem(item)
+        else:
+            item.setParentItem(self.pixmap_item)
+
     def set_mask(
         self,
         mask: np.ndarray | None,
@@ -919,6 +1037,7 @@ class MaskEditorView(ImageView):
         if reset_brush_line:
             self._brush_line_start = None
             self._clear_brush_line_preview()
+            self._update_brush_cursor(None)
         if mask is None:
             self.mask = np.zeros(shape, dtype=np.uint8)
         else:
@@ -1022,6 +1141,10 @@ class MaskEditorView(ImageView):
         x = int(round(item_pos.x()))
         y = int(round(item_pos.y()))
         height, width = self.image_shape
+        if self.strip_row >= 0 and not clamp:
+            if not (0 <= item_pos.x() < width and 0 <= item_pos.y() < height):
+                return None
+            return min(width - 1, x), min(height - 1, y)
         if clamp:
             return max(0, min(width - 1, x)), max(0, min(height - 1, y))
         if x < 0 or y < 0 or x >= width or y >= height:
@@ -1053,6 +1176,9 @@ class MaskEditorView(ImageView):
         return clipped
 
     def mousePressEvent(self, event) -> None:
+        if self.page_strip is not None and self._active_button is not None:
+            event.accept()
+            return
         swap_press = (event.button() == Qt.MouseButton.RightButton
                       and self._is_class_swap_modifier(event.modifiers()))
         if self.tool == 'roi_bounds' and not swap_press:
@@ -1067,6 +1193,9 @@ class MaskEditorView(ImageView):
             return
         if event.button() not in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
             super().mousePressEvent(event)
+            return
+        if not self._activate_page_at(event.position().toPoint()):
+            event.accept()
             return
         point = self.image_point_from_view(event.position().toPoint())
         if point is None or self.mask is None:
@@ -1097,8 +1226,10 @@ class MaskEditorView(ImageView):
             event.accept()
             return
         if self.tool == 'brush':
+            self._update_brush_cursor(point)
             self._active_button = event.button()
             self._last_brush_point = point
+            self._strip_brush_end = None
             self._edit_started = False
             self._set_brush_stroke_active(True)
             if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
@@ -1146,7 +1277,7 @@ class MaskEditorView(ImageView):
             self._advance_magic_stroke(stroke_point)
             event.accept()
             return
-        point = self.image_point_from_view(event.position().toPoint(), clamp=True)
+        point = self._drag_point(event.position().toPoint())
         if point is None or self.mask is None:
             event.accept()
             return
@@ -1161,14 +1292,22 @@ class MaskEditorView(ImageView):
             else:
                 self._begin_edit_once()
                 start = self._last_brush_point or point
-                self._paint_line(start, point, self._active_button)
-                self._last_brush_point = point
-                self.brushPreviewChanged.emit(self._brush_dirty_rect(start, point))
+                if start != point:
+                    self._paint_line(start, point, self._active_button)
+                    self._last_brush_point = point
+                    self.brushPreviewChanged.emit(self._brush_dirty_rect(start, point))
         else:
             self._update_rubber_band(self._drag_start or point, point, self._active_button)
         event.accept()
 
     def mouseDoubleClickEvent(self, event) -> None:
+        if self.page_strip is not None and self.strip_row >= 0:
+            point = self.mapToScene(event.position().toPoint())
+            if self.page_strip.row_at(self.strip_row, point) != self.strip_row:
+                # Qt can count two clicks on opposite sides of a narrow seam
+                # as a double click. The second press still belongs to its page.
+                self.mousePressEvent(event)
+                return
         if event.button() == Qt.MouseButton.LeftButton and self.tool == 'lasso':
             point = self.image_point_from_view(event.position().toPoint())
             if point is not None and not self._point_in_edit_clip(point):
@@ -1204,7 +1343,7 @@ class MaskEditorView(ImageView):
             self._finish_magic_stroke()
             event.accept()
             return
-        point = self.image_point_from_view(event.position().toPoint(), clamp=True)
+        point = self._drag_point(event.position().toPoint())
         if point is not None:
             point = self._constrain_point_to_edit_clip(point)
         if self._swap_classes_drag and self.mask is not None and self._drag_start is not None and point is not None:
@@ -1219,6 +1358,8 @@ class MaskEditorView(ImageView):
             if self._brush_line_start is not None and point is not None:
                 self._begin_edit_once()
                 self._paint_line(self._brush_line_start, point, self._active_button)
+            elif self.strip_row >= 0 and point is not None and self._last_brush_point != point:
+                self._paint_line(self._last_brush_point or point, point, self._active_button)
             self._set_brush_stroke_active(False)
             self.maskEdited.emit(self.mask.copy())
         if not (self._erase_all_drag or self._swap_classes_drag) and self.tool == 'rect' and self.mask is not None and self._drag_start is not None and point is not None:
@@ -1237,6 +1378,26 @@ class MaskEditorView(ImageView):
         self._clear_rubber_band()
         self._clear_magic_preview()
         event.accept()
+
+    def _drag_point(self, pos: QPoint) -> tuple[int, int] | None:
+        if (self.strip_row < 0 or self.tool != 'brush'
+                or self._active_button != Qt.MouseButton.LeftButton):
+            return self.image_point_from_view(pos, clamp=True)
+        if self._strip_brush_end is not None:
+            return self._strip_brush_end
+        point = self.image_point_from_view(pos)
+        if point is not None or self.image_shape is None:
+            return point
+        # End a departing stroke exactly where its last segment meets the
+        # page border. Moving along the next page must not smear the old edge.
+        outside = self.mapToScene(pos).toPoint()
+        height, width = self.image_shape
+        start = self._brush_line_start or self._last_brush_point
+        if start is None:
+            return None
+        clipped, _, end = cv2.clipLine((0, 0, width, height), start, outside.toTuple())
+        self._strip_brush_end = end if clipped else start
+        return self._strip_brush_end
 
     def _set_brush_stroke_active(self, active: bool) -> None:
         active = bool(active)
@@ -1468,7 +1629,7 @@ class MaskEditorView(ImageView):
             self._lasso_preview = QGraphicsPolygonItem()
             self._lasso_preview.setZValue(11)
             self._lasso_preview.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-            self.scene().addItem(self._lasso_preview)
+            self._add_page_overlay(self._lasso_preview)
         operation = self.selection_combine_mode
         if operation in ('subtract', 'restore_original'):
             pen = self._rect_pen_remove
@@ -1763,7 +1924,7 @@ class MaskEditorView(ImageView):
         item.setOffset(x1 + left, y1 + top)
         item.setZValue(12)
         item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-        self.scene().addItem(item)
+        self._add_page_overlay(item)
         self._magic_confirmed_items.append(item)
 
     def _finish_magic_stroke(self) -> None:
@@ -1825,7 +1986,7 @@ class MaskEditorView(ImageView):
             self._magic_candidate_item = QGraphicsPixmapItem()
             self._magic_candidate_item.setZValue(13)
             self._magic_candidate_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-            self.scene().addItem(self._magic_candidate_item)
+            self._add_page_overlay(self._magic_candidate_item)
         self._magic_candidate_item.setOffset(rect[0] + x1, rect[1] + y1)
         self._magic_candidate_item.setPixmap(QPixmap.fromImage(_qimage_from_rgba(overlay)))
         self._magic_candidate_item.setVisible(True)
@@ -1973,7 +2134,7 @@ class MaskEditorView(ImageView):
             self._magic_preview_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
             self._magic_preview_item.setAcceptHoverEvents(False)
             self._magic_preview_item.setTransformationMode(Qt.TransformationMode.FastTransformation)
-            self.scene().addItem(self._magic_preview_item)
+            self._add_page_overlay(self._magic_preview_item)
         self._magic_preview_item.setOffset(rect[0] + x1, rect[1] + y1)
         self._magic_preview_item.setPixmap(QPixmap.fromImage(_qimage_from_rgba(overlay)))
         self._magic_preview_has_content = True
@@ -2038,7 +2199,7 @@ class MaskEditorView(ImageView):
             self._magic_scope_item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
             self._magic_scope_item.setZValue(11)
             self._magic_scope_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-            self.scene().addItem(self._magic_scope_item)
+            self._add_page_overlay(self._magic_scope_item)
         x1, y1, x2, y2 = rect
         self._magic_scope_item.setRect(x1, y1, x2 - x1, y2 - y1)
         self._magic_scope_item.setVisible(True)
@@ -2235,7 +2396,7 @@ class MaskEditorView(ImageView):
         y1, y2 = sorted((start[1], end[1]))
         if self._rubber_band is None:
             self._rubber_band = RubberBandRectItem()
-            self.scene().addItem(self._rubber_band)
+            self._add_page_overlay(self._rubber_band)
         if self._swap_classes_drag:
             self._rubber_band.set_erase_all_style(False)
             self._rubber_band.setBrush(QBrush(QColor(199, 140, 255, 35)))
@@ -2273,7 +2434,7 @@ class MaskEditorView(ImageView):
         if self._brush_line_preview is None:
             self._brush_line_preview = QGraphicsLineItem()
             self._brush_line_preview.setZValue(11)
-            self.scene().addItem(self._brush_line_preview)
+            self._add_page_overlay(self._brush_line_preview)
         pen = self._brush_line_pen_remove if self._brush_color_for_button(button) == 0 else self._brush_line_pen_add
         self._brush_line_preview.setPen(pen)
         self._brush_line_preview.setLine(start[0], start[1], end[0], end[1])
@@ -2293,7 +2454,7 @@ class MaskEditorView(ImageView):
             self._brush_cursor.setBrush(QColor(233, 255, 251, 28))
             self._brush_cursor.setPen(QPen(Qt.PenStyle.NoPen))
             self._brush_cursor.setZValue(10)
-            self.scene().addItem(self._brush_cursor)
+            self._add_page_overlay(self._brush_cursor)
         radius = self.brush_radius
         self._brush_cursor.setRect(point[0] - radius, point[1] - radius, radius * 2, radius * 2)
         self._brush_cursor.setVisible(True)
@@ -3920,6 +4081,30 @@ class EditResultBridge(QObject):
     completed = Signal(object)
 
 
+def _show_other_on_preview(preview, other, settings):
+    show_other, radius, color, alpha = settings
+    if show_other:
+        ring = _expanded_mask_ring(other, radius)
+        preview = _overlay_mask_on_bgr(preview, ring, alpha * OTHER_MASK_PREVIEW_RING_ALPHA_RATIO, color)
+        preview = _overlay_mask_on_bgr(preview, other, alpha, color)
+    return preview
+
+
+def _load_strip_previews(path, settings):
+    raw, alpha, solid_color, show_sample, result_settings = settings
+    paths = {'raw': raw}
+    base = imread(path, cv2.IMREAD_UNCHANGED)
+    if base is None:
+        raise ValueError(f'無法讀取原圖：{path}')
+    shape = base.shape[:2]
+    page = read_page_state(paths, path, shape)
+    overlay, other = page['overlay'], page['other']
+    sample = _load_background_sample_cache(paths, path, shape) if show_sample else None
+    editor = _editor_mask_preview(base, overlay[:, :, 3], other, alpha, sample, solid_color)
+    result = _show_other_on_preview(_compose_overlay_preview(base, overlay), other, result_settings)
+    return _qimage_from_bgr(editor), _qimage_from_bgr(result)
+
+
 def _persist_edit_and_preview(paths, image_path, revision, job_id, page, base, settings, cancel_preview):
     result = {'path': image_path, 'raw': paths['raw'], 'revision': revision,
               'job_id': job_id, 'settings': settings, 'saved': False, 'preview': None, 'error': None}
@@ -3928,11 +4113,7 @@ def _persist_edit_and_preview(paths, image_path, revision, job_id, page, base, s
         result['saved'] = True
         if not cancel_preview.is_set():
             preview = _compose_overlay_preview(base, page['overlay'])
-            show_other, radius, color, alpha = settings
-            if show_other:
-                ring = _expanded_mask_ring(page['other'], radius)
-                preview = _overlay_mask_on_bgr(preview, ring, alpha * OTHER_MASK_PREVIEW_RING_ALPHA_RATIO, color)
-                preview = _overlay_mask_on_bgr(preview, page['other'], alpha, color)
+            preview = _show_other_on_preview(preview, page['other'], settings)
             result['preview'] = _qimage_from_bgr(preview)
     except Exception as exc:
         result['error'] = str(exc)
@@ -4010,6 +4191,13 @@ class MainWindow(QMainWindow):
         self.brush_live_alpha = self.alpha
         self.suppress_list_selection = False
         self._syncing_preview_view = False
+        self._canvas_selection_row = None
+        self._list_view_y = None
+        self._strip_rows = {}
+        self.strip_previews = StripPreviews(self, _load_strip_previews, self._display_strip_previews)
+        self.strip_refresh_timer = QTimer(self)
+        self.strip_refresh_timer.setSingleShot(True)
+        self.strip_refresh_timer.timeout.connect(self._request_strip_previews)
         self.render_timer = QTimer(self)
         self.render_timer.setSingleShot(True)
         self.render_timer.timeout.connect(self.start_pending_render)
@@ -4158,6 +4346,12 @@ class MainWindow(QMainWindow):
         self.progress_row.hide()
 
         project_row = QHBoxLayout()
+        self.page_list_toggle = QToolButton()
+        self.page_list_toggle.setText('收起列表')
+        self.page_list_toggle.setCheckable(True)
+        self.page_list_toggle.setChecked(True)
+        self.page_list_toggle.toggled.connect(self._set_page_list_visible)
+        project_row.addWidget(self.page_list_toggle)
         self.folder_path_input = QLineEdit()
         self.folder_path_input.setPlaceholderText('貼上圖片資料夾完整路徑')
         self.folder_path_input.setAccessibleName('圖片資料夾路徑')
@@ -4177,9 +4371,12 @@ class MainWindow(QMainWindow):
         root_layout.addLayout(project_row)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.page_splitter = splitter
+        self._page_list_width = 250
         root_layout.addWidget(splitter, 1)
 
         left_panel = QFrame()
+        self.page_list_panel = left_panel
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(10, 10, 10, 10)
         left_layout.addWidget(QLabel('圖片列表'))
@@ -4202,6 +4399,7 @@ class MainWindow(QMainWindow):
         self.list_widget.setAccessibleName('圖片頁面列表')
         self.list_widget.setAccessibleDescription('依順序列出檔名、偵測與人工校對狀態')
         self.list_widget.currentRowChanged.connect(self.on_image_selected)
+        self.list_widget.itemClicked.connect(self._reveal_list_page)
         left_layout.addWidget(self.list_widget, 1)
         review_row = QHBoxLayout()
         self.review_btn = QPushButton('標記已校對')
@@ -4587,7 +4785,8 @@ class MainWindow(QMainWindow):
 
         self.mask_view = MaskEditorView()
         self.mask_view.setAccessibleName('原圖與選區編輯畫布')
-        self.mask_view.setAccessibleDescription('左側畫布；依目前類型、工具及選區模式編輯')
+        self.mask_view.setAccessibleDescription('上下捲動瀏覽頁面；點選頁面即可編輯，筆畫只作用於落筆頁。')
+        self.mask_view.activate_strip_row = self._activate_canvas_page
         self.mask_view.set_magic_scope_px(self.magic_scope_px)
         self.mask_view.set_magic_dwell_ms(self.magic_dwell_ms)
         self.mask_view.editStarted.connect(self.push_undo_snapshot)
@@ -4601,6 +4800,8 @@ class MainWindow(QMainWindow):
         self.mask_view.swapClassesRequested.connect(self.on_swap_classes_requested)
         self.mask_view.viewChanged.connect(self.sync_preview_view)
         self.mask_view.viewChanged.connect(self.update_navigator_viewport)
+        self.mask_view.viewChanged.connect(self._schedule_strip_previews)
+        self.mask_view.viewChanged.connect(self._follow_canvas_in_list)
         self.mask_view.viewChanged.connect(self.local_intersect_stroke_width_help.preview.refresh_if_visible)
         self.mask_view.viewChanged.connect(self.local_intersect_min_area_help.preview.refresh_if_visible)
         self.mask_view.viewportResized.connect(self.sync_preview_view)
@@ -4608,6 +4809,8 @@ class MainWindow(QMainWindow):
         views_grid.addWidget(self.mask_view, 1, 0)
 
         self.preview_view = PassivePreviewView()
+        self.preview_view.scroll_target = self.mask_view
+        self.preview_view.activate_strip_row = self._activate_canvas_page
         self.preview_view.setAccessibleName('右側去字效果預覽')
         views_grid.addWidget(self.preview_view, 1, 1)
 
@@ -4648,7 +4851,9 @@ class MainWindow(QMainWindow):
         ):
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
-        splitter.setSizes([250, 1300])
+        splitter.setCollapsible(1, False)
+        splitter.setSizes([self._page_list_width, 1300])
+        splitter.splitterMoved.connect(self._page_splitter_moved)
         self.setCentralWidget(root)
 
         self.status = QStatusBar()
@@ -4657,6 +4862,38 @@ class MainWindow(QMainWindow):
         self.set_selection_combine_mode('add')
         self.set_edit_tool('rect')
         self.auto_fit_on_resize = True
+
+    def _page_splitter_moved(self, position: int, index: int) -> None:
+        width = self.page_splitter.sizes()[0]
+        if width:
+            self._page_list_width = width
+        else:
+            self.page_list_toggle.setChecked(False)
+
+    def _set_page_list_visible(self, visible: bool) -> None:
+        view = self.mask_view
+        center = view.mapToScene(view.viewport().rect().center())
+        self.resize_fit_timer.stop()
+        if visible:
+            self.page_list_panel.show()
+            available = self.page_splitter.contentsRect().width() - self.page_splitter.handleWidth()
+            self.page_splitter.setSizes([self._page_list_width, max(1, available - self._page_list_width)])
+        else:
+            width = self.page_splitter.sizes()[0]
+            if width:
+                self._page_list_width = width
+            self.page_list_panel.hide()
+        self.page_list_toggle.setText('收起列表' if visible else '展開列表')
+        self.page_splitter.refresh()
+        self.restore_navigator_position()
+        if not view.pixmap_item.pixmap().isNull():
+            delta = view.mapFromScene(center) - view.viewport().rect().center()
+            view.pan_by(delta.x(), delta.y())
+            self.sync_preview_view()
+        if visible:
+            selected = self.list_widget.selectedItems()
+            if selected:
+                self.list_widget.scrollToItem(selected[0])
 
     def _apply_style(self) -> None:
         self.setStyleSheet(
@@ -4742,7 +4979,7 @@ class MainWindow(QMainWindow):
         if row < 0:
             self.status.showMessage(f'找不到頁碼或完整檔名：{request}')
             return
-        self.list_widget.setCurrentRow(row)
+        self._jump_to_list_row(row)
         if self.current_img_path == self.imglist[row]:
             self.page_jump_input.clear()
             self.mask_view.setFocus()
@@ -4781,12 +5018,22 @@ class MainWindow(QMainWindow):
         self.current_manual_other = None
         self.current_background_sample = None
         self._pending_edit_future = None
+        self.strip_refresh_timer.stop()
+        self._list_view_y = None
+        self.strip_previews.request([], None)
+        self.mask_view.set_page_strip(None)
+        self.preview_view.set_page_strip(None)
         self.mask_view.setEnabled(False)
         self.mask_view._committed_mask_overlay.clear()
         self.mask_view.set_qimage(None)
         self.preview_view.set_qimage(None)
         self.paths = paths
         self.imglist = image_files_in_folder(folder)
+        self._strip_rows = {path: row for row, path in enumerate(self.imglist)}
+        if len(self.imglist) > 1:
+            strip = PageStrip(self.imglist)
+            self.preview_view.set_page_strip(strip)
+            self.mask_view.set_page_strip(strip)
         self.report = load_report(self.paths)
         self.folder_label.setText(folder)
         self.folder_label.setAccessibleName(f'目前專案資料夾：{folder}')
@@ -5384,6 +5631,7 @@ class MainWindow(QMainWindow):
         _set_state_label(self.progress_label, f'{action}進度 {current} / {total} · {name}')
 
     def on_worker_finished(self, report: dict) -> None:
+        self.strip_previews.invalidate()
         keep_original = self.worker is not None and self.worker.mode == 'keep_original'
         failed_selected = sum(
             'error' in report.get('pages', {}).get(Path(path).name, {})
@@ -5411,6 +5659,7 @@ class MainWindow(QMainWindow):
         )
 
     def on_convert_worker_finished(self, report: dict) -> None:
+        self.strip_previews.invalidate()
         self.report = report
         self.progress.setValue(100)
         self.undo_stack = []
@@ -5420,6 +5669,7 @@ class MainWindow(QMainWindow):
         self.status.showMessage('選區轉換完成。')
 
     def on_worker_failed(self, message: str) -> None:
+        self.strip_previews.invalidate()
         action = {'keep_original': '處理', 'psd_export': '導出 PSD'}.get(
             getattr(self.worker, 'mode', None), '偵測')
         _set_state_label(self.progress_label, f'{action}任務失敗')
@@ -5524,7 +5774,10 @@ class MainWindow(QMainWindow):
     def complete_page_and_next(self) -> None:
         if not self.set_current_reviewed(True):
             return
-        self.next_image()
+        self.next_edit_page()
+
+    def next_edit_page(self) -> None:
+        self._jump_to_list_row(self.list_widget.currentRow() + 1)
 
     def _update_page_item(self, image_path: str, info: dict) -> None:
         for row in range(self.list_widget.count()):
@@ -5551,6 +5804,8 @@ class MainWindow(QMainWindow):
 
     def refresh_list(self, keep_scroll: bool = True) -> None:
         previous_path = self.current_img_path
+        selection = self.list_widget.selectedItems()
+        browsed_path = selection[0].data(Qt.ItemDataRole.UserRole) if selection else None
         vertical_scroll = self.list_widget.verticalScrollBar().value()
         horizontal_scroll = self.list_widget.horizontalScrollBar().value()
         self.suppress_list_selection = True
@@ -5569,6 +5824,8 @@ class MainWindow(QMainWindow):
         self.update_review_summary()
         if selected_row >= 0:
             self.list_widget.setCurrentRow(selected_row)
+            if browsed_path in self._strip_rows:
+                self._highlight_list_row(self._strip_rows[browsed_path])
         self.suppress_list_selection = False
         if keep_scroll:
             self.restore_list_scroll(vertical_scroll, horizontal_scroll)
@@ -5580,6 +5837,103 @@ class MainWindow(QMainWindow):
         vertical_bar.setValue(max(vertical_bar.minimum(), min(vertical_bar.maximum(), vertical_scroll)))
         horizontal_bar.setValue(max(horizontal_bar.minimum(), min(horizontal_bar.maximum(), horizontal_scroll)))
 
+    def _highlight_list_row(self, row: int) -> None:
+        item = self.list_widget.item(row)
+        if item is None or item.isSelected():
+            return
+        # Qt tracks selection separately from the current index. The latter
+        # belongs to the open edit session, including its undo and save state.
+        self.list_widget.selectionModel().select(
+            self.list_widget.indexFromItem(item), QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        self.list_widget.scrollToItem(item)
+
+    def _follow_canvas_in_list(self) -> None:
+        view = self.mask_view
+        if view.page_strip is None or view.strip_row < 0 or self.suppress_list_selection:
+            return
+        center = view.mapToScene(view.viewport().rect().center())
+        y = view.page_strip.rect(view.strip_row).top() + center.y()
+        if self._list_view_y is None or abs(y - self._list_view_y) > 0.001:
+            self._list_view_y = y
+            self._highlight_list_row(view.page_strip.row_nearest_y(y))
+
+    def _jump_to_list_row(self, row: int) -> None:
+        item = self.list_widget.item(row)
+        if item is None:
+            return
+        if row == self.list_widget.currentRow():
+            self._highlight_list_row(row)
+            self._reveal_list_page(item)
+        else:
+            self.list_widget.setCurrentRow(row)
+
+    def _reveal_list_page(self, item) -> None:
+        view = self.mask_view
+        if (view.page_strip is None or item.data(Qt.ItemDataRole.UserRole) != self.current_img_path
+                or self.current_base is None):
+            return
+        # Scrolling alone can leave the list selection several pages offscreen.
+        center = view.mapToScene(view.viewport().rect().center())
+        if not view.pixmap_item.boundingRect().contains(center):
+            self.fit_both_views()
+
+    def _activate_canvas_page(self, row: int) -> bool:
+        if (self.worker_thread is not None or self.is_local_edit_active or self.is_mask_stroke_active
+                or self.mask_view._active_button is not None or not 0 <= row < len(self.imglist)):
+            return False
+        self._canvas_selection_row = row
+        try:
+            if row == self.list_widget.currentRow():
+                self._highlight_list_row(row)
+            self.list_widget.setCurrentRow(row)
+        finally:
+            self._canvas_selection_row = None
+        return self.current_img_path == self.imglist[row] and self.current_base is not None
+
+    def _schedule_strip_previews(self):
+        if self.mask_view.page_strip is not None and not self.strip_refresh_timer.isActive():
+            self.strip_refresh_timer.start(0)
+
+    def _request_strip_previews(self, ready=None):
+        view = self.mask_view
+        strip = view.page_strip
+        if strip is None or view.strip_row < 0:
+            return
+        visible = view.mapToScene(view.viewport().rect()).boundingRect()
+        # Fetch nearby pages before their edges enter the viewport.
+        margin = visible.height() / 2
+        rows = strip.visible_rows(view.strip_row, visible)
+        nearby = strip.visible_rows(view.strip_row, visible.adjusted(0, -margin, 0, margin))
+        paths = [self.imglist[row] for row in dict.fromkeys(rows + nearby) if row != view.strip_row]
+        settings = (self.paths['raw'], self.alpha, self.mask_display_color,
+                    self.show_background_sample, self._preview_settings())
+        self.strip_previews.request(paths, settings, ready=ready)
+
+    def _departing_strip_preview(self):
+        # The base pixmap can predate the last stroke. Include the committed
+        # tiles, excluding the cursor and temporary selection outlines.
+        left = self.mask_view.pixmap_item.pixmap().toImage()
+        right = self.preview_view.pixmap_item.pixmap().toImage()
+        if left.isNull() or right.isNull():
+            return {}
+        overlay = self.mask_view._committed_mask_overlay
+        if overlay.isVisible() and overlay.sparse_tiles:
+            with QPainter(left) as painter:
+                for tx, ty in overlay.sparse_tiles:
+                    tile = overlay._tile_image(tx, ty)
+                    if tile is not None:
+                        painter.drawImage(tx * overlay.TILE_SIZE, ty * overlay.TILE_SIZE, tile)
+        return {self.current_img_path: (left, right)}
+
+    def _display_strip_previews(self, images):
+        editor, preview = {}, {}
+        for path, (left_image, right_image) in images.items():
+            row = self._strip_rows.get(path)
+            if row is not None and row != self.mask_view.strip_row:
+                editor[row], preview[row] = left_image, right_image
+        self.mask_view.set_strip_neighbors(editor)
+        self.preview_view.set_strip_neighbors(preview)
+
     def on_image_selected(self, row: int) -> None:
         if self.suppress_list_selection:
             return
@@ -5588,33 +5942,38 @@ class MainWindow(QMainWindow):
         item = self.list_widget.item(row)
         if item is None:
             return
-        if not self.save_all_edit_masks():
+        if (self.is_local_edit_active or self.is_mask_stroke_active or self.mask_view._active_button is not None
+                or not self.save_all_edit_masks()):
             self.refresh_list()
+            self._highlight_list_row(self.list_widget.currentRow())
             return
+        keep_view = self._canvas_selection_row == row
+        ready = None
+        if keep_view and not self.mask_view.visible_image_rect().isEmpty():
+            ready = self._departing_strip_preview()
+        self.selection_detection_request_id += 1
         self.current_img_path = item.data(Qt.ItemDataRole.UserRole)
+        self._pending_edit_future = None
         self.remember_folder_progress(self.current_img_path)
         self.undo_stack = []
         self.redo_stack = []
-        self.reload_current()
+        if self.mask_view.page_strip is not None:
+            self.preview_view.set_strip_row(row, keep_view=keep_view)
+            self.mask_view.set_strip_row(row, keep_view=keep_view)
+        self.reload_current(keep_view=keep_view)
+        self._request_strip_previews(ready)
+        self._highlight_list_row(row)
         self.update_current_page_status()
 
     def previous_image(self) -> None:
-        if not self.imglist:
-            return
-        row = self.list_widget.currentRow()
-        if row <= 0:
-            return
-        self.list_widget.setCurrentRow(row - 1)
+        self._jump_to_list_row(self._browsed_row() - 1)
 
     def next_image(self) -> None:
-        if not self.imglist:
-            return
-        row = self.list_widget.currentRow()
-        if row < 0:
-            self.list_widget.setCurrentRow(0)
-            return
-        if row < self.list_widget.count() - 1:
-            self.list_widget.setCurrentRow(row + 1)
+        self._jump_to_list_row(self._browsed_row() + 1)
+
+    def _browsed_row(self) -> int:
+        selected = self.list_widget.selectedItems()
+        return self.list_widget.row(selected[0]) if selected else self.list_widget.currentRow()
 
     def _clear_unavailable_current_page(self) -> None:
         self.current_base = None
@@ -5694,21 +6053,7 @@ class MainWindow(QMainWindow):
         self.update_edit_buttons()
 
     def apply_other_mask_preview(self, preview: np.ndarray, other_mask: np.ndarray | None) -> np.ndarray:
-        if not self.show_other_mask:
-            return preview
-        ring = _expanded_mask_ring(other_mask, self.other_mask_preview_expand_px)
-        preview = _overlay_mask_on_bgr(
-            preview,
-            ring,
-            self.other_mask_display_alpha * OTHER_MASK_PREVIEW_RING_ALPHA_RATIO,
-            self.other_mask_display_color,
-        )
-        return _overlay_mask_on_bgr(
-            preview,
-            other_mask,
-            self.other_mask_display_alpha,
-            self.other_mask_display_color,
-        )
+        return _show_other_on_preview(preview, other_mask, self._preview_settings())
 
     def export_colored_preview(self) -> None:
         if not self.current_img_path or self.current_base is None or not self.paths:
@@ -6019,7 +6364,7 @@ class MainWindow(QMainWindow):
 
     def on_show_other_mask_changed(self, state: int) -> None:
         self.show_other_mask = state == Qt.CheckState.Checked.value
-        self.reload_current()
+        self.reload_current(keep_view=True)
 
     def choose_other_mask_display_color(self) -> None:
         current = QColor(
@@ -6486,7 +6831,11 @@ class MainWindow(QMainWindow):
             return
         if self.selection_combine_mode == 'local_edit_selection':
             queued_selection = selection_mask.copy()
-            QTimer.singleShot(0, lambda: self.open_local_edit_dialog(queued_selection))
+            generation = self._control_page_generation
+            def open_selection():
+                if generation == self._control_page_generation:
+                    self.open_local_edit_dialog(queued_selection)
+            QTimer.singleShot(0, open_selection)
             return
         if self.selection_combine_mode == 'rfdetr_detect_selection':
             self.start_rfdetr_selection_detection(selection_mask)
@@ -6837,6 +7186,7 @@ class MainWindow(QMainWindow):
             return
         self._last_handled_edit_job_id = result['job_id']
         if result['saved']:
+            self.strip_previews.invalidate_path(result['path'])
             self._saved_edit_revision = result['revision']
             self._last_edit_error = None
             self._update_saved_page_summary(result['summary'])
@@ -6948,6 +7298,8 @@ class MainWindow(QMainWindow):
             self.control_server.close()
             self.control_server = None
         self.startup_restore_timer.stop()
+        self.strip_refresh_timer.stop()
+        self.strip_previews.close()
         self._edit_executor.shutdown(wait=True)
         self._edit_executor_closed = True
         super().closeEvent(event)
