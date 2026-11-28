@@ -16,6 +16,7 @@ import test_project_store as fixtures
 class ReviewUiTests(unittest.TestCase):
     def setUp(self):
         fixtures.EditorTests.setUp(self)
+        self.window.review_tools_action.setChecked(True)
 
     def tearDown(self):
         fixtures.EditorTests.tearDown(self)
@@ -44,6 +45,25 @@ class ReviewUiTests(unittest.TestCase):
         w.jump_to_page()
         self.assertEqual(w.current_img_path, self.path)
         self.assertIn('01.png · 已校對', w.current_page_label.text())
+
+    def test_manual_list_hides_review_metadata_and_restores_saved_mark(self):
+        w = self.window
+        w.show()
+        self.assertTrue(w.set_current_reviewed(True))
+        w.review_tools_action.setChecked(False)
+        self.app.processEvents()
+        item = w.list_widget.currentItem()
+        self.assertEqual(item.text().split(), ['1', '01.png'])
+        self.assertEqual(item.toolTip(), '01.png')
+        self.assertFalse(w.page_jump_btn.isVisible())
+        self.assertFalse(w.review_next_btn.isVisible())
+        self.assertFalse(w.list_widget.horizontalScrollBar().isVisible())
+        self.assertEqual(w.page_position_label.text(), '1 / 1')
+        self.assertEqual(w.summary_label.text(), '共 1 張')
+        w.review_tools_action.setChecked(True)
+        self.assertIn('已校對', item.text())
+        self.assertTrue(w.review_next_btn.isVisible())
+        self.assertEqual(w.current_img_path, self.path)
 
     def test_review_invalidates_on_edit_and_complete_moves_next(self):
         w = self.window

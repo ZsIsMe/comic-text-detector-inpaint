@@ -258,6 +258,7 @@ class AsyncEditorTests(unittest.TestCase):
 
     def test_saved_summary_updates_existing_list_item_after_edit_clear_and_undo(self):
         w = self.window
+        w.review_tools_action.setChecked(True)
         item = w.list_widget.currentItem()
         mask = np.zeros_like(w.current_manual_other)
         mask[10:15, 10:15] = 255

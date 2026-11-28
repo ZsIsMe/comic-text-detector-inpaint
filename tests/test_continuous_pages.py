@@ -136,6 +136,7 @@ class ContinuousPagesTests(unittest.TestCase):
         QTest.mouseClick(listing.viewport(), Qt.MouseButton.LeftButton, pos=pos)
 
     def submit_jump(self, text):
+        self.window.review_tools_action.setChecked(True)
         field = self.window.page_jump_input
         field.setFocus()
         field.selectAll()
@@ -180,6 +181,7 @@ class ContinuousPagesTests(unittest.TestCase):
         self.assertFalse(self.read_mask(0).any())
 
     def test_toolbar_and_complete_page_controls_reveal_their_target(self):
+        self.window.review_tools_action.setChecked(True)
         toolbar = self.window.findChild(QToolBar)
         actions = {action.text(): action for action in toolbar.actions()}
         for name, browse, target in (('下一頁', 1, 2), ('上一頁', 1, 0), ('下一頁', 0, 1)):

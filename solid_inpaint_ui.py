@@ -16,7 +16,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QItemSelectionModel, QLocale, QObject, QPoint, QPointF, QRect, QRectF, QSettings, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QItemSelectionModel, QLocale, QObject, QPoint, QPointF, QRect, QRectF, QSettings, QSize, QEvent, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QPolygonF, QShortcut, QTransform
 from PySide6.QtWidgets import (
     QApplication,
@@ -37,6 +37,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QLayout,
+    QInputDialog,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -151,6 +153,97 @@ def review_window_geometry(available: QRect) -> QRect:
         width,
         height,
     )
+
+
+class WrappingControlsLayout(QLayout):
+    """Lay out compact control groups in rows that follow the available width."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._items = []
+        self.setContentsMargins(0, 0, 0, 0)
+        self.setSpacing(6)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._arrange(QRect(0, 0, width, 0), False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            if not item.isEmpty():
+                size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        return size + QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._arrange(rect, True)
+
+    def _arrange(self, rect, apply):
+        margins = self.contentsMargins()
+        area = rect.adjusted(margins.left(), margins.top(), -margins.right(), -margins.bottom())
+        x, y, row_height = area.x(), area.y(), 0
+        for item in self._items:
+            if item.isEmpty():
+                continue
+            size = item.sizeHint()
+            if x > area.x() and x + size.width() > area.right() + 1:
+                x = area.x()
+                y += row_height + self.spacing()
+                row_height = 0
+            if apply:
+                item.setGeometry(QRect(QPoint(x, y), size))
+            x += size.width() + self.spacing()
+            row_height = max(row_height, size.height())
+        return y + row_height - rect.y() + margins.bottom()
+
+
+def _control_group(*widgets):
+    """Keep a label and its controls together when a toolbar wraps."""
+    group = QWidget()
+    layout = QHBoxLayout(group)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(4)
+    for widget in widgets:
+        layout.addWidget(widget)
+    return group
+
+
+class PageStatusLabel(QLabel):
+    """Keep the full accessible page identity while fitting the navigation bar."""
+
+    def sizeHint(self):
+        return QSize(180, super().sizeHint().height())
+
+    def minimumSizeHint(self):
+        return QSize(100, super().minimumSizeHint().height())
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setPen(self.palette().windowText().color())
+        text = self.fontMetrics().elidedText(self.text(), Qt.TextElideMode.ElideMiddle, self.width())
+        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, text)
 
 
 def _set_state_label(label: QLabel, value: str) -> None:
@@ -4214,7 +4307,6 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._apply_style()
-        self._fit_horizontal_toolbar_heights()
         try:
             from solid_inpaint_control import start_control
             self.control_server = start_control(self)
@@ -4228,16 +4320,20 @@ class MainWindow(QMainWindow):
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
 
-        choose_action = QAction('選擇文件夾', self)
+        choose_action = QAction('開啟資料夾', self)
         choose_action.triggered.connect(self.choose_folder)
-        toolbar.addAction(choose_action)
+        self.open_button = QToolButton()
+        self.open_button.setText('開啟')
+        self.open_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        open_menu = QMenu(self.open_button)
+        open_menu.addAction(choose_action)
+        self.open_button.setMenu(open_menu)
+        toolbar.addWidget(self.open_button)
 
         self.recent_menu = QMenu(self)
-        self.recent_button = QToolButton()
-        self.recent_button.setText('打開最近列表')
-        self.recent_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        self.recent_button.setMenu(self.recent_menu)
-        toolbar.addWidget(self.recent_button)
+        self.recent_menu.setTitle('最近的專案')
+        open_menu.addMenu(self.recent_menu)
+        open_menu.addAction('貼上資料夾路徑…', self.open_folder_path_dialog)
         self.update_recent_menu()
 
         prev_action = QAction('上一頁', self)
@@ -4275,15 +4371,13 @@ class MainWindow(QMainWindow):
         self.navigator_action.setCheckable(True)
         self.navigator_action.setChecked(self.navigator_visible)
         self.navigator_action.triggered.connect(self.set_navigator_visible)
-        toolbar.addAction(self.navigator_action)
 
-        self.arrange_review_button = QToolButton()
-        self.arrange_review_button.setText('整理監修視窗')
-        self.arrange_review_button.setAccessibleName('整理監修視窗')
-        self.arrange_review_button.clicked.connect(self.arrange_review_window)
-        toolbar.addWidget(self.arrange_review_button)
+        self.arrange_review_action = QAction('整理監修視窗', self)
+        self.arrange_review_action.triggered.connect(self.arrange_review_window)
 
         more_menu = QMenu(self)
+        more_menu.addAction(self.navigator_action)
+        more_menu.addSeparator()
         more_menu.addAction('打開輸出', self.open_output)
         more_menu.addAction('生成 PDF', self.generate_pdf)
         more_menu.addAction('打開 PDF', self.open_pdf)
@@ -4298,15 +4392,11 @@ class MainWindow(QMainWindow):
         more_menu.addSeparator()
         more_menu.addAction(help_action)
 
-        spacer = QWidget()
-        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        toolbar.addWidget(spacer)
 
         self.detect_button = QToolButton()
         self.detect_button.setText('偵測並生成')
         self.detect_button.setProperty('primary', True)
         self.detect_button.clicked.connect(self.run_or_load)
-        toolbar.addWidget(self.detect_button)
 
         more_menu.addAction('添加偵測', self.run_add_detection)
         self.imported_mask_menu = more_menu.addMenu('使用傳入 Mask 運行')
@@ -4319,7 +4409,6 @@ class MainWindow(QMainWindow):
         self.more_button.setAccessibleName('更多操作與導出')
         self.more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.more_button.setMenu(more_menu)
-        toolbar.addWidget(self.more_button)
 
         root = QWidget()
         root_layout = QVBoxLayout(root)
@@ -4345,13 +4434,21 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(self.progress_row)
         self.progress_row.hide()
 
-        project_row = QHBoxLayout()
+        self.review_tools_action = QAction('顯示校對工具', self)
+        self.review_tools_action.setCheckable(True)
+        more_menu.addAction(self.review_tools_action)
+        self.review_tools_panel = QWidget()
+        review_layout = QVBoxLayout(self.review_tools_panel)
+        review_layout.setContentsMargins(0, 0, 0, 0)
+        self.project_path_row = QWidget()
+        project_row = QHBoxLayout(self.project_path_row)
+        project_row.setContentsMargins(0, 0, 0, 0)
         self.page_list_toggle = QToolButton()
-        self.page_list_toggle.setText('收起列表')
+        self.page_list_toggle.setText('列表')
         self.page_list_toggle.setCheckable(True)
         self.page_list_toggle.setChecked(True)
         self.page_list_toggle.toggled.connect(self._set_page_list_visible)
-        project_row.addWidget(self.page_list_toggle)
+        toolbar.insertWidget(prev_action, self.page_list_toggle)
         self.folder_path_input = QLineEdit()
         self.folder_path_input.setPlaceholderText('貼上圖片資料夾完整路徑')
         self.folder_path_input.setAccessibleName('圖片資料夾路徑')
@@ -4360,15 +4457,31 @@ class MainWindow(QMainWindow):
         open_path_btn.clicked.connect(self.open_typed_folder)
         project_row.addWidget(self.folder_path_input, 1)
         project_row.addWidget(open_path_btn)
-        self.current_page_label = QLabel('目前頁：未選擇')
+        self.current_page_label = PageStatusLabel('目前頁：未選擇')
         self.current_page_label.setAccessibleName(self.current_page_label.text())
-        self.current_page_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        project_row.addWidget(self.current_page_label, 1)
+        self.current_page_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.current_page_label.setMinimumWidth(100)
+        self.page_position_label = QLabel('— / —')
+        self.page_position_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.page_position_label.setMinimumWidth(70)
+        toolbar.addSeparator()
+        toolbar.addWidget(self.page_position_label)
         self.save_state_label = QLabel('保存狀態：無專案')
         self.save_state_label.setAccessibleName(self.save_state_label.text())
-        self.save_state_label.setFixedWidth(180)
-        project_row.addWidget(self.save_state_label)
-        root_layout.addLayout(project_row)
+        self.arrange_review_button = QToolButton()
+        self.arrange_review_button.setDefaultAction(self.arrange_review_action)
+        self.arrange_review_button.setAccessibleName('整理監修視窗')
+        project_row.addWidget(self.arrange_review_button)
+        toolbar.addWidget(self.detect_button)
+        toolbar.addWidget(self.more_button)
+        review_layout.addWidget(self.project_path_row)
+        self.review_status_layout = WrappingControlsLayout()
+        self.review_status_layout.addWidget(self.current_page_label)
+        self.review_status_layout.addWidget(self.save_state_label)
+        review_layout.addLayout(self.review_status_layout)
+        root_layout.addWidget(self.review_tools_panel)
+        self.review_tools_action.toggled.connect(self.review_tools_panel.setVisible)
+        self.review_tools_panel.hide()
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self.page_splitter = splitter
@@ -4398,6 +4511,8 @@ class MainWindow(QMainWindow):
         self.list_widget = QListWidget()
         self.list_widget.setAccessibleName('圖片頁面列表')
         self.list_widget.setAccessibleDescription('依順序列出檔名、偵測與人工校對狀態')
+        self.list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list_widget.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         self.list_widget.currentRowChanged.connect(self.on_image_selected)
         self.list_widget.itemClicked.connect(self._reveal_list_page)
         left_layout.addWidget(self.list_widget, 1)
@@ -4415,15 +4530,19 @@ class MainWindow(QMainWindow):
         self.review_next_btn.setAccessibleName('完成目前頁校對並到下一頁')
         self.review_next_btn.clicked.connect(self.complete_page_and_next)
         left_layout.addWidget(self.review_next_btn)
+        for control in (self.page_jump_input, self.page_jump_btn, self.review_btn,
+                        self.review_pending_btn, self.review_next_btn):
+            control.hide()
+            self.review_tools_action.toggled.connect(control.setVisible)
+        self.review_tools_action.toggled.connect(self._refresh_review_display)
         splitter.addWidget(left_panel)
 
         workspace_panel = QFrame()
         self.workspace_panel = workspace_panel
         workspace_layout = QVBoxLayout(workspace_panel)
-        workspace_layout.setContentsMargins(10, 10, 10, 10)
-        workspace_layout.setSpacing(8)
+        workspace_layout.setContentsMargins(8, 6, 8, 8)
+        workspace_layout.setSpacing(6)
 
-        mode_toolbar = QHBoxLayout()
         self.edit_state_label = QLabel('模式：純色填充 · 矩形 · 添加')
         self.edit_state_label.setAccessibleName(self.edit_state_label.text())
         self.edit_manual_solid_btn = QPushButton('F1 純色填充')
@@ -4433,21 +4552,10 @@ class MainWindow(QMainWindow):
         self.edit_manual_other_btn = QPushButton('F2 圖像修補')
         self.edit_manual_other_btn.setCheckable(True)
         self.edit_manual_other_btn.clicked.connect(lambda: self.set_edit_mode('manual_other'))
-        self.convert_masks_btn = QPushButton('批處理')
-        self.convert_masks_btn.setToolTip('將全部選區轉為指定類型；此操作不能回撤')
-        self.convert_masks_btn.clicked.connect(self.show_convert_masks_dialog)
         self.selection_local_edit_btn = QPushButton('局部視窗')
         self.selection_local_edit_btn.setCheckable(True)
         self.selection_local_edit_btn.setToolTip('點擊後框選區域，在獨立放大視窗中編輯副本；無需先切換工具')
-        mode_toolbar.addWidget(self.edit_manual_solid_btn)
-        mode_toolbar.addWidget(self.edit_manual_other_btn)
-        mode_toolbar.addWidget(self.convert_masks_btn)
-        mode_toolbar.addWidget(self.selection_local_edit_btn)
-        mode_toolbar.addStretch()
-        mode_toolbar.addWidget(self.edit_state_label)
-        workspace_layout.addLayout(mode_toolbar)
-
-        edit_toolbar = QHBoxLayout()
+        edit_toolbar = WrappingControlsLayout()
         edit_toolbar.setContentsMargins(0, 0, 0, 0)
         self.rect_btn = QPushButton('F5 矩形')
         self.rect_btn.setCheckable(True)
@@ -4531,7 +4639,7 @@ class MainWindow(QMainWindow):
         self.magic_expand_slider.setToolTip('魔法棒完成顏色選取後，再將選區向外擴展指定像素')
         self.magic_expand_slider.valueChanged.connect(self.on_magic_expand_changed)
         self.magic_scope_controls = QWidget()
-        magic_scope_layout = QHBoxLayout(self.magic_scope_controls)
+        magic_scope_layout = WrappingControlsLayout(self.magic_scope_controls)
         magic_scope_layout.setContentsMargins(0, 0, 0, 0)
         magic_scope_layout.setSpacing(6)
         magic_scope_layout.addWidget(QLabel('魔法棒範圍'))
@@ -4552,7 +4660,6 @@ class MainWindow(QMainWindow):
         self.magic_dwell_spinbox.setToolTip('第一點立即確認；其後在同一區塊停留指定毫秒才加入。淡色為候選，濃色為已確認；0 ms 沿路徑立即選取')
         self.magic_dwell_spinbox.valueChanged.connect(self.on_magic_dwell_changed)
         magic_scope_layout.addWidget(self.magic_dwell_spinbox)
-        magic_scope_layout.addStretch()
         self.local_intersect_controls = QWidget()
         local_intersect_layout = QHBoxLayout(self.local_intersect_controls)
         local_intersect_layout.setContentsMargins(0, 0, 0, 0)
@@ -4569,7 +4676,7 @@ class MainWindow(QMainWindow):
         self.local_intersect_offset_spinbox.valueChanged.connect(self.on_local_intersect_offset_changed)
         local_intersect_layout.addWidget(self.local_intersect_offset_spinbox)
         self.local_intersect_dark_controls = QWidget()
-        dark_layout = QHBoxLayout(self.local_intersect_dark_controls)
+        dark_layout = WrappingControlsLayout(self.local_intersect_dark_controls)
         dark_layout.setContentsMargins(0, 0, 0, 0)
         dark_layout.setSpacing(4)
         self.local_intersect_dark_checkbox = QCheckBox('擷取深色筆畫')
@@ -4630,28 +4737,32 @@ class MainWindow(QMainWindow):
             lambda: self.mask_view.transform().m11(),
         )
         dark_layout.addWidget(self.local_intersect_min_area_help)
-        dark_layout.addStretch()
-        edit_toolbar.addWidget(self.rect_btn)
-        edit_toolbar.addWidget(self.brush_btn)
-        edit_toolbar.addWidget(self.magic_btn)
-        edit_toolbar.addWidget(self.lasso_btn)
-        edit_toolbar.addSpacing(10)
+        edit_toolbar.setSpacing(4)
+        self.edit_target_controls = _control_group(
+            QLabel('類型'), self.edit_manual_solid_btn, self.edit_manual_other_btn)
+        self.edit_shape_controls = _control_group(
+            QLabel('工具'), self.rect_btn, self.brush_btn, self.magic_btn, self.lasso_btn)
         self.selection_combine_controls = QWidget()
         selection_combine_layout = QHBoxLayout(self.selection_combine_controls)
         selection_combine_layout.setContentsMargins(0, 0, 0, 0)
-        selection_combine_layout.setSpacing(8)
+        selection_combine_layout.setSpacing(4)
+        selection_combine_layout.addWidget(QLabel('選區'))
         selection_combine_layout.addWidget(self.selection_add_btn)
         selection_combine_layout.addWidget(self.selection_subtract_btn)
         selection_combine_layout.addWidget(self.restore_original_btn)
-        selection_combine_layout.addWidget(self.selection_intersect_btn)
-        selection_combine_layout.addWidget(self.selection_inner_btn)
-        selection_combine_layout.addWidget(self.selection_add_inner_btn)
-        selection_combine_layout.addWidget(self.selection_transfer_btn)
-        selection_combine_layout.addWidget(self.selection_rfdetr_btn)
-        edit_toolbar.addWidget(self.selection_combine_controls)
-        edit_toolbar.addSpacing(10)
-        edit_toolbar.addWidget(self.local_intersect_controls)
-        edit_toolbar.addSpacing(10)
+        self.advanced_selection_panel = QWidget()
+        advanced_layout = WrappingControlsLayout(self.advanced_selection_panel)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced_layout.addWidget(QLabel('進階選區'))
+        for button in (self.selection_intersect_btn, self.selection_inner_btn,
+                       self.selection_add_inner_btn, self.selection_transfer_btn,
+                       self.selection_rfdetr_btn, self.selection_local_edit_btn):
+            advanced_layout.addWidget(button)
+        more_menu.addSeparator()
+        more_menu.addAction('批處理全部選區…', self.show_convert_masks_dialog)
+        self.advanced_selection_toggle = QToolButton()
+        self.advanced_selection_toggle.setText('進階選區')
+        self.advanced_selection_toggle.setCheckable(True)
         self.brush_controls = QWidget()
         brush_controls_layout = QHBoxLayout(self.brush_controls)
         brush_controls_layout.setContentsMargins(0, 0, 0, 0)
@@ -4659,44 +4770,34 @@ class MainWindow(QMainWindow):
         brush_controls_layout.addWidget(self.brush_down_btn)
         brush_controls_layout.addWidget(self.brush_label)
         brush_controls_layout.addWidget(self.brush_up_btn)
-        edit_toolbar.addWidget(self.brush_controls)
-        edit_toolbar.addSpacing(10)
         self.magic_controls = QWidget()
-        magic_controls_layout = QHBoxLayout(self.magic_controls)
+        magic_controls_layout = WrappingControlsLayout(self.magic_controls)
         magic_controls_layout.setContentsMargins(0, 0, 0, 0)
         magic_controls_layout.setSpacing(8)
         magic_controls_layout.addWidget(self.magic_tolerance_label)
         magic_controls_layout.addWidget(self.magic_tolerance_slider)
-        magic_controls_layout.addSpacing(4)
         magic_controls_layout.addWidget(self.magic_expand_label)
         magic_controls_layout.addWidget(self.magic_expand_slider)
-        edit_toolbar.addWidget(self.magic_controls)
-        edit_toolbar.addSpacing(10)
-        edit_toolbar.addWidget(self.undo_btn)
-        edit_toolbar.addWidget(self.redo_btn)
-        edit_toolbar.addStretch()
+        self.edit_history_controls = _control_group(self.undo_btn, self.redo_btn)
         edit_toolbar_widget = QWidget()
         edit_toolbar_widget.setLayout(edit_toolbar)
-        self.edit_toolbar_scroll = QScrollArea()
-        self.edit_toolbar_scroll.setWidget(edit_toolbar_widget)
-        self.edit_toolbar_scroll.setWidgetResizable(False)
-        self.edit_toolbar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
-        self.edit_toolbar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.edit_toolbar_scroll.setFixedHeight(
-            edit_toolbar_widget.sizeHint().height()
-            + self.edit_toolbar_scroll.horizontalScrollBar().sizeHint().height()
-            + 2 * self.edit_toolbar_scroll.frameWidth()
-        )
-        self.edit_toolbar_scroll.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        workspace_layout.addWidget(self.edit_toolbar_scroll)
+        self.edit_controls = edit_toolbar_widget
+        self.edit_controls.setObjectName('editControls')
+        workspace_layout.addWidget(self.edit_controls)
+        self.advanced_selection_toggle.toggled.connect(self.advanced_selection_panel.setVisible)
+        workspace_layout.addWidget(self.advanced_selection_panel)
+        self.advanced_selection_panel.hide()
         workspace_layout.addWidget(self.local_intersect_dark_controls)
+        workspace_layout.addWidget(self.brush_controls)
+        workspace_layout.addWidget(self.magic_controls)
         workspace_layout.addWidget(self.magic_scope_controls)
 
-        view_options = QHBoxLayout()
+        view_options = WrappingControlsLayout()
         view_options.setContentsMargins(0, 0, 0, 0)
         view_options.addWidget(QLabel('Mask / 原圖'))
         self.alpha_slider = QSlider(Qt.Orientation.Horizontal)
         self.alpha_slider.setRange(0, 100)
+        self.alpha_slider.setFixedWidth(140)
         self.alpha_slider.setToolTip(
             '100%：黑底文字 Mask；0%：原圖；中間值：原圖與文字 Mask 混合。\n'
             '黃色背景取樣區固定 28% 透明度；取消「顯示背景選區」可查看無標記原圖。'
@@ -4706,7 +4807,7 @@ class MainWindow(QMainWindow):
         self.alpha_slider.valueChanged.connect(self.on_alpha_changed)
         self.alpha_label = QLabel(f'目前 {self.mask_alpha_percent}%')
         view_options.addWidget(QLabel('100%'))
-        view_options.addWidget(self.alpha_slider, 1)
+        view_options.addWidget(self.alpha_slider)
         view_options.addWidget(QLabel('0%'))
         view_options.addWidget(self.alpha_label)
         view_options.addWidget(QLabel('文字 Mask 顏色'))
@@ -4723,56 +4824,87 @@ class MainWindow(QMainWindow):
         self.background_sample_status = QLabel('')
         self.background_sample_status.setFixedWidth(120)
         view_options.addWidget(self.background_sample_status)
-        view_options.addSpacing(12)
 
+        other_options = WrappingControlsLayout()
+        other_options.setContentsMargins(0, 0, 0, 0)
         self.other_mask_checkbox = QCheckBox('顯示圖像修補')
         self.other_mask_checkbox.setChecked(True)
         self.other_mask_checkbox.stateChanged.connect(self.on_show_other_mask_changed)
-        view_options.addWidget(self.other_mask_checkbox)
-        view_options.addSpacing(8)
-        view_options.addWidget(QLabel('標記顏色'))
+        other_options.addWidget(self.other_mask_checkbox)
+        other_options.addWidget(QLabel('標記顏色'))
         self.other_mask_color_button = QPushButton()
         self.other_mask_color_button.clicked.connect(self.choose_other_mask_display_color)
         self.update_other_mask_color_button()
-        view_options.addWidget(self.other_mask_color_button)
-        view_options.addWidget(QLabel('透明度'))
+        other_options.addWidget(self.other_mask_color_button)
+        other_options.addWidget(QLabel('透明度'))
         self.other_mask_alpha_slider = QSlider(Qt.Orientation.Horizontal)
         self.other_mask_alpha_slider.setRange(0, 100)
         self.other_mask_alpha_slider.setValue(self.other_mask_display_alpha_percent)
         self.other_mask_alpha_slider.setFixedWidth(110)
         self.other_mask_alpha_slider.valueChanged.connect(self.on_other_mask_display_alpha_changed)
         self.other_mask_alpha_label = QLabel(f'{self.other_mask_display_alpha_percent}%')
-        view_options.addWidget(self.other_mask_alpha_slider)
-        view_options.addWidget(self.other_mask_alpha_label)
-        view_options.addSpacing(8)
-        view_options.addWidget(QLabel('PS 擴展預覽'))
+        other_options.addWidget(self.other_mask_alpha_slider)
+        other_options.addWidget(self.other_mask_alpha_label)
+        other_options.addWidget(QLabel('PS 擴展預覽'))
         self.other_mask_expand_spinbox = QSpinBox()
         self.other_mask_expand_spinbox.setRange(0, MAX_OTHER_MASK_PREVIEW_EXPAND_PX)
         self.other_mask_expand_spinbox.setValue(self.other_mask_preview_expand_px)
         self.other_mask_expand_spinbox.setSuffix(' px')
         self.other_mask_expand_spinbox.setToolTip('只影響右側淡紫色預覽，不改變輸出的 OTHER_CHANNEL')
         self.other_mask_expand_spinbox.valueChanged.connect(self.on_other_mask_preview_expand_changed)
-        view_options.addWidget(self.other_mask_expand_spinbox)
-        view_options.addSpacing(12)
-        fit_btn = QPushButton('F4')
+        other_options.addWidget(self.other_mask_expand_spinbox)
+        fit_btn = QPushButton('適應 F4')
         fit_btn.setToolTip('兩張圖同時適應窗口')
         fit_btn.clicked.connect(self.fit_both_views)
-        view_options.addWidget(fit_btn)
-        view_options.addStretch()
         view_options_widget = QWidget()
-        view_options_widget.setLayout(view_options)
-        self.view_options_scroll = QScrollArea()
-        self.view_options_scroll.setWidget(view_options_widget)
-        self.view_options_scroll.setWidgetResizable(False)
-        self.view_options_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
-        self.view_options_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.view_options_scroll.setFixedHeight(
-            view_options_widget.sizeHint().height()
-            + self.view_options_scroll.horizontalScrollBar().sizeHint().height()
-            + 2 * self.view_options_scroll.frameWidth()
+        view_options_layout = QVBoxLayout(view_options_widget)
+        view_options_layout.setContentsMargins(6, 4, 6, 4)
+        view_options_layout.addLayout(view_options)
+        view_options_layout.addLayout(other_options)
+        self.view_options_panel = view_options_widget
+        workspace_layout.addWidget(self.view_options_panel)
+        self.view_options_panel.hide()
+        self.view_options_toggle = QToolButton()
+        self.view_options_toggle.setText('預覽設定')
+        self.view_options_toggle.setCheckable(True)
+        self.view_options_toggle.setToolTip('原圖混合、Mask 顏色、OTHER 標記與預覽擴展')
+        self.view_options_toggle.toggled.connect(self.view_options_panel.setVisible)
+        self.edit_fit_button = fit_btn
+        self.compact_edit_controls = QWidget()
+        compact_layout = QHBoxLayout(self.compact_edit_controls)
+        compact_layout.setContentsMargins(0, 0, 0, 0)
+        compact_layout.setSpacing(4)
+        self.compact_edit_buttons = {}
+        self.compact_edit_actions = []
+        groups = (
+            ('target', (self.edit_manual_solid_btn, self.edit_manual_other_btn)),
+            ('tool', (self.rect_btn, self.brush_btn, self.magic_btn, self.lasso_btn)),
+            ('operation', (self.selection_add_btn, self.selection_subtract_btn,
+                           self.restore_original_btn, self.selection_intersect_btn,
+                           self.selection_inner_btn, self.selection_add_inner_btn,
+                           self.selection_transfer_btn, self.selection_rfdetr_btn,
+                           self.selection_local_edit_btn)),
         )
-        self.view_options_scroll.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        workspace_layout.addWidget(self.view_options_scroll)
+        for name, buttons in groups:
+            menu_button = QToolButton()
+            menu_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+            menu = QMenu(menu_button)
+            for button in buttons:
+                action = menu.addAction(button.text())
+                action.setCheckable(True)
+                action.setToolTip(button.toolTip())
+                action.triggered.connect(button.click)
+                self.compact_edit_actions.append((action, button))
+            menu_button.setMenu(menu)
+            self.compact_edit_buttons[name] = menu_button
+            compact_layout.addWidget(menu_button)
+        for control in (self.compact_edit_controls, self.edit_target_controls,
+                        self.edit_shape_controls, self.selection_combine_controls,
+                        self.advanced_selection_toggle, self.local_intersect_controls,
+                        self.edit_history_controls, self.view_options_toggle, fit_btn):
+            edit_toolbar.addWidget(control)
+        self.compact_edit_controls.hide()
+        self.edit_controls.installEventFilter(self)
 
         views_grid = QGridLayout()
         views_grid.setContentsMargins(0, 0, 0, 0)
@@ -4828,7 +4960,6 @@ class MainWindow(QMainWindow):
         for button in (
             self.edit_manual_solid_btn,
             self.edit_manual_other_btn,
-            self.convert_masks_btn,
             self.brush_btn,
             self.rect_btn,
             self.magic_btn,
@@ -4858,6 +4989,7 @@ class MainWindow(QMainWindow):
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
+        self.review_status_layout.addWidget(self.edit_state_label)
         self.status.showMessage('可編輯純色填充與圖像修補，兩類互斥，編輯後直接更新預覽。')
         self.set_selection_combine_mode('add')
         self.set_edit_tool('rect')
@@ -4883,7 +5015,8 @@ class MainWindow(QMainWindow):
             if width:
                 self._page_list_width = width
             self.page_list_panel.hide()
-        self.page_list_toggle.setText('收起列表' if visible else '展開列表')
+        self.page_list_toggle.setText('列表')
+        self.page_list_toggle.setToolTip('收起圖片列表' if visible else '展開圖片列表')
         self.page_splitter.refresh()
         self.restore_navigator_position()
         if not view.pixmap_item.pixmap().isNull():
@@ -4899,11 +5032,14 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(
             """
             QMainWindow, QWidget { background: #111418; color: #e6ebef; }
-            QToolBar { background: #171b20; border: 0; spacing: 8px; padding: 8px; }
+            QToolBar { background: #171b20; border: 0; spacing: 5px; padding: 4px; }
             QToolButton, QPushButton {
                 background: #242b33; color: #e6ebef; border: 1px solid #3a4551;
                 border-radius: 5px; padding: 6px 12px;
             }
+            QWidget#editControls QPushButton { padding: 5px 7px; }
+            QWidget#editControls QToolButton { padding: 5px 7px; }
+            QToolButton:checked { background: #34454c; border-color: #38a996; }
             QToolButton:hover, QPushButton:hover { background: #2b3440; }
             QPushButton:checked {
                 background: #e9fffb; color: #10161a; border-color: #e9fffb;
@@ -4939,20 +5075,44 @@ class MainWindow(QMainWindow):
             """
         )
 
-    def _fit_horizontal_toolbar_heights(self) -> None:
-        """Keep every control visible above its horizontal scrollbar after styling."""
-        for scroll in (self.edit_toolbar_scroll, self.view_options_scroll):
-            content = scroll.widget()
-            if content is None:
-                continue
-            content.ensurePolished()
-            content.layout().activate()
-            height = (content.sizeHint().height()
-                      + scroll.horizontalScrollBar().sizeHint().height()
-                      + 2 * scroll.frameWidth())
-            if scroll.height() != height:
-                scroll.setFixedHeight(height)
-            content.adjustSize()
+    def eventFilter(self, watched, event):
+        if watched is getattr(self, 'edit_controls', None) and event.type() == QEvent.Type.Resize:
+            self._update_adaptive_edit_controls()
+        return super().eventFilter(watched, event)
+
+    def _update_adaptive_edit_controls(self) -> None:
+        if not hasattr(self, 'compact_edit_controls') or not hasattr(self, 'mask_view'):
+            return
+        wide = (self.edit_target_controls, self.edit_shape_controls,
+                self.selection_combine_controls)
+        shared = (self.advanced_selection_toggle, self.edit_history_controls,
+                  self.view_options_toggle, self.edit_fit_button)
+        required = sum(widget.sizeHint().width() for widget in (*wide, *shared))
+        required += self.edit_controls.layout().spacing() * (len(wide) + len(shared) - 1)
+        compact = self.edit_controls.width() < required
+        for widget in wide:
+            widget.setVisible(not compact)
+        self.compact_edit_controls.setVisible(compact)
+        tool = self.mask_view.tool
+        tool_label = {'rect': '矩形', 'brush': '筆刷', 'magic': '魔法棒', 'lasso': '套索'}[tool]
+        labels = {
+            'target': '類型：' + EDIT_MODE_LABELS[self.edit_mode],
+            'tool': '工具：' + tool_label,
+            'operation': '操作：' + SELECTION_COMBINE_LABELS[self.selection_combine_mode],
+        }
+        for name, button in self.compact_edit_buttons.items():
+            button.setText(labels[name])
+            button.setAccessibleName(labels[name])
+        for action, button in self.compact_edit_actions:
+            action.setChecked(button.isChecked())
+            action.setEnabled(button.isEnabled() and not button.isHidden())
+
+    def open_folder_path_dialog(self) -> None:
+        path, accepted = QInputDialog.getText(
+            self, '開啟專案', '圖片資料夾完整路徑', text=self.folder_path_input.text())
+        if accepted and path.strip():
+            self.folder_path_input.setText(path)
+            self.open_typed_folder()
 
     def choose_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, '選擇圖片文件夾', self.folder or str(Path.home()))
@@ -5039,6 +5199,7 @@ class MainWindow(QMainWindow):
         self.folder_label.setAccessibleName(f'目前專案資料夾：{folder}')
         self.folder_label.setToolTip(folder)
         self.folder_path_input.setText(folder)
+        self.setWindowTitle(f'{Path(folder).name or folder} · 塗白')
         self.add_recent_folder(folder)
         self.refresh_list()
         if self.imglist:
@@ -5687,7 +5848,18 @@ class MainWindow(QMainWindow):
         self._control_worker_silent = False
         self.update_current_page_status()
 
+    def _refresh_review_display(self) -> None:
+        pages = self.report.get('pages', {})
+        for row in range(self.list_widget.count()):
+            item = self.list_widget.item(row)
+            name = osp.basename(item.data(Qt.ItemDataRole.UserRole))
+            self._display_page_item(item, name, pages.get(name, {}), row)
+        self.update_review_summary()
+        self.update_current_page_status()
+
     def _page_item_text(self, name: str, info: dict, index: int) -> str:
+        if not self.review_tools_action.isChecked():
+            return f'{index + 1}　{name}'
         if 'error' in info:
             detection = STATUS_FAILED
         elif not info:
@@ -5699,6 +5871,9 @@ class MainWindow(QMainWindow):
         return f'第 {index + 1} 頁  {name}    {detection} · {review}'
 
     def update_review_summary(self) -> None:
+        if not self.review_tools_action.isChecked():
+            self.summary_label.setText(f'共 {len(self.imglist)} 張')
+            return
         pages = self.report.get('pages', {})
         other_count = sum(int(info.get('other_pixels', 0)) > 0 and 'error' not in info
                           for info in pages.values())
@@ -5715,6 +5890,8 @@ class MainWindow(QMainWindow):
         if not self.current_img_path or self.current_img_path not in self.imglist:
             _set_state_label(self.current_page_label, '目前頁：未選擇')
             _set_state_label(self.save_state_label, '保存狀態：無專案')
+            _set_state_label(self.page_position_label, '— / —')
+            self.page_position_label.setToolTip('')
             for button in (self.review_btn, self.review_pending_btn, self.review_next_btn):
                 button.setEnabled(False)
             return
@@ -5722,10 +5899,11 @@ class MainWindow(QMainWindow):
         info = self.report.get('pages', {}).get(name, {})
         reviewed = store.is_page_reviewed(info) and self._edit_revision == self._saved_edit_revision
         page_number = self.imglist.index(self.current_img_path) + 1
+        _set_state_label(self.page_position_label, f'{page_number} / {len(self.imglist)}')
+        self.page_position_label.setToolTip(name)
+        review_state = '已校對' if reviewed else '待回看'
         _set_state_label(self.current_page_label,
-            f'目前頁：第 {page_number}/{len(self.imglist)} 頁 · {name} · '
-            f'{"已校對" if reviewed else "待回看"}'
-        )
+                         f'目前頁：第 {page_number}/{len(self.imglist)} 頁 · {name} · {review_state}')
         self.current_page_label.setToolTip(self.current_page_label.text())
         if self._last_edit_error:
             save_state = f'保存狀態：失敗 · {self._last_edit_error}'
@@ -5785,22 +5963,26 @@ class MainWindow(QMainWindow):
             if item.data(Qt.ItemDataRole.UserRole) != image_path:
                 continue
             name = osp.basename(image_path)
-            item.setText(self._page_item_text(name, info, row))
-            item.setData(Qt.ItemDataRole.AccessibleTextRole,
-                f'第 {row + 1}/{len(self.imglist)} 頁，{name}，'
-                f'{"已校對" if store.is_page_reviewed(info) else "待回看"}，'
-                f'{"有待修復選區" if int(info.get("other_pixels", 0)) else "無待修復選區"}'
-            )
-            if 'error' in info:
-                color = '#e06767'
-            elif int(info.get('other_pixels', 0)) > 0:
-                color = '#d59a45'
-            elif store.is_page_reviewed(info):
-                color = '#57b66f'
-            else:
-                color = '#dfe5ea'
-            item.setForeground(QColor(color))
+            self._display_page_item(item, name, info, row)
             return
+
+    def _display_page_item(self, item: QListWidgetItem, name: str, info: dict, row: int) -> None:
+        item.setText(self._page_item_text(name, info, row))
+        item.setData(Qt.ItemDataRole.AccessibleTextRole,
+            f'第 {row + 1}/{len(self.imglist)} 頁，{name}，'
+            f'{"已校對" if store.is_page_reviewed(info) else "待回看"}，'
+            f'{"有待修復選區" if int(info.get("other_pixels", 0)) else "無待修復選區"}'
+        )
+        item.setToolTip(name)
+        if 'error' in info:
+            color = '#e06767'
+        elif self.review_tools_action.isChecked() and int(info.get('other_pixels', 0)) > 0:
+            color = '#d59a45'
+        elif self.review_tools_action.isChecked() and store.is_page_reviewed(info):
+            color = '#57b66f'
+        else:
+            color = '#dfe5ea'
+        item.setForeground(QColor(color))
 
     def refresh_list(self, keep_scroll: bool = True) -> None:
         previous_path = self.current_img_path
@@ -5815,10 +5997,11 @@ class MainWindow(QMainWindow):
         for img_path in self.imglist:
             name = osp.basename(img_path)
             info = pages.get(name, {})
-            item = QListWidgetItem(self._page_item_text(name, info, self.list_widget.count()))
+            row = self.list_widget.count()
+            item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, img_path)
             self.list_widget.addItem(item)
-            self._update_page_item(img_path, info)
+            self._display_page_item(item, name, info, row)
             if img_path == previous_path:
                 selected_row = self.list_widget.count() - 1
         self.update_review_summary()
@@ -6487,7 +6670,6 @@ class MainWindow(QMainWindow):
         self.update_local_intersect_controls_visibility()
         self.update_selection_combine_status()
         self.update_edit_state_label()
-        self._fit_horizontal_toolbar_heights()
 
     def set_selection_combine_mode(self, mode: str) -> None:
         if mode not in SELECTION_COMBINE_LABELS:
@@ -6496,6 +6678,9 @@ class MainWindow(QMainWindow):
             self.set_edit_tool('rect')
         if not self.selection_mode_allowed_for_tool(mode, self.mask_view.tool):
             return
+        if mode in ('local_intersect', 'selection_inner', 'add_selection_inner',
+                    'transfer_from_other', 'rfdetr_detect_selection', 'local_edit_selection'):
+            self.advanced_selection_toggle.setChecked(True)
         self.selection_combine_mode = mode
         self.mask_view.set_selection_combine_mode(mode)
         self.selection_add_btn.setChecked(mode == 'add')
@@ -6511,7 +6696,6 @@ class MainWindow(QMainWindow):
         self.update_local_intersect_controls_visibility()
         self.update_selection_combine_status()
         self.update_edit_state_label()
-        self._fit_horizontal_toolbar_heights()
 
     def selection_mode_allowed_for_tool(self, mode: str, tool: str) -> bool:
         if mode == 'local_edit_selection':
@@ -6581,6 +6765,7 @@ class MainWindow(QMainWindow):
             f'模式：{EDIT_MODE_LABELS[self.edit_mode]} · {tool_label} · '
             f'{SELECTION_COMBINE_LABELS[self.selection_combine_mode]}'
         )
+        self._update_adaptive_edit_controls()
 
     def change_brush_radius(self, delta: int) -> None:
         self.mask_view.set_brush_radius(self.mask_view.brush_radius + delta)
@@ -6652,8 +6837,6 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        if getattr(self, 'view_options_scroll', None) is not None:
-            self._fit_horizontal_toolbar_heights()
         if getattr(self, 'navigator', None) is not None:
             self.restore_navigator_position()
             self.update_navigator_viewport()
